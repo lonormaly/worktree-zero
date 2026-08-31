@@ -43,6 +43,14 @@ pub struct Migrate {
     /// Canonical source ref whose identical tracked files should be shared.
     #[arg(long)]
     pub baseline: Option<String>,
+
+    /// Migrate tracked source even when a dependency adapter is unavailable.
+    #[arg(long)]
+    pub source_only: bool,
+
+    /// Record Worktree Zero ownership after every selected migration succeeds.
+    #[arg(long, requires = "apply")]
+    pub adopt: bool,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -200,6 +208,8 @@ pub fn migrate(args: Migrate, json_output: bool) -> Result<()> {
             &worktree_root,
             &baseline_ref,
             args.apply,
+            args.source_only,
+            args.adopt,
             live_cwds.as_deref(),
             process_inspection_error.as_deref(),
         ) {
@@ -227,6 +237,8 @@ pub fn migrate(args: Migrate, json_output: bool) -> Result<()> {
         "schema_version": 1,
         "mode": if args.apply { "apply" } else { "dry-run" },
         "baseline_ref": baseline_ref,
+        "source_only": args.source_only,
+        "adopt": args.adopt,
         "worktrees": items,
         "summary": {
             "scanned": items.len(),
@@ -282,6 +294,8 @@ fn migrate_one(
     root: &Path,
     baseline_ref: &str,
     apply: bool,
+    source_only: bool,
+    adopt: bool,
     live_cwds: Option<&[PathBuf]>,
     process_inspection_error: Option<&str>,
 ) -> Result<Value> {
@@ -313,11 +327,14 @@ fn migrate_one(
     if source_before.eligible_files > 0 && !source_before.already_migrated {
         actions.push("clone_identical_tracked_files");
     }
-    if stale_before > 0 {
+    if !source_only && stale_before > 0 {
         actions.push("repair_bun_dependency_layout");
     }
-    if needs_prepared_environment {
+    if !source_only && needs_prepared_environment {
         actions.push("attach_prepared_bun_environment");
+    }
+    if adopt && !worktree::is_managed(root) {
+        actions.push("adopt_worktree_ownership");
     }
 
     let mut blockers = Vec::new();
@@ -333,7 +350,7 @@ fn migrate_one(
     if !cow_supported && source_before.eligible_files > 0 && !source_before.already_migrated {
         blockers.push("copy-on-write source cloning unsupported".to_string());
     }
-    if stale_before > 0 || needs_prepared_environment {
+    if !source_only && (stale_before > 0 || needs_prepared_environment) {
         match &bun {
             Some(report)
                 if report.configured
@@ -366,7 +383,7 @@ fn migrate_one(
                 true,
             )?);
         }
-        if stale_before > 0 {
+        if !source_only && stale_before > 0 {
             repair_dependency_layout(root, &dependencies_before)?;
             let dependencies_after = dependency_storage(root)?;
             stale_after =
@@ -375,7 +392,7 @@ fn migrate_one(
                 bail!("dependency migration left {stale_after} stale logical bytes");
             }
         }
-        if needs_prepared_environment {
+        if !source_only && needs_prepared_environment {
             let key = prepared_key
                 .as_deref()
                 .context("prepared environment has no complete identity")?;
@@ -383,6 +400,10 @@ fn migrate_one(
                 .as_ref()
                 .context("prepared environment has no Bun adapter")?;
             prepare_bun_environment(root, key, report.version.as_deref().unwrap_or_default())?;
+        }
+        if adopt && !worktree::is_managed(root) {
+            let branch = worktree_branch_label(root)?;
+            worktree::mark_managed(root, &branch, false)?;
         }
         "applied"
     };
@@ -1199,6 +1220,29 @@ fn git_dirty_count(root: &Path) -> Result<usize> {
         bail!("git status failed in {}", root.display());
     }
     Ok(output.stdout.iter().filter(|byte| **byte == 0).count())
+}
+
+fn worktree_branch_label(root: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .current_dir(root)
+        .output()
+        .context("inspect worktree branch")?;
+    if output.status.success() {
+        return Ok(String::from_utf8(output.stdout)?.trim().to_owned());
+    }
+    let output = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(root)
+        .output()
+        .context("inspect detached worktree commit")?;
+    if !output.status.success() {
+        bail!("cannot identify worktree branch or detached commit");
+    }
+    Ok(format!(
+        "detached:{}",
+        String::from_utf8(output.stdout)?.trim()
+    ))
 }
 
 fn filesystem_free_bytes(path: &Path) -> Result<u64> {

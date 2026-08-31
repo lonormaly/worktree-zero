@@ -60,6 +60,11 @@ The test must run without a person pressing a button after setup.
 
 ## Planned command surface
 
+The v0.1.6 lifecycle ships path/branch-based ownership records, automatic
+30-second heartbeats for `wt0 run`, explicit `wt0 heartbeat`, and GC refusal for
+unowned, dirty, active, unknown-state, or detached worktrees. Runtime-ID lookup,
+idempotent create, MCP transport, and vendor packages remain planned.
+
 ```text
 wt0 capabilities --json
 wt0 create --branch <name> --owner <agent-id> --idempotency-key <uuid> --json
@@ -68,7 +73,8 @@ wt0 heartbeat --runtime <id> --lease <duration> --json
 wt0 measure --runtime <id> --json
 wt0 stop --runtime <id> --json
 wt0 remove --runtime <id> --json
-wt0 gc --dry-run --json
+wt0 gc --json
+wt0 gc --apply --json
 wt0 mcp serve
 ```
 

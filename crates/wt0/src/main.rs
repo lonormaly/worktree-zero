@@ -69,6 +69,8 @@ enum Commands {
     Gc(commands::worktree::WorktreeGc),
     /// Repair interrupted overlay-backed runtimes.
     Repair(commands::worktree::WorktreeRepair),
+    /// Refresh the ownership lease for a running agent worktree.
+    Heartbeat(commands::worktree::WorktreeHeartbeat),
     /// Remove stale source baselines and Git registrations.
     Prune(commands::worktree::WorktreePrune),
     /// Inspect dependency sharing and generated runtime storage.
@@ -102,6 +104,9 @@ fn main() -> Result<()> {
         }
         Commands::Repair(args) => {
             commands::worktree::run(commands::worktree::Worktree::Repair(args), cli.json)
+        }
+        Commands::Heartbeat(args) => {
+            commands::worktree::run(commands::worktree::Worktree::Heartbeat(args), cli.json)
         }
         Commands::Prune(args) => {
             commands::worktree::run(commands::worktree::Worktree::Prune(args), cli.json)
