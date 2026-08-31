@@ -14,7 +14,17 @@ FLAM is Worktree Zero's first design partner and evidence source. It is not the 
 - About 6 GiB of ImmorTerm logs in the main checkout.
 - Bun 1.3.14 global virtual store enabled; package links alone did not control total worktree storage.
 
-The tracked repository contains about 369 MiB of blobs, but TypeScript and JavaScript account for only about 25 MiB. Most weight comes from images, videos, specifications, generated output still tracked by Git, and other non-code material.
+Git did not copy ignored files from one worktree into another. Package installs,
+builds, dev servers, tests, and agent tools created those files independently,
+then abandoned worktrees kept them alive. This generated and runtime state was
+the dominant measured FLAM problem.
+
+The shared Git object database contains about 369 MiB of repository blobs, while
+TypeScript and JavaScript account for only about 25 MiB. A linked worktree still
+checks out tracked files, including images, videos, specifications, and other
+non-code material, but it does not clone the shared Git history. The physical
+cost of those checked-out files must be measured separately from both Git objects
+and generated state.
 
 ## Existing FLAM lifecycle
 
@@ -31,7 +41,7 @@ FLAM already has project-specific controls Worktree Zero must learn from:
 
 ## Gaps to solve generically
 
-- source files should use a proven copy-on-write backend;
+- a copy-on-write source backend should be used only when the measured tracked-file saving justifies it;
 - package-store support must be detected and verified, not assumed;
 - framework caches need share/isolate/disable/expire policies;
 - mutable emulator state must live under the runtime identity;
@@ -44,7 +54,7 @@ FLAM already has project-specific controls Worktree Zero must learn from:
 
 1. A fresh FLAM agent runtime is created through one command.
 2. Physical disk allocation is measured before and after creation.
-3. Source CoW, package sharing, cache policy, and mutable-state isolation are each proven independently.
+3. Ordinary Git checkout cost, optional source CoW, package sharing, cache policy, and mutable-state isolation are each proven independently.
 4. Two runtimes start concurrently with no port, process, database, or storage collision.
 5. Editing one file cannot change the main checkout or a sibling runtime.
 6. Dirty and live runtime removal is refused.
