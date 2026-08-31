@@ -72,6 +72,8 @@ enum Commands {
     Prune(commands::worktree::WorktreePrune),
     /// Inspect dependency sharing and generated runtime storage.
     Doctor(runtime::Doctor),
+    /// Prepare package-manager state for a thin runtime.
+    Prepare(runtime::Prepare),
     /// Compatibility namespace for the imported source engine.
     #[command(hide = true, subcommand)]
     Worktree(commands::worktree::Worktree),
@@ -102,6 +104,7 @@ fn main() -> Result<()> {
             commands::worktree::run(commands::worktree::Worktree::Prune(args), cli.json)
         }
         Commands::Doctor(args) => runtime::doctor(args, cli.json),
+        Commands::Prepare(args) => runtime::prepare(args, cli.json),
         Commands::Worktree(cmd) => commands::worktree::run(cmd, cli.json),
     }
 }
