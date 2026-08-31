@@ -17,9 +17,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: oven-sh/setup-bun@v2
+        if: runner.os == 'macOS'
+        with:
+          bun-version: 1.3.14
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
+      - name: Prepared Bun environment integration
+        if: runner.os == 'macOS'
+        run: WT0="$PWD/target/debug/wt0" bash tests/prepared_bun_integration.sh
 
   overlay-linux:
     # Validates the fuse-overlayfs populate mode, which cannot run on macOS.

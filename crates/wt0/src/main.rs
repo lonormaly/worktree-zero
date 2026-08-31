@@ -43,6 +43,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "wt0",
+    version,
     about = "Thin, isolated development runtimes for coding agents"
 )]
 struct Cli {

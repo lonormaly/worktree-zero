@@ -3,8 +3,10 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 use serde_json::{json, Value};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::SystemTime;
 use uuid::Uuid;
 
 const DEFAULT_GENERATED_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
@@ -47,6 +49,13 @@ pub struct Migrate {
 struct DependencyStorage {
     bun_backups: u64,
     materialized_root_entries: u64,
+    materialized_store_entries: u64,
+}
+
+#[derive(Debug)]
+struct PreparedEnvironment {
+    key: String,
+    action: &'static str,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -72,10 +81,20 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let generated = generated_storage(&root)?;
     let bun = bun_report(&root);
     let stale = dependencies.bun_backups + dependencies.materialized_root_entries;
-    let dependency_ready = bun
+    let prepared_key = bun
         .as_ref()
-        .is_none_or(|report| report.configured && report.version.is_some())
-        && stale == 0;
+        .and_then(|report| report.version.as_deref())
+        .and_then(|version| bun_environment_key(&root, version).ok());
+    let prepared_attached = prepared_key
+        .as_deref()
+        .is_some_and(|key| prepared_marker_key(&root).ok().flatten().as_deref() == Some(key));
+    let bun_links_ready = has_global_links(&root).unwrap_or(false);
+    let dependency_ready = bun.as_ref().is_none_or(|report| {
+        report.configured
+            && report.version.as_deref().is_some_and(bun_version_supported)
+            && bun_links_ready
+    }) && stale == 0
+        && (dependencies.materialized_store_entries == 0 || prepared_attached);
     let generated_ready = generated.total() <= DEFAULT_GENERATED_BUDGET_BYTES;
     let ready = dependency_ready && generated_ready;
 
@@ -92,12 +111,17 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
         "dependencies": {
             "bun": bun.map(|report| json!({
                 "configured": report.configured,
+                "supported_version": report.version.as_deref().is_some_and(bun_version_supported),
                 "version": report.version,
                 "required_version": "1.3.14",
+                "global_links_ready": bun_links_ready,
             })),
             "stale_logical_bytes": stale,
             "bun_backup_bytes": dependencies.bun_backups,
             "materialized_root_bytes": dependencies.materialized_root_entries,
+            "materialized_store_bytes": dependencies.materialized_store_entries,
+            "prepared_environment_key": prepared_key,
+            "prepared_environment_attached": prepared_attached,
         },
         "generated": {
             "logical_bytes": generated.total(),
@@ -128,6 +152,11 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
         println!("  ready:             {}", if ready { "yes" } else { "no" });
         if stale > 0 {
             println!("  action: run a reviewed Worktree Zero dependency repair before agent work");
+        }
+        if dependencies.materialized_store_entries > 0 && !prepared_attached {
+            println!(
+                "  action: seal the worktree-local post-install files with `wt0 prepare --apply`"
+            );
         }
         if !generated_ready {
             println!(
@@ -265,6 +294,17 @@ fn migrate_one(
         dependencies_before.bun_backups + dependencies_before.materialized_root_entries;
     let generated = generated_storage(root)?;
     let bun = bun_report(root);
+    let prepared_key = match bun.as_ref().and_then(|report| report.version.as_deref()) {
+        Some(version) if root.join("package.json").is_file() => {
+            Some(bun_environment_key(root, version)?)
+        }
+        _ => None,
+    };
+    let prepared_attached = prepared_key
+        .as_deref()
+        .is_some_and(|key| prepared_marker_key(root).ok().flatten().as_deref() == Some(key));
+    let needs_prepared_environment =
+        dependencies_before.materialized_store_entries > 0 && !prepared_attached;
     let source_before = worktree::migrate_identical_source(root, baseline_ref, false)?;
     let repo = worktree::discover_repo(root)?;
     let cow_supported = worktree::cow::clone_supported(&repo.common_git_dir, root)?;
@@ -275,6 +315,9 @@ fn migrate_one(
     }
     if stale_before > 0 {
         actions.push("repair_bun_dependency_layout");
+    }
+    if needs_prepared_environment {
+        actions.push("attach_prepared_bun_environment");
     }
 
     let mut blockers = Vec::new();
@@ -290,9 +333,11 @@ fn migrate_one(
     if !cow_supported && source_before.eligible_files > 0 && !source_before.already_migrated {
         blockers.push("copy-on-write source cloning unsupported".to_string());
     }
-    if stale_before > 0 {
+    if stale_before > 0 || needs_prepared_environment {
         match &bun {
-            Some(report) if report.configured && report.version.is_some() => {}
+            Some(report)
+                if report.configured
+                    && report.version.as_deref().is_some_and(bun_version_supported) => {}
             Some(_) => blockers.push("Bun isolated global store is not ready".to_string()),
             None => blockers
                 .push("stale dependency layout has no supported manager adapter".to_string()),
@@ -330,6 +375,15 @@ fn migrate_one(
                 bail!("dependency migration left {stale_after} stale logical bytes");
             }
         }
+        if needs_prepared_environment {
+            let key = prepared_key
+                .as_deref()
+                .context("prepared environment has no complete identity")?;
+            let report = bun
+                .as_ref()
+                .context("prepared environment has no Bun adapter")?;
+            prepare_bun_environment(root, key, report.version.as_deref().unwrap_or_default())?;
+        }
         "applied"
     };
 
@@ -356,6 +410,9 @@ fn migrate_one(
             "remaining_stale_logical_bytes": stale_after,
             "bun_backup_bytes": dependencies_before.bun_backups,
             "materialized_root_bytes": dependencies_before.materialized_root_entries,
+            "materialized_store_bytes": dependencies_before.materialized_store_entries,
+            "prepared_environment_key": prepared_key,
+            "prepared_environment_attached": prepared_attached,
         },
         "generated": {
             "logical_bytes": generated.total(),
@@ -373,25 +430,32 @@ pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
     if !bun.configured {
         bail!("Bun must use linker=isolated and globalStore=true before repair");
     }
+    if root.join("package.json").is_file()
+        && !bun.version.as_deref().is_some_and(bun_version_supported)
+    {
+        bail!("Bun 1.3.14 or newer is required for the isolated global store");
+    }
 
     let before = dependency_storage(&root)?;
     let stale = before.bun_backups + before.materialized_root_entries;
-    if stale == 0 {
-        emit_prepare(
-            json_output,
+    let environment_key = if root.join("package.json").is_file() {
+        Some(bun_environment_key(
             &root,
-            false,
-            0,
-            "dependency layout is already thin",
-        )?;
-        return Ok(());
-    }
+            bun.version
+                .as_deref()
+                .context("Bun executable was not found")?,
+        )?)
+    } else {
+        None
+    };
     if !args.apply {
         emit_prepare(
             json_output,
             &root,
             false,
             stale,
+            environment_key.as_deref(),
+            None,
             "dry run; repeat with --apply after reviewing the exact target",
         )?;
         return Ok(());
@@ -400,10 +464,22 @@ pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
     if dirty_entries > 0 {
         bail!("refusing dependency repair in dirty worktree ({dirty_entries} entries)");
     }
-    if let Some(path) = live_open_path(&root)? {
-        bail!("refusing dependency repair while a process uses {path}");
+    let modules = root.join("node_modules");
+    if modules.exists() {
+        if let Some(path) = live_open_path(&modules)? {
+            bail!("refusing dependency repair while a process uses {path}");
+        }
     }
-    repair_dependency_layout(&root, &before)?;
+    if stale > 0 {
+        repair_dependency_layout(&root, &before)?;
+    }
+
+    let physical_before = filesystem_free_bytes(&root)?;
+    let prepared = environment_key
+        .as_deref()
+        .map(|key| prepare_bun_environment(&root, key, bun.version.as_deref().unwrap_or_default()))
+        .transpose()?;
+    let physical_after = filesystem_free_bytes(&root)?;
 
     let after = dependency_storage(&root)?;
     let remaining = after.bun_backups + after.materialized_root_entries;
@@ -415,7 +491,14 @@ pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
         &root,
         true,
         stale,
-        "stale dependency layout retired after verification",
+        prepared
+            .as_ref()
+            .map(|environment| environment.key.as_str()),
+        Some(i128::from(physical_after) - i128::from(physical_before)),
+        prepared
+            .as_ref()
+            .map(|environment| environment.action)
+            .unwrap_or("stale dependency layout retired after verification"),
     )
 }
 
@@ -443,6 +526,8 @@ fn emit_prepare(
     root: &Path,
     applied: bool,
     bytes: u64,
+    environment_key: Option<&str>,
+    physical_delta: Option<i128>,
     message: &str,
 ) -> Result<()> {
     if json_output {
@@ -453,13 +538,410 @@ fn emit_prepare(
                 "root": root,
                 "applied": applied,
                 "stale_logical_bytes": bytes,
+                "environment_key": environment_key,
+                "physical_free_space_delta_bytes": physical_delta,
                 "message": message,
             }))?
         );
     } else {
         println!("Worktree Zero prepare: {}", root.display());
         println!("  stale dependency layout: {}", human_bytes(bytes));
+        if let Some(key) = environment_key {
+            println!("  prepared environment: {key}");
+        }
+        if let Some(delta) = physical_delta {
+            println!("  filesystem free-space delta: {delta} bytes");
+        }
         println!("  {message}");
+    }
+    Ok(())
+}
+
+fn prepare_bun_environment(
+    root: &Path,
+    key: &str,
+    bun_version: &str,
+) -> Result<PreparedEnvironment> {
+    let store = prepared_environment_store(root)?;
+    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let family = store.join("bun").join(&platform);
+    let exact = family.join(key);
+    let exact_modules = exact.join("node_modules");
+    let marker_key = prepared_marker_key(root)?;
+    let platform_identity = platform_identity()?;
+
+    if exact.join("ready").is_file() && exact_modules.is_dir() {
+        if marker_key.as_deref() == Some(key) {
+            return Ok(PreparedEnvironment {
+                key: key.to_owned(),
+                action: "prepared environment already attached",
+            });
+        }
+        attach_prepared_environment(root, &exact_modules, key, bun_version)?;
+        return Ok(PreparedEnvironment {
+            key: key.to_owned(),
+            action: "attached exact prepared environment",
+        });
+    }
+
+    if exact.exists() {
+        bail!(
+            "prepared environment is incomplete: {}; remove it only after inspection",
+            exact.display()
+        );
+    }
+
+    let modules = root.join("node_modules");
+    let parent = newest_prepared_environment(&family, bun_version, &platform_identity)?;
+    if let Some(parent) = &parent {
+        attach_prepared_environment(root, &parent.join("node_modules"), key, bun_version)?;
+    } else if modules.is_dir() {
+        replace_dependency_tree(root)?;
+        write_prepared_marker(root, key, bun_version)?;
+    } else {
+        run_bun_install(root)?;
+        write_prepared_marker(root, key, bun_version)?;
+    }
+    validate_environment_links(root, &modules)?;
+    publish_prepared_environment(root, &family, key, bun_version, &platform_identity)?;
+
+    Ok(PreparedEnvironment {
+        key: key.to_owned(),
+        action: if parent.is_some() {
+            "derived and sealed a prepared environment from the nearest compatible snapshot"
+        } else {
+            "sealed the first prepared environment for this platform"
+        },
+    })
+}
+
+fn prepared_environment_store(root: &Path) -> Result<PathBuf> {
+    let repo = worktree::discover_repo(root)?;
+    let configured = std::env::var_os("WT0_STORE").map(PathBuf::from);
+    let store = match configured {
+        Some(path) if path.is_absolute() => path.join("environments"),
+        Some(path) => bail!("WT0_STORE must be absolute: {}", path.display()),
+        None => worktree::state_dir(&repo.common_git_dir).join("environments"),
+    };
+    fs::create_dir_all(&store)
+        .with_context(|| format!("create prepared-environment store {}", store.display()))?;
+    let probe_root = if std::env::var_os("WT0_STORE").is_some() {
+        store.clone()
+    } else {
+        repo.common_git_dir
+    };
+    if !worktree::cow::clone_supported(&probe_root, root)? {
+        bail!(
+            "prepared-environment store and worktree do not support strict copy-on-write: {} -> {}",
+            store.display(),
+            root.display()
+        );
+    }
+    Ok(store)
+}
+
+fn platform_identity() -> Result<String> {
+    let uname = Command::new("uname")
+        .args(["-s", "-r", "-m"])
+        .output()
+        .context("read operating-system identity")?;
+    if !uname.status.success() {
+        bail!("uname failed while identifying the prepared-environment platform");
+    }
+    let uname = String::from_utf8(uname.stdout)?.trim().to_owned();
+    let abi = if cfg!(target_os = "linux") {
+        Command::new("ldd").arg("--version").output().ok()
+    } else if cfg!(target_os = "macos") {
+        Command::new("sw_vers").arg("-productVersion").output().ok()
+    } else {
+        None
+    }
+    .filter(|output| output.status.success())
+    .map(|output| {
+        let text = if output.stdout.is_empty() {
+            output.stderr
+        } else {
+            output.stdout
+        };
+        String::from_utf8_lossy(&text)
+            .lines()
+            .next()
+            .unwrap_or("unknown")
+            .trim()
+            .to_owned()
+    })
+    .unwrap_or_else(|| "unknown".to_owned());
+    Ok(format!("uname={uname};abi={abi}"))
+}
+
+fn bun_environment_key(root: &Path, bun_version: &str) -> Result<String> {
+    let output = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(root)
+        .output()
+        .context("list tracked prepared-environment inputs")?;
+    if !output.status.success() {
+        bail!("git ls-files failed while computing the prepared-environment identity");
+    }
+    let mut inputs = Vec::new();
+    for raw in output.stdout.split(|byte| *byte == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let relative = PathBuf::from(
+            std::str::from_utf8(raw).context("non-UTF-8 package input path is unsupported")?,
+        );
+        let name = relative.file_name().and_then(|name| name.to_str());
+        let relevant = matches!(
+            name,
+            Some("package.json" | "bun.lock" | "bunfig.toml" | ".npmrc")
+        ) || relative.starts_with("patches");
+        if relevant {
+            inputs.push(relative);
+        }
+    }
+    inputs.sort();
+    if !inputs.iter().any(|path| path == Path::new("bun.lock")) {
+        bail!("bun.lock must be tracked before preparing an environment");
+    }
+
+    let mut child = Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("start prepared-environment identity hash")?;
+    {
+        let mut input = child.stdin.take().context("open identity hash input")?;
+        writeln!(input, "wt0-bun-environment-v1")?;
+        writeln!(input, "bun={bun_version}")?;
+        writeln!(input, "os={}", std::env::consts::OS)?;
+        writeln!(input, "arch={}", std::env::consts::ARCH)?;
+        writeln!(input, "platform={}", platform_identity()?)?;
+        writeln!(input, "flags=isolated,global-store,frozen-lockfile")?;
+        for relative in inputs {
+            let contents = fs::read(root.join(&relative))
+                .with_context(|| format!("read identity input {}", relative.display()))?;
+            writeln!(
+                input,
+                "path={} bytes={}",
+                relative.display(),
+                contents.len()
+            )?;
+            input.write_all(&contents)?;
+            input.write_all(b"\n")?;
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .context("finish environment identity hash")?;
+    if !output.status.success() {
+        bail!("git hash-object failed while computing the environment identity");
+    }
+    let key = String::from_utf8(output.stdout)?.trim().to_owned();
+    if key.is_empty() || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("Git returned an invalid prepared-environment identity");
+    }
+    Ok(key)
+}
+
+fn newest_prepared_environment(
+    family: &Path,
+    bun_version: &str,
+    platform_identity: &str,
+) -> Result<Option<PathBuf>> {
+    let entries = match fs::read_dir(family) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read prepared-environment family"),
+    };
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let ready = path.join("ready");
+        let manifest = path.join("manifest.json");
+        if !ready.is_file() || !path.join("node_modules").is_dir() || !manifest.is_file() {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(&fs::read(&manifest)?)
+            .with_context(|| format!("read prepared manifest {}", manifest.display()))?;
+        if value["bun_version"].as_str() != Some(bun_version)
+            || value["platform_identity"].as_str() != Some(platform_identity)
+        {
+            continue;
+        }
+        let modified = ready
+            .metadata()?
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if newest
+            .as_ref()
+            .is_none_or(|(current, _)| modified > *current)
+        {
+            newest = Some((modified, path));
+        }
+    }
+    Ok(newest.map(|(_, path)| path))
+}
+
+fn publish_prepared_environment(
+    root: &Path,
+    family: &Path,
+    key: &str,
+    bun_version: &str,
+    platform_identity: &str,
+) -> Result<()> {
+    fs::create_dir_all(family)?;
+    let final_dir = family.join(key);
+    if final_dir.join("ready").is_file() && final_dir.join("node_modules").is_dir() {
+        return Ok(());
+    }
+    if final_dir.exists() {
+        bail!(
+            "refusing incomplete prepared environment: {}",
+            final_dir.display()
+        );
+    }
+    let temporary = family.join(format!(".{key}.{}", Uuid::now_v7()));
+    let payload = temporary.join("payload");
+    fs::create_dir_all(&payload)?;
+    let result = (|| -> Result<()> {
+        let payload_modules = payload.join("node_modules");
+        fs::create_dir(&payload_modules)?;
+        worktree::cow::clone_tree(&root.join("node_modules"), &payload_modules)?;
+        fs::write(
+            payload.join("manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "adapter": "bun",
+                "key": key,
+                "bun_version": bun_version,
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "platform_identity": platform_identity,
+            }))?,
+        )?;
+        fs::write(payload.join("ready"), format!("{key}\n"))?;
+        match fs::rename(&payload, &final_dir) {
+            Ok(()) => Ok(()),
+            Err(_) if final_dir.join("ready").is_file() => Ok(()),
+            Err(error) => Err(error).context("publish prepared environment"),
+        }
+    })();
+    let _ = fs::remove_dir_all(&temporary);
+    result
+}
+
+fn attach_prepared_environment(
+    root: &Path,
+    source_modules: &Path,
+    key: &str,
+    bun_version: &str,
+) -> Result<()> {
+    let modules = root.join("node_modules");
+    let parent = root.parent().context("worktree root has no parent")?;
+    let rollback = parent.join(format!(".wt0-environment-rollback-{}", Uuid::now_v7()));
+    let had_modules = modules.exists();
+    if had_modules {
+        fs::rename(&modules, &rollback).context("move dependency tree into exact rollback")?;
+    }
+    let attempt = (|| -> Result<()> {
+        fs::create_dir(&modules).context("create private prepared-environment view")?;
+        worktree::cow::clone_tree(source_modules, &modules)
+            .context("attach copy-on-write prepared environment")?;
+        run_bun_install(root)?;
+        write_prepared_marker(root, key, bun_version)?;
+        validate_environment_links(root, &modules)
+    })();
+    if let Err(error) = attempt {
+        if modules.exists() {
+            fs::remove_dir_all(&modules).context("remove failed prepared-environment view")?;
+        }
+        if had_modules {
+            fs::rename(&rollback, &modules).context("restore dependency rollback")?;
+        }
+        return Err(error.context("prepared-environment attach failed; original tree restored"));
+    }
+    if had_modules {
+        fs::remove_dir_all(&rollback).context("retire verified dependency rollback")?;
+    }
+    Ok(())
+}
+
+fn run_bun_install(root: &Path) -> Result<()> {
+    let output = Command::new("bun")
+        .args(["install", "--linker", "isolated", "--frozen-lockfile"])
+        .env("BUN_INSTALL_GLOBAL_STORE", "1")
+        .current_dir(root)
+        .output()
+        .context("run Bun isolated global-store install")?;
+    if !output.status.success() {
+        bail!(
+            "Bun install exited with {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if !has_global_links(root)? {
+        bail!("Bun install did not create global-store links");
+    }
+    Ok(())
+}
+
+fn prepared_marker_key(root: &Path) -> Result<Option<String>> {
+    let marker = root.join("node_modules/.wt0-environment.json");
+    let bytes = match fs::read(&marker) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read prepared-environment marker"),
+    };
+    let value: Value =
+        serde_json::from_slice(&bytes).context("parse prepared-environment marker")?;
+    Ok(value["key"].as_str().map(str::to_owned))
+}
+
+fn write_prepared_marker(root: &Path, key: &str, bun_version: &str) -> Result<()> {
+    fs::write(
+        root.join("node_modules/.wt0-environment.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "adapter": "bun",
+            "key": key,
+            "bun_version": bun_version,
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        }))?,
+    )
+    .context("write prepared-environment marker")
+}
+
+fn validate_environment_links(root: &Path, path: &Path) -> Result<()> {
+    let output = Command::new("find")
+        .arg(path)
+        .args(["-type", "l", "-print0"])
+        .output()
+        .context("list prepared-environment links")?;
+    if !output.status.success() {
+        bail!("find failed while validating prepared-environment links");
+    }
+    for raw in output.stdout.split(|byte| *byte == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let child = PathBuf::from(
+            std::str::from_utf8(raw).context("non-UTF-8 dependency link path is unsupported")?,
+        );
+        let target = fs::read_link(&child)?;
+        if target.is_absolute() && target.starts_with(root) {
+            bail!(
+                "prepared environment contains a worktree-absolute link: {} -> {}",
+                child.display(),
+                target.display()
+            );
+        }
     }
     Ok(())
 }
@@ -521,7 +1003,12 @@ fn assert_node_modules_ignored(root: &Path) -> Result<()> {
 
 fn node_modules_ignored(root: &Path) -> Result<bool> {
     let status = Command::new("git")
-        .args(["check-ignore", "-q", "node_modules"])
+        .args([
+            "check-ignore",
+            "-q",
+            "--no-index",
+            "node_modules/.wt0-ignore-probe",
+        ])
         .current_dir(root)
         .status()
         .context("verify node_modules ignore policy")?;
@@ -602,6 +1089,19 @@ fn live_open_path(root: &Path) -> Result<Option<String>> {
 struct BunReport {
     configured: bool,
     version: Option<String>,
+}
+
+fn bun_version_supported(version: &str) -> bool {
+    let mut parts = version
+        .split('.')
+        .take(3)
+        .map(|part| part.parse::<u64>().ok());
+    let parsed = (
+        parts.next().flatten(),
+        parts.next().flatten(),
+        parts.next().flatten(),
+    );
+    matches!(parsed, (Some(major), Some(minor), Some(patch)) if (major, minor, patch) >= (1, 3, 14))
 }
 
 fn bun_report(root: &Path) -> Option<BunReport> {
@@ -734,6 +1234,16 @@ fn dependency_storage(root: &Path) -> Result<DependencyStorage> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let kind = entry.file_type()?;
+        if name == ".bun" && kind.is_dir() {
+            for package in fs::read_dir(entry.path())? {
+                let package = package?;
+                let package_kind = package.file_type()?;
+                if package_kind.is_dir() && !package_kind.is_symlink() {
+                    result.materialized_store_entries += logical_bytes(&package.path())?;
+                }
+            }
+            continue;
+        }
         if kind.is_dir() && is_bun_backup(&name) {
             result.bun_backups += logical_bytes(&entry.path())?;
             continue;
@@ -842,6 +1352,13 @@ mod tests {
             vec![0; 4096],
         )
         .expect("write Bun backup fixture");
+        fs::create_dir_all(root.join("node_modules/.bun/local-package/node_modules/pkg"))
+            .expect("create materialized Bun package");
+        fs::write(
+            root.join("node_modules/.bun/local-package/node_modules/pkg/data"),
+            vec![0; 1024],
+        )
+        .expect("write materialized Bun fixture");
         fs::create_dir_all(root.join("apps/web/.next")).expect("create Next fixture");
         fs::write(root.join("apps/web/.next/cache"), vec![0; 2048]).expect("write Next fixture");
 
@@ -849,9 +1366,68 @@ mod tests {
         let generated = generated_storage(&root).expect("inspect generated state");
         assert_eq!(dependencies.bun_backups, 4096);
         assert_eq!(dependencies.materialized_root_entries, 0);
+        assert_eq!(dependencies.materialized_store_entries, 1024);
         assert_eq!(generated.next, 2048);
 
         fs::remove_dir_all(root).expect("remove test fixture");
+    }
+
+    #[test]
+    fn bun_environment_identity_changes_only_for_install_inputs() {
+        let root = std::env::temp_dir().join(format!(
+            "wt0-environment-key-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create identity fixture");
+        fs::write(root.join("package.json"), "{\"dependencies\":{}}\n")
+            .expect("write package manifest");
+        fs::write(root.join("bun.lock"), "lock\n").expect("write lockfile");
+        fs::write(root.join("source.ts"), "export const value = 1;\n").expect("write source");
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "test@example.com"][..],
+            &["config", "user.name", "Test User"][..],
+            &["add", "package.json", "bun.lock", "source.ts"][..],
+            &["commit", "-q", "-m", "fixture"][..],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .expect("prepare identity repository")
+                .success());
+        }
+
+        let initial = bun_environment_key(&root, "1.3.14").expect("initial identity");
+        fs::write(root.join("source.ts"), "export const value = 2;\n").expect("change source");
+        let source_changed = bun_environment_key(&root, "1.3.14").expect("source identity");
+        assert_eq!(initial, source_changed);
+
+        fs::write(
+            root.join("package.json"),
+            "{\"dependencies\":{\"zod\":\"4.4.3\"}}\n",
+        )
+        .expect("change package manifest");
+        let package_changed = bun_environment_key(&root, "1.3.14").expect("package identity");
+        assert_ne!(initial, package_changed);
+        assert_ne!(
+            package_changed,
+            bun_environment_key(&root, "1.3.15").expect("Bun identity")
+        );
+
+        fs::remove_dir_all(root).expect("remove identity fixture");
+    }
+
+    #[test]
+    fn bun_version_floor_is_explicit() {
+        assert!(!bun_version_supported("1.3.12"));
+        assert!(bun_version_supported("1.3.14"));
+        assert!(bun_version_supported("1.4.0"));
+        assert!(!bun_version_supported("canary"));
     }
 
     #[cfg(unix)]

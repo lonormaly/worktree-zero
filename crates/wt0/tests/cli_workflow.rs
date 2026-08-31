@@ -4,6 +4,71 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+fn cli_reports_the_pinned_release_version() {
+    let output = Command::new(env!("CARGO_BIN_EXE_wt0"))
+        .arg("--version")
+        .output()
+        .expect("read wt0 version");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout)
+            .expect("UTF-8 version")
+            .trim(),
+        format!("wt0 {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn remove_accepts_an_absolute_worktree_path_from_outside_the_repository() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-absolute-remove-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    let worktree = root.join("worktree");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["create", "absolute/remove", "--path"])
+        .arg(&worktree)
+        .output()
+        .expect("create worktree");
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let removed = Command::new(wt0)
+        .current_dir(&root)
+        .args(["remove"])
+        .arg(&worktree)
+        .arg("--delete-branch")
+        .output()
+        .expect("remove absolute worktree");
+    assert!(
+        removed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!worktree.exists());
+
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[test]
 fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
     let root = std::env::temp_dir().join(format!(
         "worktree-zero-workflow-{}-{}",

@@ -501,7 +501,20 @@ fn force_teardown(repo: &RepoContext, target: &Path) -> Result<()> {
 
 fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let repo = discover_repo(&cwd)?;
+    let repo_hint = args
+        .target
+        .as_deref()
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        })
+        .filter(|path| path.exists())
+        .unwrap_or(cwd);
+    let repo = discover_repo(&repo_hint)?;
     let target = resolve_worktree_target(&repo, args.target.as_deref())?;
     let branch = list_worktrees(&repo)?
         .into_iter()
@@ -1213,7 +1226,7 @@ fn absolute_path(path: PathBuf) -> Result<PathBuf> {
     }
 }
 
-fn state_dir(common_git_dir: &Path) -> PathBuf {
+pub(crate) fn state_dir(common_git_dir: &Path) -> PathBuf {
     common_git_dir.join("wt0")
 }
 
