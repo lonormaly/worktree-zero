@@ -320,6 +320,67 @@ fn cow_worktree_is_clean_when_filesystem_supports_clones() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn source_migration_clones_only_files_identical_to_the_canonical_baseline() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    if !cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+        return Ok(());
+    }
+    let baseline = resolve_commit(&repo, "HEAD")?;
+    let target = fixture.root.join("existing-worktree");
+    add_git_worktree(&repo, "migration-test", &target, &baseline)?;
+
+    fs::write(target.join("file with spaces.txt"), "branch-specific\n")?;
+    git(&target, ["add", "file with spaces.txt"])?;
+    git(&target, ["commit", "-q", "-m", "branch change"])?;
+
+    let dry_run = migrate_identical_source(&target, &baseline, false)?;
+    assert!(dry_run.eligible_files >= 4);
+    assert!(dry_run.eligible_bytes > 0);
+    assert_eq!(dry_run.divergent_files, 1);
+    assert_eq!(dry_run.applied_files, 0);
+    assert!(!repo.common_git_dir.join("wt0/baselines").exists());
+
+    let applied = migrate_identical_source(&target, &baseline, true)?;
+    assert_eq!(applied.applied_files, applied.eligible_files);
+    ensure_clean(&target)?;
+    assert_eq!(
+        fs::read_to_string(target.join("file with spaces.txt"))?,
+        "branch-specific\n"
+    );
+
+    let repeated = migrate_identical_source(&target, &baseline, false)?;
+    assert!(repeated.already_migrated);
+    assert_eq!(repeated.applied_files, 0);
+
+    fs::write(target.join("file.txt"), "private write\n")?;
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt"))?,
+        "content\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn source_migration_refuses_a_dirty_worktree_before_creating_a_baseline() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    if !cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+        return Ok(());
+    }
+    let baseline = resolve_commit(&repo, "HEAD")?;
+    let target = fixture.root.join("dirty-existing-worktree");
+    add_git_worktree(&repo, "dirty-migration-test", &target, &baseline)?;
+    fs::write(target.join("file.txt"), "uncommitted\n")?;
+
+    let error = migrate_identical_source(&target, &baseline, true)
+        .expect_err("dirty source migration must fail");
+    assert!(format!("{error:#}").contains("clean worktree"));
+    assert!(!repo.common_git_dir.join("wt0/baselines").exists());
+    Ok(())
+}
+
 fn branch_exists(repo: &RepoContext, branch: &str) -> Result<bool> {
     let reference = format!("refs/heads/{branch}");
     let output = git_output_common(repo, ["show-ref", "--verify", "--quiet", &reference])?;
