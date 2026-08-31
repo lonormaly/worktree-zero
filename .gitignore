@@ -1,7 +1,13 @@
 .DS_Store
 .wt0/
-target/
+/target/
 node_modules/
 dist/
 coverage/
 *.log
+.env
+.venv/
+.venv-stress/
+__pycache__/
+*.pyc
+plan
