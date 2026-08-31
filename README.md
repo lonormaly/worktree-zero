@@ -85,6 +85,38 @@ writable `.next` directory between two running agents would be unsafe. Copying
 the same tracked video forty times is unnecessary. The tool must classify the
 data before deciding whether to share, isolate, or remove it.
 
+### Forgotten worktrees are a lifecycle problem
+
+Every worktree created by Worktree Zero receives a private ownership record and
+runtime ID in Git's worktree administration directory. `wt0 run` refreshes its
+heartbeat every 30 seconds. Other agent managers can call:
+
+```bash
+wt0 heartbeat /absolute/path/to/worktree
+```
+
+Garbage collection is deliberately stricter than folder deletion. `wt0 gc`
+is a dry run by default; `wt0 gc --apply` will remove a worktree only when all
+of these are true:
+
+- Worktree Zero owns it;
+- it is attached to a preserved branch, not a detached commit;
+- its lease is old enough;
+- Git reports no modified or untracked work;
+- no process has its working directory or an open path inside it; and
+- every ignored path is recognized generated state such as `node_modules`,
+  `.next`, `.nx`, `dist`, coverage, or Wrangler output.
+
+An ignored `.env.local`, an unknown tool directory, a dirty file, a running
+agent, an unowned checkout, or a detached commit is preserved and reported.
+`wt0 gc --force` is disabled. Existing native worktrees can be inspected first,
+then explicitly adopted only after migration succeeds:
+
+```bash
+wt0 migrate --all --source-only
+wt0 migrate --all --source-only --apply --adopt
+```
+
 ## Why Git worktrees still repeat tracked files
 
 ### What branch isolation means

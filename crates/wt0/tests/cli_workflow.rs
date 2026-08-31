@@ -51,6 +51,22 @@ fn remove_accepts_an_absolute_worktree_path_from_outside_the_repository() {
         String::from_utf8_lossy(&created.stderr)
     );
 
+    let heartbeat = Command::new(wt0)
+        .current_dir(&root)
+        .args(["--json", "heartbeat"])
+        .arg(&worktree)
+        .output()
+        .expect("refresh absolute worktree heartbeat");
+    assert!(
+        heartbeat.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&heartbeat.stderr)
+    );
+    let heartbeat: serde_json::Value =
+        serde_json::from_slice(&heartbeat.stdout).expect("heartbeat JSON");
+    assert_eq!(heartbeat["worktree"], worktree.to_string_lossy().as_ref());
+    assert!(heartbeat["runtime_id"].as_str().is_some());
+
     let removed = Command::new(wt0)
         .current_dir(&root)
         .args(["remove"])
@@ -110,6 +126,7 @@ fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
         fs::read_to_string(worktree.join("result.txt")).expect("agent result"),
         "agent output\n"
     );
+    git(&repo, &["merge", "--ff-only", "agent/test"]);
 
     let gc = Command::new(wt0)
         .current_dir(&repo)
@@ -119,7 +136,7 @@ fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
             "--older-than",
             "0s",
             "--delete-branches",
-            "--force",
+            "--apply",
         ])
         .output()
         .expect("run wt0 gc");
@@ -181,7 +198,7 @@ fn migrate_apply_converts_a_clean_existing_worktree_and_is_idempotent() {
         .current_dir(&repo)
         .args(["--json", "migrate"])
         .arg(&existing)
-        .args(["--apply", "--baseline", &baseline])
+        .args(["--apply", "--adopt", "--baseline", &baseline])
         .output()
         .expect("apply source migration");
     assert!(
@@ -198,6 +215,13 @@ fn migrate_apply_converts_a_clean_existing_worktree_and_is_idempotent() {
             .expect("applied file count")
             >= 2
     );
+    let heartbeat = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "heartbeat"])
+        .arg(&existing)
+        .output()
+        .expect("heartbeat adopted worktree");
+    assert!(heartbeat.status.success());
 
     let repeated = Command::new(wt0)
         .current_dir(&repo)

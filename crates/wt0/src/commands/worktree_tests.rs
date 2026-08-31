@@ -30,17 +30,21 @@ fn gc_reaps_ephemeral_and_by_prefix_but_spares_others() -> Result<()> {
 
     let eph = fixture.root.join("eph");
     add_git_worktree(&repo, "exp/eph", &eph, &base)?;
+    mark_managed(&eph, "exp/eph", true)?;
     mark_ephemeral(&eph)?;
     let keep = fixture.root.join("keep");
     add_git_worktree(&repo, "exp/keep", &keep, &base)?;
+    mark_managed(&keep, "exp/keep", false)?;
     let other = fixture.root.join("other");
     add_git_worktree(&repo, "feat/other", &other, &base)?;
+    mark_managed(&other, "feat/other", true)?;
     mark_ephemeral(&other)?;
 
     let args = WorktreeGc {
         ephemeral: true,
         prefix: Some("exp".to_owned()),
         older_than: "0s".to_owned(),
+        apply: true,
         ..Default::default()
     };
     let outcome = run_gc(&repo, &args)?;
@@ -68,6 +72,7 @@ fn gc_skips_dirty_worktrees_without_force() -> Result<()> {
     let base = resolve_commit(&repo, "HEAD")?;
     let dirty = fixture.root.join("dirty");
     add_git_worktree(&repo, "dirty", &dirty, &base)?;
+    mark_managed(&dirty, "dirty", false)?;
     fs::write(dirty.join("scratch.txt"), "uncommitted")?;
 
     let outcome = run_gc(
@@ -87,8 +92,9 @@ fn gc_skips_dirty_worktrees_without_force() -> Result<()> {
             force: true,
             ..Default::default()
         },
-    )?;
-    assert_eq!(forced.reaped, vec![dirty]);
+    );
+    assert!(forced.is_err());
+    assert!(dirty.exists());
     Ok(())
 }
 
@@ -99,12 +105,14 @@ fn gc_deletes_merged_branches_when_requested() -> Result<()> {
     let base = resolve_commit(&repo, "HEAD")?;
     let target = fixture.root.join("merged");
     add_git_worktree(&repo, "agent/merged", &target, &base)?;
+    mark_managed(&target, "agent/merged", false)?;
 
     let outcome = run_gc(
         &repo,
         &WorktreeGc {
             older_than: "0s".to_owned(),
             delete_branches: true,
+            apply: true,
             ..Default::default()
         },
     )?;
@@ -122,6 +130,7 @@ fn gc_retains_unmerged_branches_without_force() -> Result<()> {
     let base = resolve_commit(&repo, "HEAD")?;
     let target = fixture.root.join("unmerged");
     add_git_worktree(&repo, "agent/unmerged", &target, &base)?;
+    mark_managed(&target, "agent/unmerged", false)?;
     fs::write(target.join("agent.txt"), "result")?;
     run_git_at(&target, ["add", "."])?;
     run_git_at(&target, ["commit", "-q", "-m", "agent result"])?;
@@ -131,12 +140,95 @@ fn gc_retains_unmerged_branches_without_force() -> Result<()> {
         &WorktreeGc {
             older_than: "0s".to_owned(),
             delete_branches: true,
+            apply: true,
             ..Default::default()
         },
     )?;
     assert_eq!(outcome.reaped, vec![target]);
     assert_eq!(outcome.retained_branches, vec!["agent/unmerged"]);
     assert!(branch_exists(&repo, "agent/unmerged")?);
+    Ok(())
+}
+
+#[test]
+fn gc_preserves_unowned_and_unknown_ignored_state() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fs::write(
+        fixture.repo.join(".gitignore"),
+        ".env.local\nnode_modules/\n",
+    )?;
+    run_git_at(&fixture.repo, ["add", "-f", ".gitignore"])?;
+    run_git_at(&fixture.repo, ["commit", "-q", "-m", "ignore policy"])?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+
+    let unowned = fixture.root.join("unowned");
+    add_git_worktree(&repo, "agent/unowned", &unowned, &base)?;
+    let secret = fixture.root.join("secret");
+    add_git_worktree(&repo, "agent/secret", &secret, &base)?;
+    mark_managed(&secret, "agent/secret", false)?;
+    fs::write(secret.join(".env.local"), "must survive\n")?;
+    let detached = fixture.root.join("detached");
+    run_git_common(
+        &repo,
+        [
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("--detach"),
+            detached.as_os_str(),
+            OsStr::new(&base),
+        ],
+    )?;
+    mark_managed(&detached, "detached:test", false)?;
+
+    let outcome = run_gc(
+        &repo,
+        &WorktreeGc {
+            older_than: "0s".to_owned(),
+            ..Default::default()
+        },
+    )?;
+    assert!(outcome.reaped.is_empty());
+    assert!(outcome.skipped.contains(&(unowned.clone(), "unowned")));
+    assert!(outcome
+        .skipped
+        .contains(&(secret.clone(), "unowned-local-state")));
+    assert!(outcome.skipped.contains(&(detached.clone(), "detached")));
+    assert_eq!(
+        fs::read_to_string(secret.join(".env.local"))?,
+        "must survive\n"
+    );
+    assert!(detached.exists());
+    Ok(())
+}
+
+#[test]
+fn gc_refuses_a_live_working_directory() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+    let target = fixture.root.join("active");
+    add_git_worktree(&repo, "agent/active", &target, &base)?;
+    mark_managed(&target, "agent/active", false)?;
+    let mut process = Command::new("sh")
+        .args(["-c", "sleep 30"])
+        .current_dir(&target)
+        .spawn()?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    let result = run_gc(
+        &repo,
+        &WorktreeGc {
+            older_than: "0s".to_owned(),
+            ..Default::default()
+        },
+    );
+    let _ = process.kill();
+    let _ = process.wait();
+    let outcome = result?;
+    assert!(outcome.reaped.is_empty());
+    assert_eq!(outcome.skipped, vec![(target.clone(), "active-cwd")]);
+    assert!(target.exists());
     Ok(())
 }
 

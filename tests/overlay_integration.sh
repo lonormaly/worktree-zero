@@ -94,7 +94,7 @@ if "$WT0" list --json | grep -q agent-1; then fail "agent-1 still registered"; f
 echo "== gc reaps ephemeral overlay worktrees and unmounts them =="
 a="$("$WT0" create gc-a --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
 b="$("$WT0" create gc-b --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
-"$WT0" gc --ephemeral --older-than 0s --delete-branches --force
+"$WT0" gc --ephemeral --older-than 0s --delete-branches --apply
 for d in "$a" "$b"; do
     if test -d "$d"; then fail "gc left $d on disk"; fi
     if mount | grep -q "$d"; then fail "gc left $d mounted"; fi

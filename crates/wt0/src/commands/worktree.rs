@@ -13,7 +13,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub(crate) mod cow;
@@ -35,6 +35,8 @@ pub enum Worktree {
     Run(WorktreeRun),
     /// Remount overlay-backed worktrees after a reboot or interrupted mount.
     Repair(WorktreeRepair),
+    /// Refresh the ownership lease for a running agent worktree.
+    Heartbeat(WorktreeHeartbeat),
 }
 
 #[derive(Args)]
@@ -118,17 +120,17 @@ pub struct WorktreeGc {
     #[arg(long, default_value = "24h")]
     pub older_than: String,
 
-    /// Reap even if the worktree has uncommitted changes (discards them).
-    #[arg(long)]
+    /// Legacy compatibility flag. Always refused; GC never discards dirty work.
+    #[arg(long, hide = true)]
     pub force: bool,
 
     /// Delete each reaped worktree's branch. Refuses unmerged branches unless --force.
     #[arg(long)]
     pub delete_branches: bool,
 
-    /// Report what would be reaped without removing anything.
+    /// Apply the reported garbage collection. Dry-run is the default.
     #[arg(long)]
-    pub dry_run: bool,
+    pub apply: bool,
 
     /// JSON output.
     #[arg(long)]
@@ -164,6 +166,16 @@ pub struct WorktreeRun {
 
 #[derive(Args, Default)]
 pub struct WorktreeRepair {
+    /// JSON output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Default)]
+pub struct WorktreeHeartbeat {
+    /// Worktree path or branch. Defaults to the current worktree.
+    pub target: Option<String>,
+
     /// JSON output.
     #[arg(long)]
     pub json: bool,
@@ -213,6 +225,7 @@ pub fn run(cmd: Worktree, global_json: bool) -> Result<()> {
         }
         Worktree::Run(args) => run_in_worktree(args, global_json),
         Worktree::Repair(args) => repair(args.json || global_json),
+        Worktree::Heartbeat(args) => heartbeat(args, global_json),
     }
 }
 
@@ -267,6 +280,11 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         PopulateMode::GitCheckout => add_git_worktree(&repo, &args.branch, &target, &base)?,
     }
 
+    if let Err(error) = mark_managed(&target, &args.branch, args.ephemeral) {
+        let _ = force_teardown(&repo, &target);
+        let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
+        return Err(error).context("record worktree ownership lease");
+    }
     if args.ephemeral {
         if let Err(error) = mark_ephemeral(&target) {
             let _ = force_teardown(&repo, &target);
@@ -297,11 +315,27 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
         args.branch
     );
     let (program, command_args) = args.command.split_first().context("command is required")?;
-    let status = Command::new(program)
+    let mut child = Command::new(program)
         .args(command_args)
         .current_dir(&created.target)
-        .status()
+        .spawn()
         .with_context(|| format!("run command in {}", created.target.display()))?;
+    let mut seconds_since_heartbeat = 0_u64;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("inspect agent command")? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        seconds_since_heartbeat += 1;
+        if seconds_since_heartbeat >= 30 {
+            if let Err(error) = refresh_heartbeat(&created.target) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.context("agent heartbeat failed; command stopped"));
+            }
+            seconds_since_heartbeat = 0;
+        }
+    };
     if !status.success() {
         bail!(
             "command exited with {status}; worktree retained at {}",
@@ -668,7 +702,7 @@ fn gc(args: WorktreeGc, json: bool) -> Result<()> {
 
     if json {
         emit(&json!({
-            "dry_run": args.dry_run,
+            "mode": if args.apply { "apply" } else { "dry-run" },
             "reaped": outcome.reaped
                 .iter()
                 .map(|p| p.display().to_string())
@@ -681,7 +715,7 @@ fn gc(args: WorktreeGc, json: bool) -> Result<()> {
             "deleted_branches": outcome.deleted_branches,
         }));
     } else {
-        let verb = if args.dry_run { "would reap" } else { "reaped" };
+        let verb = if args.apply { "reaped" } else { "would reap" };
         for path in &outcome.reaped {
             println!("{verb}: {}", path.display());
         }
@@ -748,7 +782,11 @@ struct GcOutcome {
 /// Core reaping logic, separated from output for testability. Returns the
 /// worktrees reaped (or that would be, under `--dry-run`) and those skipped.
 fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
+    if args.force {
+        bail!("--force is disabled: Worktree Zero never discards dirty work during garbage collection");
+    }
     let older_than = parse_duration(&args.older_than)?;
+    let live_cwds = live_working_directories()?;
     let mut reaped: Vec<PathBuf> = Vec::new();
     let mut skipped: Vec<(PathBuf, &'static str)> = Vec::new();
     let mut retained_branches = Vec::new();
@@ -758,7 +796,15 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
         if entry.is_main {
             continue;
         }
+        if !is_managed(&entry.path) {
+            skipped.push((entry.path, "unowned"));
+            continue;
+        }
         let branch = entry.branch.as_deref().unwrap_or("");
+        if branch.is_empty() {
+            skipped.push((entry.path, "detached"));
+            continue;
+        }
         let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
         if let Some(prefix) = &args.prefix {
             if !short.starts_with(prefix) {
@@ -771,20 +817,30 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
         if worktree_idle(&entry.path) < older_than {
             continue;
         }
-        if !args.force {
-            match worktree_dirty(&entry.path) {
-                Ok(true) => {
-                    skipped.push((entry.path.clone(), "dirty"));
-                    continue;
-                }
-                Err(_) => {
-                    skipped.push((entry.path.clone(), "status-failed"));
-                    continue;
-                }
-                Ok(false) => {}
-            }
+        if live_cwds.iter().any(|path| path.starts_with(&entry.path)) {
+            skipped.push((entry.path, "active-cwd"));
+            continue;
         }
-        if args.dry_run {
+        match worktree_dirty(&entry.path) {
+            Ok(true) => {
+                skipped.push((entry.path.clone(), "dirty"));
+                continue;
+            }
+            Err(_) => {
+                skipped.push((entry.path.clone(), "status-failed"));
+                continue;
+            }
+            Ok(false) => {}
+        }
+        if has_unknown_local_state(&entry.path)? {
+            skipped.push((entry.path, "unowned-local-state"));
+            continue;
+        }
+        if live_open_path(&entry.path)?.is_some() {
+            skipped.push((entry.path, "active-open-path"));
+            continue;
+        }
+        if !args.apply {
             reaped.push(entry.path);
             continue;
         }
@@ -792,7 +848,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
             Ok(()) => {
                 if args.delete_branches {
                     if let Some(branch) = &entry.branch {
-                        if delete_local_branch(repo, branch, args.force).is_err() {
+                        if delete_local_branch(repo, branch, false).is_err() {
                             retained_branches.push(short.to_owned());
                         } else {
                             deleted_branches.push(short.to_owned());
@@ -805,7 +861,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
         }
     }
 
-    if !args.dry_run {
+    if args.apply {
         run_git_common(repo, [OsStr::new("worktree"), OsStr::new("prune")])?;
     }
     Ok(GcOutcome {
@@ -885,18 +941,113 @@ fn mark_ephemeral(worktree: &Path) -> Result<()> {
     Ok(())
 }
 
+fn managed_marker(worktree: &Path) -> Result<PathBuf> {
+    Ok(worktree_admin_dir(worktree)?.join("wt0-runtime.json"))
+}
+
+fn now_unix_seconds() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs())
+}
+
+pub(crate) fn mark_managed(worktree: &Path, branch: &str, ephemeral: bool) -> Result<()> {
+    let marker = managed_marker(worktree)?;
+    if marker.is_file() {
+        bail!(
+            "worktree already has an ownership marker: {}",
+            marker.display()
+        );
+    }
+    let now = now_unix_seconds()?;
+    fs::write(
+        marker,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "runtime_id": Uuid::now_v7().to_string(),
+            "branch": branch,
+            "ephemeral": ephemeral,
+            "created_at_unix": now,
+            "heartbeat_at_unix": now,
+        }))?,
+    )
+    .context("write worktree ownership marker")
+}
+
+pub(crate) fn is_managed(worktree: &Path) -> bool {
+    managed_marker(worktree)
+        .map(|marker| marker.is_file())
+        .unwrap_or(false)
+}
+
+fn refresh_heartbeat(worktree: &Path) -> Result<(String, u64)> {
+    let marker = managed_marker(worktree)?;
+    let bytes = fs::read(&marker).with_context(|| {
+        format!(
+            "worktree is not owned by Worktree Zero; missing {}",
+            marker.display()
+        )
+    })?;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&bytes).context("parse worktree ownership marker")?;
+    let runtime_id = value["runtime_id"]
+        .as_str()
+        .context("ownership marker has no runtime_id")?
+        .to_owned();
+    let now = now_unix_seconds()?;
+    value["heartbeat_at_unix"] = json!(now);
+    let temporary = marker.with_extension(format!("json.{}.tmp", Uuid::now_v7()));
+    fs::write(&temporary, serde_json::to_vec_pretty(&value)?)?;
+    fs::rename(&temporary, &marker).context("publish worktree heartbeat")?;
+    Ok((runtime_id, now))
+}
+
+fn heartbeat(args: WorktreeHeartbeat, json_output: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let repo_hint = args
+        .target
+        .as_deref()
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        })
+        .filter(|path| path.exists())
+        .unwrap_or(cwd);
+    let repo = discover_repo(&repo_hint)?;
+    let target = resolve_worktree_target(&repo, args.target.as_deref())?;
+    let (runtime_id, heartbeat_at_unix) = refresh_heartbeat(&target)?;
+    if json_output || args.json {
+        emit(&json!({
+            "worktree": target,
+            "runtime_id": runtime_id,
+            "heartbeat_at_unix": heartbeat_at_unix,
+        }));
+    } else {
+        println!("heartbeat: {} ({runtime_id})", target.display());
+    }
+    Ok(())
+}
+
 fn is_ephemeral(repo: &RepoContext, worktree: &Path) -> bool {
     overlay::admin_dir(repo, worktree)
         .map(|admin| admin.join("wt0-ephemeral").is_file())
         .unwrap_or(false)
 }
 
-/// Time since the worktree was last touched, approximated by the mtime of its
-/// index (updated on add/commit/checkout), falling back to the directory mtime.
+/// Time since the last Worktree Zero heartbeat, falling back to Git activity
+/// only for reporting unowned legacy worktrees that GC will preserve.
 fn worktree_idle(worktree: &Path) -> Duration {
-    let index = worktree_admin_dir(worktree).ok().map(|a| a.join("index"));
-    let probe = match index {
-        Some(index) if index.is_file() => index,
+    let admin = worktree_admin_dir(worktree).ok();
+    let marker = admin.as_ref().map(|admin| admin.join("wt0-runtime.json"));
+    let index = admin.map(|admin| admin.join("index"));
+    let probe = match (marker, index) {
+        (Some(marker), _) if marker.is_file() => marker,
+        (_, Some(index)) if index.is_file() => index,
         _ => worktree.to_path_buf(),
     };
     fs::metadata(&probe)
@@ -912,6 +1063,98 @@ fn worktree_dirty(worktree: &Path) -> Result<bool> {
         return Err(git_failure("git status --porcelain", &output));
     }
     Ok(!output.stdout.is_empty())
+}
+
+fn live_working_directories() -> Result<Vec<PathBuf>> {
+    let output = Command::new("lsof")
+        .args(["-a", "-d", "cwd", "-Fn"])
+        .output()
+        .context("lsof is required for safe worktree garbage collection")?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        bail!("lsof failed while checking active worktree processes");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .map(PathBuf::from)
+        .collect())
+}
+
+fn live_open_path(worktree: &Path) -> Result<Option<String>> {
+    let output = Command::new("lsof")
+        .args(["-Fn", "+D"])
+        .arg(worktree)
+        .output()
+        .context("lsof is required for safe worktree garbage collection")?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        bail!("lsof failed while checking open worktree paths");
+    }
+    let root = worktree.to_string_lossy();
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .find(|path| *path == root || path.starts_with(&format!("{root}/")))
+        .map(str::to_owned))
+}
+
+fn has_unknown_local_state(worktree: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--ignored=matching",
+            "--untracked-files=all",
+        ])
+        .current_dir(worktree)
+        .output()
+        .context("inspect ignored worktree state")?;
+    if !output.status.success() {
+        bail!("git status failed while classifying ignored worktree state");
+    }
+    for record in output.stdout.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let text = match std::str::from_utf8(record) {
+            Ok(text) => text,
+            Err(_) => return Ok(true),
+        };
+        let Some(path) = text.strip_prefix("!! ") else {
+            return Ok(true);
+        };
+        if !is_known_generated_path(Path::new(path)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn is_known_generated_path(path: &Path) -> bool {
+    const GENERATED_DIRECTORIES: &[&str] = &[
+        "node_modules",
+        ".next",
+        ".nx",
+        ".turbo",
+        ".wrangler",
+        ".expo",
+        "coverage",
+        "dist",
+        "out",
+        "build",
+        ".output",
+        "storybook-static",
+    ];
+    path.components().any(|component| {
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        GENERATED_DIRECTORIES
+            .iter()
+            .any(|generated| name == OsStr::new(generated))
+    }) || path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().ends_with(".tsbuildinfo"))
 }
 
 /// Parse a compact duration like `90s`, `30m`, `24h`, `7d`. A bare number is
