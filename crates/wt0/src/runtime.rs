@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
 
+const DEFAULT_GENERATED_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
 #[derive(Args)]
 pub struct Doctor {
     /// Repository or worktree to inspect. Defaults to the current directory.
@@ -51,15 +53,18 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let generated = generated_storage(&root)?;
     let bun = bun_report(&root);
     let stale = dependencies.bun_backups + dependencies.materialized_root_entries;
-    let ready = bun
+    let dependency_ready = bun
         .as_ref()
         .is_none_or(|report| report.configured && report.version.is_some())
         && stale == 0;
+    let generated_ready = generated.total() <= DEFAULT_GENERATED_BUDGET_BYTES;
+    let ready = dependency_ready && generated_ready;
 
     let report = json!({
         "schema_version": 1,
         "root": root,
         "ready": ready,
+        "dependency_ready": dependency_ready,
         "source": {
             "git_objects_shared": true,
             "physical_measurement": "df-delta",
@@ -77,6 +82,8 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
         },
         "generated": {
             "logical_bytes": generated.total(),
+            "budget_bytes": DEFAULT_GENERATED_BUDGET_BYTES,
+            "within_budget": generated_ready,
             "next_bytes": generated.next,
             "nx_bytes": generated.nx,
             "turbo_bytes": generated.turbo,
@@ -102,6 +109,12 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
         println!("  ready:             {}", if ready { "yes" } else { "no" });
         if stale > 0 {
             println!("  action: run a reviewed Worktree Zero dependency repair before agent work");
+        }
+        if !generated_ready {
+            println!(
+                "  action: generated state exceeds the default {}; apply project retention policy",
+                human_bytes(DEFAULT_GENERATED_BUDGET_BYTES)
+            );
         }
     }
     if ready {
