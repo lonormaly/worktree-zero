@@ -34,6 +34,7 @@
 //! ```
 
 mod commands;
+mod runtime;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -69,6 +70,8 @@ enum Commands {
     Repair(commands::worktree::WorktreeRepair),
     /// Remove stale source baselines and Git registrations.
     Prune(commands::worktree::WorktreePrune),
+    /// Inspect dependency sharing and generated runtime storage.
+    Doctor(runtime::Doctor),
     /// Compatibility namespace for the imported source engine.
     #[command(hide = true, subcommand)]
     Worktree(commands::worktree::Worktree),
@@ -98,6 +101,7 @@ fn main() -> Result<()> {
         Commands::Prune(args) => {
             commands::worktree::run(commands::worktree::Worktree::Prune(args), cli.json)
         }
+        Commands::Doctor(args) => runtime::doctor(args, cli.json),
         Commands::Worktree(cmd) => commands::worktree::run(cmd, cli.json),
     }
 }
