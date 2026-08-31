@@ -117,6 +117,20 @@ wt0 migrate --all --source-only
 wt0 migrate --all --source-only --apply --adopt
 ```
 
+Projects may explicitly review additional ignored outputs without teaching the
+generic adapter project-specific names:
+
+```bash
+wt0 gc --allow-generated apps/docs/.source \
+  --allow-generated services/worker/.local-runtime
+wt0 gc --allow-generated apps/docs/.source \
+  --allow-generated services/worker/.local-runtime --apply
+```
+
+Each path must be relative and appears in the JSON receipt. Sensitive paths
+such as `.env*`, `.dev.vars`, or a `secrets` directory cannot be allowed through
+this option. Unknown ignored paths continue to block removal.
+
 ## Why Git worktrees still repeat tracked files
 
 ### What branch isolation means

@@ -155,7 +155,7 @@ fn gc_preserves_unowned_and_unknown_ignored_state() -> Result<()> {
     let fixture = Fixture::new()?;
     fs::write(
         fixture.repo.join(".gitignore"),
-        ".env.local\nnode_modules/\n",
+        ".env.local\n.generated-cache/\nnode_modules/\n",
     )?;
     run_git_at(&fixture.repo, ["add", "-f", ".gitignore"])?;
     run_git_at(&fixture.repo, ["commit", "-q", "-m", "ignore policy"])?;
@@ -180,15 +180,21 @@ fn gc_preserves_unowned_and_unknown_ignored_state() -> Result<()> {
         ],
     )?;
     mark_managed(&detached, "detached:test", false)?;
+    let custom = fixture.root.join("custom");
+    add_git_worktree(&repo, "agent/custom", &custom, &base)?;
+    mark_managed(&custom, "agent/custom", false)?;
+    fs::create_dir(custom.join(".generated-cache"))?;
+    fs::write(custom.join(".generated-cache/data"), "generated\n")?;
 
     let outcome = run_gc(
         &repo,
         &WorktreeGc {
             older_than: "0s".to_owned(),
+            allowed_generated: vec![PathBuf::from(".generated-cache")],
             ..Default::default()
         },
     )?;
-    assert!(outcome.reaped.is_empty());
+    assert_eq!(outcome.reaped, vec![custom]);
     assert!(outcome.skipped.contains(&(unowned.clone(), "unowned")));
     assert!(outcome
         .skipped
@@ -199,6 +205,8 @@ fn gc_preserves_unowned_and_unknown_ignored_state() -> Result<()> {
         "must survive\n"
     );
     assert!(detached.exists());
+    assert!(validate_generated_policy(&[PathBuf::from(".env.local")]).is_err());
+    assert!(validate_generated_policy(&[PathBuf::from("../outside")]).is_err());
     Ok(())
 }
 
