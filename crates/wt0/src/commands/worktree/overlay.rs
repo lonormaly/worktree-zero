@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-const OVERLAY_MARKER: &str = "simgit-overlay";
+const OVERLAY_MARKER: &str = "wt0-overlay";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct State {
@@ -152,7 +152,7 @@ pub(super) fn admin_dir(repo: &RepoContext, worktree: &Path) -> Option<PathBuf> 
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|path| PathBuf::from(path.trim()));
     // When `worktree` is an empty, unmounted mountpoint nested inside the
-    // common git dir (e.g. `.git/simgit/worktrees/<name>`), git's directory
+    // common git dir (e.g. `.git/wt0/worktrees/<name>`), git's directory
     // discovery walks past it and finds the outer repository instead. Reject
     // that escape rather than mistaking the whole repo for this worktree's
     // admin dir.

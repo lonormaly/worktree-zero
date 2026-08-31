@@ -1,10 +1,10 @@
-# Contributing to simgit
+# Contributing to Worktree Zero
 
 ## Getting started
 
 ```bash
-git clone https://github.com/abendrothj/simgit.git
-cd simgit
+git clone https://github.com/lonormaly/worktree-zero.git
+cd worktree-zero
 cargo build --workspace
 cargo test --workspace
 ```
@@ -18,8 +18,8 @@ You'll need:
 ## Project structure
 
 ```
-simgit/
-├── sg/               the CLI — `sg worktree add/run/list/remove/prune/gc/repair`
+worktree-zero/
+├── crates/wt0/        the CLI — `wt0 create/run/list/remove/prune/gc/repair`
 │   ├── src/commands/worktree.rs   command and lifecycle orchestration
 │   └── src/commands/worktree/     CoW baseline and overlay backends
 ├── tests/            CoW scaling benchmarks + overlay_integration.sh (Linux)
@@ -29,24 +29,19 @@ simgit/
 
 ## Finding something to work on
 
-Issues labeled [good first issue](https://github.com/abendrothj/simgit/labels/good%20first%20issue) are designed for newcomers — no deep codebase knowledge needed. Issues labeled [help wanted](https://github.com/abendrothj/simgit/labels/help%20wanted) are higher-effort features we'd love help with.
+Issues labeled [good first issue](https://github.com/lonormaly/worktree-zero/labels/good%20first%20issue) are designed for newcomers. Issues labeled [help wanted](https://github.com/lonormaly/worktree-zero/labels/help%20wanted) are higher-effort features.
 
 ## Architecture overview
 
-simgit is a small CLI that creates real Git linked worktrees populated via
-filesystem copy-on-write. It has no daemon and no runtime services — each
-invocation shells out to `git` and, where supported, populates the working tree
-via `clonefile`/reflink or a `fuse-overlayfs` mount from a cached baseline. The
-command lifecycle lives in `sg/src/commands/worktree.rs`; filesystem-specific
-CoW baseline and overlay recovery logic lives in the adjacent backend modules.
+Worktree Zero creates real Git linked worktrees and owns the agent runtime around
+them. The source engine shells out to `git` and, where supported, populates the
+working tree via `clonefile`/reflink or a `fuse-overlayfs` mount from a cached
+baseline. The command lifecycle lives in `crates/wt0/src/commands/worktree.rs`;
+filesystem-specific CoW and overlay recovery live in the adjacent modules.
 
 The overlay path only activates on Linux with `fuse-overlayfs`; it can't run on
 macOS, so it's covered by `tests/overlay_integration.sh` in the `overlay-linux`
-CI job. `SIMGIT_POPULATE=reflink|overlay|checkout` forces a populate mode.
-
-(An earlier daemon-based architecture — session manager, borrow registry, delta
-store, RPC server, VFS backends — was retired; see the README "History"
-section and Git history.)
+CI job. `WT0_POPULATE=reflink|overlay|checkout` forces a populate mode.
 
 ## Before submitting a PR
 
@@ -64,15 +59,14 @@ section and Git history.)
 
 ## Releasing
 
-Published as `simgit-cli` on crates.io (binary `sg`).
+Published as `worktree-zero` on crates.io (binary `wt0`).
 
 1. Bump `version` in the workspace `Cargo.toml`, `cargo build` to refresh the lockfile, commit.
 2. Tag and push: `git tag -a vX.Y.Z -m "…" && git push origin main vX.Y.Z`.
-3. `cargo publish -p simgit-cli`.
+3. `cargo publish -p worktree-zero`.
 4. GitHub release: `gh release create vX.Y.Z --title vX.Y.Z --notes "…"`.
-5. Homebrew: update `url`/`sha256` in `packaging/homebrew/simgit.rb`
-   (`curl -sL <tarball> | shasum -a 256`) and copy it into the
-   `abendrothj/homebrew-tap` repo's `Formula/simgit.rb`.
+5. Homebrew: update `url`/`sha256` in
+   `packaging/homebrew/worktree-zero.rb` after the first stable release.
 
 ## Communication
 

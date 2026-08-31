@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[test]
 fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
     let root = std::env::temp_dir().join(format!(
-        "simgit-cli-workflow-{}-{}",
+        "worktree-zero-workflow-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -23,10 +23,10 @@ fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "-m", "initial"]);
 
-    let sg = env!("CARGO_BIN_EXE_sg");
-    let run = Command::new(sg)
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let run = Command::new(wt0)
         .current_dir(&repo)
-        .args(["worktree", "run", "agent/test", "--path"])
+        .args(["run", "agent/test", "--path"])
         .arg(&worktree)
         .args([
             "--",
@@ -35,7 +35,7 @@ fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
             "printf 'agent output\\n' > result.txt && git add . && git commit -qm agent-result",
         ])
         .output()
-        .expect("run sg worktree run");
+        .expect("run wt0 run");
     assert!(
         run.status.success(),
         "stderr: {}",
@@ -46,10 +46,9 @@ fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
         "agent output\n"
     );
 
-    let gc = Command::new(sg)
+    let gc = Command::new(wt0)
         .current_dir(&repo)
         .args([
-            "worktree",
             "gc",
             "--ephemeral",
             "--older-than",
@@ -58,7 +57,7 @@ fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
             "--force",
         ])
         .output()
-        .expect("run sg worktree gc");
+        .expect("run wt0 gc");
     assert!(
         gc.status.success(),
         "stderr: {}",

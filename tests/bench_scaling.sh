@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Scaling benchmark: does simgit's "avoid N copies of the working tree" claim hold?
+# Scaling benchmark: does wt0's "avoid N copies of the working tree" claim hold?
 # Compares real host disk and time-to-ready for N `git worktree` checkouts vs
-# N native CoW-backed `sg worktree` checkouts. See docs/scaling_benchmark.md.
+# N native CoW-backed `wt0 worktree` checkouts. See docs/scaling_benchmark.md.
 #
 #   NFILES=400 FSIZE_KB=128 NS="1 2 4 8 16" bash tests/bench_scaling.sh
 #
@@ -13,14 +13,14 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SG="${SG:-$REPO_ROOT/target/debug/sg}"
+WT0="${WT0:-$REPO_ROOT/target/debug/wt0}"
 WORK="${WORK:-$(mktemp -d)}"
 NFILES="${NFILES:-400}"        # files in the working tree
 FSIZE_KB="${FSIZE_KB:-128}"    # size per file
 NS="${NS:-1 2 4 8}"            # session counts to test
 DISK_SETTLE_SECS="${DISK_SETTLE_SECS:-1}"
 
-[ -x "$SG" ] || { echo "missing $SG — run: cargo build -p simgit-cli"; exit 1; }
+[ -x "$WT0" ] || { echo "missing $WT0 — run: cargo build -p worktree-zero"; exit 1; }
 
 kb() { local v; v=$(du -sxk "$1" 2>/dev/null | awk '{print $1; exit}'); echo "${v:-0}"; }
 used_kb() { df -Pk "$1" | awk 'NR == 2 {print $3}'; }
@@ -43,7 +43,7 @@ make_repo() {
 }
 
 TREE_KB=""
-printf '%-6s | %-34s | %-34s\n' "N" "git worktree" "sg native CoW worktree"
+printf '%-6s | %-34s | %-34s\n' "N" "git worktree" "wt0 native CoW worktree"
 printf '%-6s | %-9s %-10s %-9s | %-9s %-10s %-9s\n' "" "du(MB)" "phys(MB)" "time(s)" "du(MB)" "phys(MB)" "time(s)"
 echo "-------|------------------------------------|------------------------------------"
 
@@ -68,17 +68,17 @@ for N in $NS; do
   settle_disk
 
   # ---------- native CoW-backed linked worktrees ----------
-  SGREPO="$WORK/bench-sg"
+  SGREPO="$WORK/bench-wt0"
   make_repo "$SGREPO"
   settle_disk
   sg_before=$(used_kb "$WORK")
   t0=$(now_ns)
-  ( cd "$SGREPO"; for j in $(seq 1 "$N"); do "$SG" worktree add "feat/s$j" >/dev/null 2>&1; done )
+  ( cd "$SGREPO"; for j in $(seq 1 "$N"); do "$WT0" create "feat/s$j" >/dev/null 2>&1; done )
   t1=$(now_ns)
   settle_disk
   sg_after=$(used_kb "$WORK")
   sg_time=$(elapsed_s "$t1" "$t0")
-  sg_kb=$(kb "$SGREPO/.git/simgit")
+  sg_kb=$(kb "$SGREPO/.git/wt0")
   sg_mb=$(awk -v k="$sg_kb" 'BEGIN{printf "%.1f", k/1024}')
   sg_phys_mb=$(delta_mb "$sg_after" "$sg_before")
   rm -rf "$SGREPO"

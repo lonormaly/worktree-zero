@@ -1,9 +1,8 @@
 //! Native Git linked worktrees populated with filesystem copy-on-write clones.
 //!
-//! `sg worktree` deliberately has no daemon dependency. Git owns the refs,
-//! index, commits, and lifecycle; simgit only avoids repeatedly inflating the
-//! same checkout by cloning an immutable cached baseline when the filesystem
-//! supports it.
+//! This module is Worktree Zero's source-checkout engine. Git owns refs and
+//! commits; this module avoids repeatedly inflating the same checkout by
+//! cloning an immutable cached baseline when the filesystem supports it.
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
@@ -42,7 +41,8 @@ pub struct WorktreeAdd {
     /// Branch name to create (for example, feat/my-feature).
     pub branch: String,
 
-    /// Worktree path. Defaults to `.git/simgit/worktrees/<branch>`.
+    /// Worktree path. Defaults to `.git/wt0/worktrees/<branch>`.
+    #[arg(long)]
     pub path: Option<PathBuf>,
 
     /// Commit-ish to start from. Defaults to HEAD.
@@ -73,7 +73,7 @@ pub struct WorktreeRemove {
     pub commit: bool,
 
     /// Commit message for --commit.
-    #[arg(short, long, default_value = "simgit worktree remove")]
+    #[arg(short, long, default_value = "wt0 remove")]
     pub message: String,
 
     /// Discard uncommitted changes. Without this flag, Git refuses dirty removal.
@@ -140,7 +140,7 @@ pub struct WorktreeRun {
     /// Branch to create for the command.
     pub branch: String,
 
-    /// Worktree path. Defaults to `.git/simgit/worktrees/<branch>`.
+    /// Worktree path. Defaults to `.git/wt0/worktrees/<branch>`.
     #[arg(long)]
     pub path: Option<PathBuf>,
 
@@ -311,31 +311,31 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
 }
 
 /// Choose how to populate the worktree. Prefers per-file reflink, then
-/// fuse-overlayfs, then a plain checkout. `SIMGIT_POPULATE` (reflink | overlay |
+/// fuse-overlayfs, then a plain checkout. `WT0_POPULATE` (reflink | overlay |
 /// checkout) forces a specific mode and errors if it is unavailable.
 fn select_populate_mode(
     repo: &RepoContext,
     target_parent: &Path,
     require_cow: bool,
 ) -> Result<PopulateMode> {
-    if let Ok(forced) = std::env::var("SIMGIT_POPULATE") {
+    if let Ok(forced) = std::env::var("WT0_POPULATE") {
         return match forced.to_lowercase().as_str() {
             "reflink" | "cow" | "cow-clone" => {
                 if cow::clone_supported(&repo.common_git_dir, target_parent)? {
                     Ok(PopulateMode::CowClone)
                 } else {
-                    bail!("SIMGIT_POPULATE=reflink but reflink cloning is unsupported here")
+                    bail!("WT0_POPULATE=reflink but reflink cloning is unsupported here")
                 }
             }
             "overlay" => {
                 if overlay::supported() {
                     Ok(PopulateMode::Overlay)
                 } else {
-                    bail!("SIMGIT_POPULATE=overlay but fuse-overlayfs is not installed")
+                    bail!("WT0_POPULATE=overlay but fuse-overlayfs is not installed")
                 }
             }
             "checkout" | "git-checkout" => Ok(PopulateMode::GitCheckout),
-            other => bail!("unknown SIMGIT_POPULATE={other} (use reflink, overlay, or checkout)"),
+            other => bail!("unknown WT0_POPULATE={other} (use reflink, overlay, or checkout)"),
         };
     }
 
@@ -857,13 +857,13 @@ fn worktree_admin_dir(worktree: &Path) -> Result<PathBuf> {
 
 fn mark_ephemeral(worktree: &Path) -> Result<()> {
     let admin = worktree_admin_dir(worktree)?;
-    fs::write(admin.join("simgit-ephemeral"), b"").context("write ephemeral marker")?;
+    fs::write(admin.join("wt0-ephemeral"), b"").context("write ephemeral marker")?;
     Ok(())
 }
 
 fn is_ephemeral(repo: &RepoContext, worktree: &Path) -> bool {
     overlay::admin_dir(repo, worktree)
-        .map(|admin| admin.join("simgit-ephemeral").is_file())
+        .map(|admin| admin.join("wt0-ephemeral").is_file())
         .unwrap_or(false)
 }
 
@@ -959,7 +959,7 @@ fn resolve_commit(repo: &RepoContext, base: &str) -> Result<String> {
 
 fn default_worktree_path(common_git_dir: &Path, branch: &str) -> PathBuf {
     common_git_dir
-        .join("simgit")
+        .join("wt0")
         .join("worktrees")
         .join(safe_path_component(branch))
 }
@@ -999,7 +999,7 @@ fn absolute_path(path: PathBuf) -> Result<PathBuf> {
 }
 
 fn state_dir(common_git_dir: &Path) -> PathBuf {
-    common_git_dir.join("simgit")
+    common_git_dir.join("wt0")
 }
 
 fn ensure_clean(worktree: &Path) -> Result<()> {

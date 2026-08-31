@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare native file I/O in a Git worktree and an sg CoW worktree.
+"""Compare native file I/O in a Git worktree and an wt0 CoW worktree.
 
 Both arguments must contain the same untouched tracked files. The benchmark
 warms metadata/data caches, alternates execution order, and reports ranges.
@@ -47,7 +47,7 @@ def read_all(paths: list[Path]) -> int:
 
 
 def durable_first_writes(paths: list[Path]) -> int:
-    payload = b"simgit-first-write".ljust(4096, b"\0")
+    payload = b"wt0-first-write".ljust(4096, b"\0")
     for path in paths:
         with path.open("r+b", buffering=0) as handle:
             handle.write(payload)
@@ -92,25 +92,25 @@ def main() -> None:
     read_all(sg_files)
 
     print(f"files: {len(git_files)}")
-    print("operation                 git worktree       sg CoW worktree")
+    print("operation                 git worktree       wt0 CoW worktree")
 
-    git, sg = ranges(git_files, sg_files, stat_all, args.rounds)
+    git, wt0 = ranges(git_files, sg_files, stat_all, args.rounds)
     print(
         f"stat (us/file)            {span([s / n * 1e6 for s, n in git]):18} "
-        f"{span([s / n * 1e6 for s, n in sg])}"
+        f"{span([s / n * 1e6 for s, n in wt0])}"
     )
 
-    git, sg = ranges(git_files, sg_files, read_prefixes, args.rounds)
+    git, wt0 = ranges(git_files, sg_files, read_prefixes, args.rounds)
     print(
         f"read 4KiB (us/file)       {span([s / len(git_files) * 1e6 for s, _ in git]):18} "
-        f"{span([s / len(sg_files) * 1e6 for s, _ in sg])}"
+        f"{span([s / len(sg_files) * 1e6 for s, _ in wt0])}"
     )
 
-    git, sg = ranges(git_files, sg_files, read_all, args.rounds)
+    git, wt0 = ranges(git_files, sg_files, read_all, args.rounds)
     gib = 1024**3
     print(
         f"full read (GiB/s)         {span([n / gib / s for s, n in git]):18} "
-        f"{span([n / gib / s for s, n in sg])}"
+        f"{span([n / gib / s for s, n in wt0])}"
     )
 
     git_seconds, _ = timed(lambda: durable_first_writes(git_files))

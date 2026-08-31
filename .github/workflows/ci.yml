@@ -30,7 +30,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y fuse-overlayfs
       - run: cargo build --release
       - name: Overlay integration test
-        run: SG="$PWD/target/release/sg" bash tests/overlay_integration.sh
+        run: WT0="$PWD/target/release/wt0" bash tests/overlay_integration.sh
 
   linux-arm64:
     runs-on: ubuntu-latest
@@ -44,4 +44,4 @@ jobs:
       - name: Cross-build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --locked --target aarch64-unknown-linux-gnu -p simgit-cli
+        run: cargo build --release --locked --target aarch64-unknown-linux-gnu -p worktree-zero

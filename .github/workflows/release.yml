@@ -1,9 +1,9 @@
 name: Release
 
-# On every version tag, build `sg` for the common targets and attach them to
-# the GitHub release as sg-<target>.tar.gz (containing sg-<target>/sg). This
-# naming matches the [package.metadata.binstall] config in sg/Cargo.toml, so
-# `cargo binstall simgit-cli` fetches these prebuilt binaries instead of
+# On every version tag, build `wt0` for the common targets and attach them to
+# the GitHub release as wt0-<target>.tar.gz (containing wt0-<target>/wt0). This
+# naming matches the [package.metadata.binstall] config in wt0/Cargo.toml, so
+# `cargo binstall worktree-zero` fetches these prebuilt binaries instead of
 # compiling.
 
 on:
@@ -39,12 +39,12 @@ jobs:
       - name: Build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --locked --target ${{ matrix.target }} -p simgit-cli
+        run: cargo build --release --locked --target ${{ matrix.target }} -p worktree-zero
       - name: Package
         run: |
-          dir="sg-${{ matrix.target }}"
+          dir="wt0-${{ matrix.target }}"
           mkdir "$dir"
-          cp "target/${{ matrix.target }}/release/sg" "$dir/"
+          cp "target/${{ matrix.target }}/release/wt0" "$dir/"
           cp README.md LICENSE "$dir/"
           tar czf "$dir.tar.gz" "$dir"
       - name: Attach to release
@@ -55,4 +55,4 @@ jobs:
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" --verify-tag --title "$tag" --generate-notes || sleep 3
           fi
-          gh release upload "$tag" "sg-${{ matrix.target }}.tar.gz" --clobber
+          gh release upload "$tag" "wt0-${{ matrix.target }}.tar.gz" --clobber

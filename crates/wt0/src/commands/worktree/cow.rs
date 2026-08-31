@@ -23,8 +23,8 @@ pub(super) fn clone_supported(common_git_dir: &Path, destination_dir: &Path) -> 
         fs::create_dir_all(&probe)?;
         let token = Uuid::new_v4().to_string();
         let source = probe.join(format!("{token}.source"));
-        let destination = destination_dir.join(format!(".simgit-clone-probe-{token}"));
-        fs::write(&source, b"simgit-cow-probe")?;
+        let destination = destination_dir.join(format!(".wt0-clone-probe-{token}"));
+        fs::write(&source, b"wt0-cow-probe")?;
         let status = clone_file_command(&source, &destination)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -75,7 +75,7 @@ pub(super) fn ensure_baseline(repo: &RepoContext, commit: &str) -> Result<PathBu
     fs::create_dir_all(&root)?;
     if final_dir.exists() {
         bail!(
-            "cached baseline {} is incomplete; run `sg worktree prune --all`",
+            "cached baseline {} is incomplete; run `wt0 prune --all`",
             final_dir.display()
         );
     }

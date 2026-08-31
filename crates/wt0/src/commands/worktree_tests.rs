@@ -190,8 +190,8 @@ fn admin_dir_does_not_escape_to_the_common_git_dir_when_unmounted() -> Result<()
     let repo = discover_repo(&fixture.repo)?;
     let base = resolve_commit(&repo, "HEAD")?;
     // Mirrors production overlay worktrees, whose mountpoint lives inside the
-    // common git dir itself (e.g. `.git/simgit/worktrees/<name>`).
-    let worktree = repo.common_git_dir.join("simgit/worktrees/nested");
+    // common git dir itself (e.g. `.git/wt0/worktrees/<name>`).
+    let worktree = repo.common_git_dir.join("wt0/worktrees/nested");
     add_git_worktree(&repo, "nested", &worktree, &base)?;
     let admin = overlay::admin_dir(&repo, &worktree).expect("admin dir while mounted");
     assert_ne!(admin, repo.common_git_dir);
@@ -205,7 +205,7 @@ fn admin_dir_does_not_escape_to_the_common_git_dir_when_unmounted() -> Result<()
 
 #[test]
 fn overlay_health_requires_the_view_to_reflect_upperdir_data() -> Result<()> {
-    let root = std::env::temp_dir().join(format!("simgit-overlay-health-{}", Uuid::new_v4()));
+    let root = std::env::temp_dir().join(format!("wt0-overlay-health-{}", Uuid::new_v4()));
     let upper = root.join("upper");
     let view = root.join("view");
     fs::create_dir_all(upper.join("nested"))?;
@@ -333,7 +333,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Result<Self> {
-        let root = std::env::temp_dir().join(format!("simgit-worktree-test-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("wt0-worktree-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root)?;
         let root = root.canonicalize()?;
         let repo = root.join("repo");
@@ -343,26 +343,18 @@ impl Fixture {
         git(&repo, ["config", "user.name", "Test User"])?;
         git(
             &repo,
-            [
-                "config",
-                "filter.simgit.clean",
-                "sed 's/^smudged:/stored:/'",
-            ],
+            ["config", "filter.wt0.clean", "sed 's/^smudged:/stored:/'"],
         )?;
         git(
             &repo,
-            [
-                "config",
-                "filter.simgit.smudge",
-                "sed 's/^stored:/smudged:/'",
-            ],
+            ["config", "filter.wt0.smudge", "sed 's/^stored:/smudged:/'"],
         )?;
         fs::write(repo.join("file.txt"), "content\n")?;
         fs::write(repo.join("file with spaces.txt"), "spaces\n")?;
         fs::write(repo.join("filtered.txt"), "smudged:content\n")?;
         fs::write(
             repo.join(".gitattributes"),
-            "archive-excluded.txt export-ignore\nfiltered.txt filter=simgit\n",
+            "archive-excluded.txt export-ignore\nfiltered.txt filter=wt0\n",
         )?;
         fs::write(
             repo.join("archive-excluded.txt"),
