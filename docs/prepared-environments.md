@@ -1,6 +1,7 @@
 # Prepared environments
 
-Status: approved product direction; benchmarked baseline; implementation not yet complete.
+Status: Bun adapter implemented and measured on macOS; Linux prepared-environment
+measurement and additional package-manager adapters remain release gates.
 
 ## The user promise
 
@@ -40,7 +41,7 @@ Measured on an isolated APFS volume with a Next, React, TypeScript, and Zod
 fixture that installed dependencies, ran tests, changed source, changed one
 dependency, tested again, and removed the worktrees:
 
-| Worktrees | npm + plain Git | npm + current wt0 | Bun global store + plain Git | Bun global store + current wt0 |
+| Worktrees | npm + plain Git | npm + source-only wt0 | Bun global store + plain Git | Bun + source-only wt0 |
 | ---: | ---: | ---: | ---: | ---: |
 | 1 | 361.79 MiB | 373.52 MiB | 3.39 MiB | 3.50 MiB |
 | 2 | 735.28 MiB | 740.33 MiB | 6.72 MiB | 6.72 MiB |
@@ -56,6 +57,42 @@ stores alone.
 The same four-worktree npm lifecycle on an isolated Linux Btrfs filesystem used
 1,867.64 MiB with plain Git and 1,867.92 MiB with current Worktree Zero. That is
 the same red dependency baseline on a second operating system.
+
+The first real Bun prepared-environment adapter was then measured against
+Builders Stack commit `9c57d227` on two fresh isolated APFS volumes. Both sides
+used Bun 1.3.14's global store:
+
+| Worktrees | Native Git + Bun | wt0 prepared environment | Reduction |
+| ---: | ---: | ---: | ---: |
+| 1 | 383.74 MiB | 391.38 MiB | -2.0% |
+| 2 | 767.17 MiB | 401.82 MiB | 47.6% |
+| 3 | 1,148.90 MiB | 411.35 MiB | 64.2% |
+| 4 | 1,532.74 MiB | 421.27 MiB | 72.5% |
+
+Bun linked 1,608 package entries to its own store but retained 52 materialized
+post-install directories using about 317 MiB per worktree. Worktree Zero sealed
+those remaining files once. Each later complete worktree added about 10 MiB of
+physical metadata and private state instead of another 383 MiB, a roughly 97%
+reduction in marginal allocation. The environment passed the repository's real
+worktree tests; a private change inside Next did not alter the baseline or a
+sibling.
+
+The same commit and Bun configuration were measured inside a freshly formatted
+Linux Btrfs volume:
+
+| Worktrees | Native Git + Bun | wt0 prepared environment | Reduction |
+| ---: | ---: | ---: | ---: |
+| 1 | 357.32 MiB | 408.24 MiB | -14.2% |
+| 2 | 714.06 MiB | 460.00 MiB | 35.6% |
+| 3 | 1,070.80 MiB | 512.31 MiB | 52.2% |
+| 4 | 1,427.42 MiB | 564.60 MiB | 60.4% |
+
+Btrfs needed about 52 MiB of new directory metadata per additional private
+reflink tree, compared with roughly 10 MiB on APFS. That is still an 85%
+reduction from the roughly 357 MiB native marginal cost. A Linux read-only
+lower environment with a private overlay is the next measured optimization; it
+must not replace the working reflink path until it passes the same isolation and
+teardown tests.
 
 Source-only scaling uses a larger synthetic working tree so package output does
 not hide the source mechanism:

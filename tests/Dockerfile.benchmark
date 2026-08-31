@@ -5,6 +5,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --locked -p worktree-zero
 
+FROM oven/bun:1.3.14 AS bun
+
 FROM node:22-bookworm
 
 RUN apt-get update \
@@ -12,7 +14,9 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /source/target/debug/wt0 /usr/local/bin/wt0
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 COPY tests/bench_agent_runtime.sh /usr/local/lib/wt0/bench-agent-runtime
+COPY tests/bench_builders_stack.sh /usr/local/lib/wt0/bench-builders-stack
 COPY tests/bench_migration.sh /usr/local/lib/wt0/bench-migration
 COPY tests/bench_scaling.sh /usr/local/lib/wt0/bench-scaling
 

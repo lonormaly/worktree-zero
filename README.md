@@ -228,7 +228,7 @@ already shares dependencies, and worktrees are few and short-lived.
 
 ### Builders Stack: the first template measurement
 
-The clean `origin/main` checkout at commit `5a5c3116` contains 325 tracked files
+The clean `origin/main` checkout at commit `9c57d227` contains 328 tracked files
 with 2.36 MiB of visible file contents. That makes tracked-source sharing a
 small win in this repository. Its dependency tree is the more useful test.
 
@@ -246,17 +246,39 @@ on 1 September 2026 produced:
 This result explains why Bun and Worktree Zero are complementary. Bun already
 shares most package entries and makes repeated installs fast. Packages changed
 by install scripts, including large Next and native-package closures, remain
-private and account for most of the 317 MiB. Worktree Zero's prepared-environment
-adapter must make those verified post-install files copy-on-write before this
-repository can claim near-zero additional dependency blocks. Until that adapter
-is released and remeasured, the honest native-versus-Worktree-Zero comparison is:
+private and account for most of the 317 MiB.
 
-| Current behavior | Native Git + configured Bun | Current Worktree Zero + configured Bun |
-| --- | ---: | ---: |
-| Repeated tracked source | about 2.36 MiB per additional worktree | copy-on-write metadata plus changed blocks |
-| Repeated materialized dependency files | about 317 MiB per additional worktree | about 317 MiB per additional worktree |
+The Worktree Zero 0.1.5 prepared-environment adapter keys those remaining files
+from the lockfile, every tracked package manifest, Bun version, operating system,
+CPU architecture, install flags and patches. It seals the first verified result,
+then gives later worktrees private APFS clonefile or Linux reflink views. A new
+identity may start from the nearest compatible snapshot, so changing one package
+does not require an unrelated full copy.
 
-The second row is an open release gate, not a finished saving.
+The same Builders Stack commit was measured on two fresh isolated APFS volumes.
+Both sides used the same warm Bun 1.3.14 global store and frozen isolated install:
+
+| Worktrees | Native Git + Bun physical | Worktree Zero + Bun physical | Reduction |
+| ---: | ---: | ---: | ---: |
+| 1 | 383.74 MiB | 391.38 MiB | -2.0% |
+| 2 | 767.17 MiB | 401.82 MiB | 47.6% |
+| 3 | 1,148.90 MiB | 411.35 MiB | 64.2% |
+| 4 | 1,532.74 MiB | 421.27 MiB | 72.5% |
+
+The first Worktree Zero runtime pays for the one sealed environment, so one
+worktree has no storage advantage. After that, native Git added about 383 MiB
+per worktree while Worktree Zero added about 10 MiB. That is roughly a 97%
+reduction in marginal physical storage. All four Worktree Zero directories
+still appeared as about 368 MiB each, and the fourth passed the repository's
+real worktree tests and drift gate. A private edit inside Next's installed files
+did not change the sealed environment or another worktree.
+
+The same benchmark on a newly formatted Linux Btrfs volume measured 1,427.42
+MiB for four native worktrees and 564.60 MiB for four Worktree Zero worktrees,
+a 60.4% total reduction. Each additional Btrfs reflink environment cost about
+52 MiB of directory metadata instead of about 357 MiB, an 85% marginal
+reduction. Linux overlay-backed prepared environments remain an optimization
+target because they can avoid much of that repeated directory metadata.
 
 ## The Zero contract
 
@@ -265,7 +287,7 @@ The second row is an open release gate, not a finished saving.
 | Goal | Contract |
 | --- | --- |
 | Near-zero extra tracked-file blocks | Use copy-on-write/reflink when measured; report an explicit fallback. |
-| Zero copied package blobs | Reuse the package manager's store; keep only required links and mutable closures local. |
+| Near-zero repeated dependency blocks | Reuse the package manager's store, then provide private CoW views of verified post-install closures. |
 | Zero unsafe shared state | Share immutable answers; isolate mutable databases, emulators, and workspace metadata. |
 | Zero collisions | Give every runtime stable identities for every process and resource. |
 | Zero cleanup debt | One lifecycle owns create, run, stop, remove, expiry, and crash reconciliation. |
@@ -277,8 +299,8 @@ The second row is an open release gate, not a finished saving.
   generated state: 40 registered worktrees, multi-gigabyte stale dependency
   layouts, 7.7 GiB of Next output, 1.4 GiB of Wrangler state, and a 1.2 GiB Nx
   daemon log.
-- **Builders Stack** will be the first reusable template consumer after the
-  FLAM adapter and thresholds are verified.
+- **Builders Stack** is the first reusable template benchmark and will consume
+  the pinned Worktree Zero release instead of carrying a second implementation.
 
 See the [FLAM design-partner brief](docs/design-partners/flam.md),
 [prepared-environment contract](docs/prepared-environments.md),

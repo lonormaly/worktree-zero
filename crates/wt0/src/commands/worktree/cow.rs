@@ -146,7 +146,7 @@ fn materialize_baseline(repo: &RepoContext, commit: &str, destination: &Path) ->
     result
 }
 
-pub(super) fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = Command::new("cp");
