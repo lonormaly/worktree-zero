@@ -1,6 +1,7 @@
+use crate::commands::worktree;
 use anyhow::{bail, Context, Result};
 use clap::Args;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,6 +23,24 @@ pub struct Prepare {
     /// Apply the reported repair. Without this flag, prepare is a dry run.
     #[arg(long)]
     pub apply: bool,
+}
+
+#[derive(Args)]
+pub struct Migrate {
+    /// Repository or worktree to inspect. Defaults to the current directory.
+    pub path: Option<PathBuf>,
+
+    /// Inspect every linked worktree registered to this repository.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Apply only actions whose safety preconditions pass. Dry-run is default.
+    #[arg(long)]
+    pub apply: bool,
+
+    /// Canonical source ref whose identical tracked files should be shared.
+    #[arg(long)]
+    pub baseline: Option<String>,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -124,6 +143,228 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     }
 }
 
+pub fn migrate(args: Migrate, json_output: bool) -> Result<()> {
+    let requested = args.path.unwrap_or(std::env::current_dir()?);
+    let root = git_root(&requested)?;
+    let baseline_ref = match args.baseline {
+        Some(baseline) => baseline,
+        None => default_baseline_ref(&root)?,
+    };
+    let roots = if args.all {
+        linked_worktree_roots(&root)?
+    } else {
+        vec![root]
+    };
+    let (live_cwds, process_inspection_error) = match live_working_directories() {
+        Ok(paths) => (Some(paths), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
+    let physical_before = args
+        .apply
+        .then(|| filesystem_free_bytes(&requested))
+        .transpose()?;
+
+    let mut items = Vec::new();
+    let mut failed = 0_usize;
+    for worktree_root in roots {
+        match migrate_one(
+            &worktree_root,
+            &baseline_ref,
+            args.apply,
+            live_cwds.as_deref(),
+            process_inspection_error.as_deref(),
+        ) {
+            Ok(item) => items.push(item),
+            Err(error) => {
+                failed += 1;
+                items.push(json!({
+                    "root": worktree_root,
+                    "status": "failed",
+                    "error": format!("{error:#}"),
+                }));
+            }
+        }
+    }
+
+    let physical_after = args
+        .apply
+        .then(|| filesystem_free_bytes(&requested))
+        .transpose()?;
+    let physical_delta = physical_before
+        .zip(physical_after)
+        .map(|(before, after)| i128::from(after) - i128::from(before));
+    let physical_reclaimed = physical_delta.map(|delta| delta.max(0));
+    let report = json!({
+        "schema_version": 1,
+        "mode": if args.apply { "apply" } else { "dry-run" },
+        "baseline_ref": baseline_ref,
+        "worktrees": items,
+        "summary": {
+            "scanned": items.len(),
+            "failed": failed,
+            "physical_free_space_delta_bytes": physical_delta,
+            "physical_bytes_reclaimed": physical_reclaimed,
+            "physical_measurement": if args.apply { "filesystem free-space delta; may include concurrent writes" } else { "not measured during dry-run" },
+        }
+    });
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Worktree Zero migrate ({})",
+            report["mode"].as_str().unwrap_or("unknown")
+        );
+        println!(
+            "  baseline: {}",
+            report["baseline_ref"].as_str().unwrap_or("unknown")
+        );
+        for item in report["worktrees"].as_array().into_iter().flatten() {
+            println!(
+                "  {} · {} · source {} · stale deps {}",
+                item["status"].as_str().unwrap_or("unknown"),
+                item["root"].as_str().unwrap_or("unknown"),
+                human_bytes(item["source"]["eligible_bytes"].as_u64().unwrap_or(0)),
+                human_bytes(
+                    item["dependencies"]["stale_logical_bytes"]
+                        .as_u64()
+                        .unwrap_or(0)
+                ),
+            );
+            for blocker in item["blockers"].as_array().into_iter().flatten() {
+                println!(
+                    "    skipped: {}",
+                    blocker.as_str().unwrap_or("unknown blocker")
+                );
+            }
+        }
+        if let Some(delta) = physical_delta {
+            println!("  filesystem free-space delta: {} bytes", delta);
+        }
+    }
+
+    if failed > 0 {
+        bail!("{failed} worktree migration inspection(s) failed");
+    }
+    Ok(())
+}
+
+fn migrate_one(
+    root: &Path,
+    baseline_ref: &str,
+    apply: bool,
+    live_cwds: Option<&[PathBuf]>,
+    process_inspection_error: Option<&str>,
+) -> Result<Value> {
+    let dirty_entries = git_dirty_count(root)?;
+    let live_cwd = live_cwds
+        .and_then(|paths| paths.iter().find(|path| path.starts_with(root)))
+        .map(|path| path.display().to_string());
+    let dependencies_before = dependency_storage(root)?;
+    let stale_before =
+        dependencies_before.bun_backups + dependencies_before.materialized_root_entries;
+    let generated = generated_storage(root)?;
+    let bun = bun_report(root);
+    let source_before = worktree::migrate_identical_source(root, baseline_ref, false)?;
+    let repo = worktree::discover_repo(root)?;
+    let cow_supported = worktree::cow::clone_supported(&repo.common_git_dir, root)?;
+
+    let mut actions = Vec::new();
+    if source_before.eligible_files > 0 && !source_before.already_migrated {
+        actions.push("clone_identical_tracked_files");
+    }
+    if stale_before > 0 {
+        actions.push("repair_bun_dependency_layout");
+    }
+
+    let mut blockers = Vec::new();
+    if dirty_entries > 0 {
+        blockers.push(format!("dirty worktree ({dirty_entries} entries)"));
+    }
+    if let Some(path) = &live_cwd {
+        blockers.push(format!("live process working directory at {path}"));
+    }
+    if let Some(error) = process_inspection_error {
+        blockers.push(format!("process inspection unavailable: {error}"));
+    }
+    if !cow_supported && source_before.eligible_files > 0 && !source_before.already_migrated {
+        blockers.push("copy-on-write source cloning unsupported".to_string());
+    }
+    if stale_before > 0 {
+        match &bun {
+            Some(report) if report.configured && report.version.is_some() => {}
+            Some(_) => blockers.push("Bun isolated global store is not ready".to_string()),
+            None => blockers
+                .push("stale dependency layout has no supported manager adapter".to_string()),
+        }
+        if !node_modules_ignored(root)? {
+            blockers.push("node_modules is not ignored".to_string());
+        }
+    }
+
+    let mut source_after = None;
+    let mut stale_after = stale_before;
+    let status = if actions.is_empty() {
+        "ready"
+    } else if !blockers.is_empty() {
+        "skipped"
+    } else if !apply {
+        "planned"
+    } else if let Some(path) = live_open_path(root)? {
+        blockers.push(format!("open file or process detected at {path}"));
+        "skipped"
+    } else {
+        if source_before.eligible_files > 0 && !source_before.already_migrated {
+            source_after = Some(worktree::migrate_identical_source(
+                root,
+                baseline_ref,
+                true,
+            )?);
+        }
+        if stale_before > 0 {
+            repair_dependency_layout(root, &dependencies_before)?;
+            let dependencies_after = dependency_storage(root)?;
+            stale_after =
+                dependencies_after.bun_backups + dependencies_after.materialized_root_entries;
+            if stale_after > 0 {
+                bail!("dependency migration left {stale_after} stale logical bytes");
+            }
+        }
+        "applied"
+    };
+
+    Ok(json!({
+        "root": root,
+        "status": status,
+        "dirty_entries": dirty_entries,
+        "live_cwd": live_cwd,
+        "cow_supported": cow_supported,
+        "actions": actions,
+        "blockers": blockers,
+        "source": {
+            "baseline_commit": source_before.baseline_commit,
+            "already_migrated": source_before.already_migrated,
+            "eligible_files": source_before.eligible_files,
+            "eligible_bytes": source_before.eligible_bytes,
+            "divergent_files": source_before.divergent_files,
+            "skipped_files": source_before.skipped_files,
+            "applied_files": source_after.as_ref().map(|report| report.applied_files).unwrap_or(0),
+        },
+        "dependencies": {
+            "adapter": bun.as_ref().map(|_| "bun"),
+            "stale_logical_bytes": stale_before,
+            "remaining_stale_logical_bytes": stale_after,
+            "bun_backup_bytes": dependencies_before.bun_backups,
+            "materialized_root_bytes": dependencies_before.materialized_root_entries,
+        },
+        "generated": {
+            "logical_bytes": generated.total(),
+            "budget_bytes": DEFAULT_GENERATED_BUDGET_BYTES,
+            "cleanup": "report-only; project ownership adapter required",
+        }
+    }))
+}
+
 pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
     let requested = args.path.unwrap_or(std::env::current_dir()?);
     let root = git_root(&requested)?;
@@ -155,22 +396,14 @@ pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
         )?;
         return Ok(());
     }
-
-    if before.materialized_root_entries == 0 && has_global_links(&root)? {
-        let modules = root.join("node_modules");
-        for backup in bun_backup_paths(&root)? {
-            if backup.parent() != Some(modules.as_path()) {
-                bail!(
-                    "refusing dependency path outside node_modules: {}",
-                    backup.display()
-                );
-            }
-            fs::remove_dir_all(&backup)
-                .with_context(|| format!("remove verified Bun backup {}", backup.display()))?;
-        }
-    } else {
-        replace_dependency_tree(&root)?;
+    let dirty_entries = git_dirty_count(&root)?;
+    if dirty_entries > 0 {
+        bail!("refusing dependency repair in dirty worktree ({dirty_entries} entries)");
     }
+    if let Some(path) = live_open_path(&root)? {
+        bail!("refusing dependency repair while a process uses {path}");
+    }
+    repair_dependency_layout(&root, &before)?;
 
     let after = dependency_storage(&root)?;
     let remaining = after.bun_backups + after.materialized_root_entries;
@@ -184,6 +417,25 @@ pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
         stale,
         "stale dependency layout retired after verification",
     )
+}
+
+fn repair_dependency_layout(root: &Path, before: &DependencyStorage) -> Result<()> {
+    if before.materialized_root_entries == 0 && has_global_links(root)? {
+        let modules = root.join("node_modules");
+        for backup in bun_backup_paths(root)? {
+            if backup.parent() != Some(modules.as_path()) {
+                bail!(
+                    "refusing dependency path outside node_modules: {}",
+                    backup.display()
+                );
+            }
+            fs::remove_dir_all(&backup)
+                .with_context(|| format!("remove verified Bun backup {}", backup.display()))?;
+        }
+        Ok(())
+    } else {
+        replace_dependency_tree(root)
+    }
 }
 
 fn emit_prepare(
@@ -261,15 +513,19 @@ fn replace_dependency_tree(root: &Path) -> Result<()> {
 }
 
 fn assert_node_modules_ignored(root: &Path) -> Result<()> {
+    if !node_modules_ignored(root)? {
+        bail!("node_modules is not ignored in {}", root.display());
+    }
+    Ok(())
+}
+
+fn node_modules_ignored(root: &Path) -> Result<bool> {
     let status = Command::new("git")
         .args(["check-ignore", "-q", "node_modules"])
         .current_dir(root)
         .status()
         .context("verify node_modules ignore policy")?;
-    if !status.success() {
-        bail!("node_modules is not ignored in {}", root.display());
-    }
-    Ok(())
+    Ok(status.success())
 }
 
 fn has_global_links(root: &Path) -> Result<bool> {
@@ -305,18 +561,40 @@ fn bun_backup_paths(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn live_working_directory(root: &Path) -> Result<Option<String>> {
+    Ok(live_working_directories()?
+        .into_iter()
+        .find(|path| path.starts_with(root))
+        .map(|path| path.display().to_string()))
+}
+
+fn live_working_directories() -> Result<Vec<PathBuf>> {
     let output = Command::new("lsof")
-        .args(["-a", "-d", "cwd"])
+        .args(["-a", "-d", "cwd", "-Fn"])
         .output()
-        .context("lsof is required for safe dependency replacement")?;
+        .context("lsof is required for safe migration")?;
     if !output.status.success() && output.status.code() != Some(1) {
         bail!("lsof failed while checking active processes");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .map(PathBuf::from)
+        .collect())
+}
+
+fn live_open_path(root: &Path) -> Result<Option<String>> {
+    let output = Command::new("lsof")
+        .args(["-Fn", "+D"])
+        .arg(root)
+        .output()
+        .context("lsof is required for safe migration apply")?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        bail!("lsof failed while checking open worktree paths");
     }
     let root_text = root.to_string_lossy();
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
-        .skip(1)
-        .filter_map(|line| line.split_whitespace().last())
+        .filter_map(|line| line.strip_prefix('n'))
         .find(|path| *path == root_text || path.starts_with(&format!("{root_text}/")))
         .map(str::to_owned))
 }
@@ -364,6 +642,85 @@ fn git_root(requested: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(
         String::from_utf8_lossy(&output.stdout).trim(),
     ))
+}
+
+fn default_baseline_ref(root: &Path) -> Result<String> {
+    let remote_head = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
+        .current_dir(root)
+        .output()
+        .context("inspect origin default branch")?;
+    if remote_head.status.success() {
+        let reference = String::from_utf8(remote_head.stdout)?.trim().to_owned();
+        if !reference.is_empty() {
+            return Ok(reference);
+        }
+    }
+    for reference in ["refs/heads/main", "refs/heads/master"] {
+        let status = Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", reference])
+            .current_dir(root)
+            .status()
+            .context("inspect local default branch")?;
+        if status.success() {
+            return Ok(reference.to_owned());
+        }
+    }
+    Ok("HEAD".to_owned())
+}
+
+fn linked_worktree_roots(root: &Path) -> Result<Vec<PathBuf>> {
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(root)
+        .output()
+        .context("list linked worktrees")?;
+    if !output.status.success() {
+        bail!("git worktree list failed");
+    }
+    let roots = String::from_utf8(output.stdout)?
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        bail!("Git reported no linked worktrees");
+    }
+    Ok(roots)
+}
+
+fn git_dirty_count(root: &Path) -> Result<usize> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .current_dir(root)
+        .output()
+        .context("inspect worktree changes")?;
+    if !output.status.success() {
+        bail!("git status failed in {}", root.display());
+    }
+    Ok(output.stdout.iter().filter(|byte| **byte == 0).count())
+}
+
+fn filesystem_free_bytes(path: &Path) -> Result<u64> {
+    let output = Command::new("df")
+        .args(["-Pk"])
+        .arg(path)
+        .output()
+        .context("measure filesystem free space")?;
+    if !output.status.success() {
+        bail!("df failed for {}", path.display());
+    }
+    let text = String::from_utf8(output.stdout)?;
+    let available_kib = text
+        .lines()
+        .last()
+        .and_then(|line| line.split_whitespace().nth(3))
+        .context("unexpected df output")?
+        .parse::<u64>()
+        .context("parse df available blocks")?;
+    available_kib
+        .checked_mul(1024)
+        .context("filesystem free-space value overflow")
 }
 
 fn dependency_storage(root: &Path) -> Result<DependencyStorage> {
@@ -533,6 +890,19 @@ mod tests {
             .status()
             .expect("initialize fixture repository");
         assert!(status.success());
+        for args in [
+            &["config", "user.email", "test@example.com"][..],
+            &["config", "user.name", "Test User"][..],
+            &["add", "-f", ".gitignore", "bunfig.toml", "bun.lock"][..],
+            &["commit", "-q", "-m", "fixture"][..],
+        ] {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .expect("prepare clean fixture repository");
+            assert!(status.success(), "git {args:?}");
+        }
 
         prepare(
             Prepare {

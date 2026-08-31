@@ -74,6 +74,8 @@ enum Commands {
     Doctor(runtime::Doctor),
     /// Prepare package-manager state for a thin runtime.
     Prepare(runtime::Prepare),
+    /// Audit or safely migrate existing linked runtimes.
+    Migrate(runtime::Migrate),
     /// Compatibility namespace for the imported source engine.
     #[command(hide = true, subcommand)]
     Worktree(commands::worktree::Worktree),
@@ -105,6 +107,7 @@ fn main() -> Result<()> {
         }
         Commands::Doctor(args) => runtime::doctor(args, cli.json),
         Commands::Prepare(args) => runtime::prepare(args, cli.json),
+        Commands::Migrate(args) => runtime::migrate(args, cli.json),
         Commands::Worktree(cmd) => commands::worktree::run(cmd, cli.json),
     }
 }

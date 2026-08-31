@@ -7,15 +7,16 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
-mod cow;
+pub(crate) mod cow;
 mod overlay;
 
 #[derive(Subcommand)]
@@ -169,9 +170,9 @@ pub struct WorktreeRepair {
 }
 
 #[derive(Debug)]
-struct RepoContext {
-    pub(super) top_level: PathBuf,
-    pub(super) common_git_dir: PathBuf,
+pub(crate) struct RepoContext {
+    pub(crate) top_level: PathBuf,
+    pub(crate) common_git_dir: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -389,7 +390,12 @@ fn add_cow_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str)
     let populate_result = (|| -> Result<()> {
         run_git_at(target, ["read-tree", "HEAD"]).context("initialize linked-worktree index")?;
         cow::clone_tree(&baseline, target).context("clone cached baseline")?;
-        ensure_clean(target).context("verify cloned worktree")
+        ensure_clean(target).context("verify cloned worktree")?;
+        fs::write(
+            source_migration_marker(target)?,
+            format!("{base}\n{base}\n"),
+        )
+        .context("record cloned source identity")
     })();
 
     if let Err(error) = populate_result {
@@ -457,6 +463,11 @@ fn add_overlay_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &
                 lower: Some(baseline.clone()),
             },
         )?;
+        fs::write(
+            source_migration_marker(target)?,
+            format!("{base}\n{base}\n"),
+        )
+        .context("record overlay source identity")?;
         Ok(())
     })();
 
@@ -921,7 +932,7 @@ fn emit(value: &serde_json::Value) {
     );
 }
 
-fn discover_repo(path: &Path) -> Result<RepoContext> {
+pub(crate) fn discover_repo(path: &Path) -> Result<RepoContext> {
     let top_level = git_path_output(path, ["rev-parse", "--show-toplevel"])
         .context("not in a Git working tree")?;
     let common = git_path_output(
@@ -948,13 +959,217 @@ fn git_path_output<const N: usize>(path: &Path, args: [&str; N]) -> Result<Strin
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
-fn resolve_commit(repo: &RepoContext, base: &str) -> Result<String> {
+pub(crate) fn resolve_commit(repo: &RepoContext, base: &str) -> Result<String> {
     let spec = format!("{base}^{{commit}}");
     let output = git_output_common(repo, ["rev-parse", "--verify", &spec])?;
     if !output.status.success() {
         bail!("cannot resolve base commit '{base}'");
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+#[derive(Debug)]
+pub(crate) struct SourceMigrationReport {
+    pub baseline_commit: String,
+    pub already_migrated: bool,
+    pub eligible_files: usize,
+    pub eligible_bytes: u64,
+    pub divergent_files: usize,
+    pub skipped_files: usize,
+    pub applied_files: usize,
+}
+
+#[derive(Debug)]
+struct TreeEntry {
+    mode: String,
+    object: String,
+}
+
+#[derive(Debug)]
+struct SourceCandidate {
+    relative: PathBuf,
+    bytes: u64,
+}
+
+/// Replace only clean tracked files that are identical to one canonical
+/// baseline with private CoW clones of that baseline. Branch-specific files are
+/// left in place. Applying this operation changes inodes, never file contents.
+pub(crate) fn migrate_identical_source(
+    worktree: &Path,
+    baseline_ref: &str,
+    apply: bool,
+) -> Result<SourceMigrationReport> {
+    let repo = discover_repo(worktree)?;
+    let baseline_commit = resolve_commit(&repo, baseline_ref)?;
+    let worktree_commit = git_path_output(worktree, ["rev-parse", "HEAD"])?;
+    let baseline_entries = tree_entries(&repo, &baseline_commit)?;
+    let worktree_entries = tree_entries(&repo, &worktree_commit)?;
+
+    let mut candidates = Vec::new();
+    let mut divergent_files = 0;
+    let mut skipped_files = 0;
+    for (relative, entry) in &worktree_entries {
+        if !matches!(entry.mode.as_str(), "100644" | "100755") {
+            skipped_files += 1;
+            continue;
+        }
+        let Some(baseline) = baseline_entries.get(relative) else {
+            divergent_files += 1;
+            continue;
+        };
+        if baseline.mode != entry.mode || baseline.object != entry.object {
+            divergent_files += 1;
+            continue;
+        }
+        let destination = worktree.join(relative);
+        let metadata = match fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+            _ => {
+                skipped_files += 1;
+                continue;
+            }
+        };
+        candidates.push(SourceCandidate {
+            relative: relative.clone(),
+            bytes: metadata.len(),
+        });
+    }
+
+    let eligible_bytes = candidates.iter().map(|candidate| candidate.bytes).sum();
+    let already_migrated = source_migration_marker(worktree)
+        .ok()
+        .and_then(|marker| fs::read_to_string(marker).ok())
+        .is_some_and(|marker| marker == format!("{}\n{}\n", baseline_commit, worktree_commit));
+    let mut report = SourceMigrationReport {
+        baseline_commit,
+        already_migrated,
+        eligible_files: candidates.len(),
+        eligible_bytes,
+        divergent_files,
+        skipped_files,
+        applied_files: 0,
+    };
+    if !apply || candidates.is_empty() || already_migrated {
+        return Ok(report);
+    }
+
+    ensure_clean(worktree).context("source migration requires a clean worktree")?;
+    if !cow::clone_supported(&repo.common_git_dir, worktree)? {
+        bail!(
+            "copy-on-write source migration is unsupported on the filesystem containing {}",
+            worktree.display()
+        );
+    }
+    let baseline_tree = cow::ensure_baseline(&repo, &report.baseline_commit)?;
+
+    for candidate in candidates {
+        let source = baseline_tree.join(&candidate.relative);
+        let destination = worktree.join(&candidate.relative);
+        if !files_identical(&source, &destination)? {
+            bail!(
+                "refusing changed source file during migration: {}",
+                destination.display()
+            );
+        }
+        replace_with_clone(&source, &destination)?;
+        report.applied_files += 1;
+    }
+    ensure_clean(worktree).context("source migration changed tracked contents")?;
+    fs::write(
+        source_migration_marker(worktree)?,
+        format!("{}\n{}\n", report.baseline_commit, worktree_commit),
+    )
+    .context("record source migration identity")?;
+    Ok(report)
+}
+
+fn source_migration_marker(worktree: &Path) -> Result<PathBuf> {
+    Ok(worktree_admin_dir(worktree)?.join("wt0-source-migration"))
+}
+
+fn tree_entries(repo: &RepoContext, commit: &str) -> Result<HashMap<PathBuf, TreeEntry>> {
+    let output = git_output_common(repo, ["ls-tree", "-r", "-z", commit])?;
+    if !output.status.success() {
+        return Err(git_failure("git ls-tree", &output));
+    }
+    let mut entries = HashMap::new();
+    for record in output.stdout.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let record = std::str::from_utf8(record).context("non-UTF-8 Git path is unsupported")?;
+        let (metadata, relative) = record
+            .split_once('\t')
+            .context("unexpected git ls-tree record")?;
+        let mut fields = metadata.split_whitespace();
+        let mode = fields.next().context("missing tree mode")?;
+        let kind = fields.next().context("missing tree object kind")?;
+        let object = fields.next().context("missing tree object id")?;
+        if kind != "blob" {
+            continue;
+        }
+        let relative = PathBuf::from(relative);
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            bail!("refusing unsafe Git path: {}", relative.display());
+        }
+        entries.insert(
+            relative,
+            TreeEntry {
+                mode: mode.to_owned(),
+                object: object.to_owned(),
+            },
+        );
+    }
+    Ok(entries)
+}
+
+fn files_identical(left: &Path, right: &Path) -> Result<bool> {
+    let left_meta = fs::metadata(left)?;
+    let right_meta = fs::metadata(right)?;
+    if left_meta.len() != right_meta.len() {
+        return Ok(false);
+    }
+    let mut left_file = fs::File::open(left)?;
+    let mut right_file = fs::File::open(right)?;
+    let mut left_buffer = [0_u8; 64 * 1024];
+    let mut right_buffer = [0_u8; 64 * 1024];
+    loop {
+        let left_read = left_file.read(&mut left_buffer)?;
+        let right_read = right_file.read(&mut right_buffer)?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn replace_with_clone(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("tracked source file has no parent directory")?;
+    let temporary = parent.join(format!(".wt0-migrate-{}", Uuid::now_v7()));
+    let result = (|| -> Result<()> {
+        cow::clone_file(source, &temporary)?;
+        if !files_identical(source, &temporary)? {
+            bail!("copy-on-write clone verification failed");
+        }
+        fs::rename(&temporary, destination).with_context(|| {
+            format!(
+                "atomically replace {} with verified clone",
+                destination.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn default_worktree_path(common_git_dir: &Path, branch: &str) -> PathBuf {

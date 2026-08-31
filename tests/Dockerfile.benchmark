@@ -8,11 +8,12 @@ RUN cargo build --locked -p worktree-zero
 FROM node:22-bookworm
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends btrfs-progs git jq python3 util-linux \
+  && apt-get install -y --no-install-recommends btrfs-progs git jq lsof python3 util-linux \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /source/target/debug/wt0 /usr/local/bin/wt0
 COPY tests/bench_agent_runtime.sh /usr/local/lib/wt0/bench-agent-runtime
+COPY tests/bench_migration.sh /usr/local/lib/wt0/bench-migration
 COPY tests/bench_scaling.sh /usr/local/lib/wt0/bench-scaling
 
 ENTRYPOINT ["bash", "-ceu"]

@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 const BASELINE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-pub(super) fn clone_supported(common_git_dir: &Path, destination_dir: &Path) -> Result<bool> {
+pub(crate) fn clone_supported(common_git_dir: &Path, destination_dir: &Path) -> Result<bool> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (common_git_dir, destination_dir);
@@ -40,6 +40,7 @@ fn clone_file_command(source: &Path, destination: &Path) -> Command {
     let mut command = Command::new("cp");
     command.args([
         OsStr::new("-c"),
+        OsStr::new("-p"),
         source.as_os_str(),
         destination.as_os_str(),
     ]);
@@ -51,10 +52,25 @@ fn clone_file_command(source: &Path, destination: &Path) -> Command {
     let mut command = Command::new("cp");
     command.args([
         OsStr::new("--reflink=always"),
+        OsStr::new("--preserve=mode,timestamps"),
         source.as_os_str(),
         destination.as_os_str(),
     ]);
     command
+}
+
+pub(crate) fn clone_file(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (source, destination);
+        bail!("copy-on-write file cloning is not supported on this platform");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let mut command = clone_file_command(source, destination);
+        run_command(&mut command, "copy-on-write file clone")
+    }
 }
 
 /// Return an immutable checkout cache for `commit`.
@@ -62,7 +78,7 @@ fn clone_file_command(source: &Path, destination: &Path) -> Command {
 /// Every creator materializes into a unique temporary directory and publishes
 /// with one atomic rename. Concurrent losers discard their temporary tree and
 /// use the winner; no process removes or mutates a published baseline.
-pub(super) fn ensure_baseline(repo: &RepoContext, commit: &str) -> Result<PathBuf> {
+pub(crate) fn ensure_baseline(repo: &RepoContext, commit: &str) -> Result<PathBuf> {
     let root = state_dir(&repo.common_git_dir).join("baselines");
     let final_dir = root.join(commit);
     let final_tree = final_dir.join("tree");
