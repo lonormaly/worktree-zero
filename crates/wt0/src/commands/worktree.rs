@@ -124,9 +124,14 @@ pub struct WorktreeGc {
     #[arg(long, hide = true)]
     pub force: bool,
 
-    /// Delete each reaped worktree's branch. Refuses unmerged branches unless --force.
+    /// Delete each reaped worktree's branch. Unmerged branches are retained.
     #[arg(long)]
     pub delete_branches: bool,
+
+    /// Additional reviewed ignored path that GC may treat as generated.
+    /// Repeat for multiple exact relative paths or directory prefixes.
+    #[arg(long = "allow-generated", value_name = "RELATIVE_PATH")]
+    pub allowed_generated: Vec<PathBuf>,
 
     /// Apply the reported garbage collection. Dry-run is the default.
     #[arg(long)]
@@ -703,6 +708,7 @@ fn gc(args: WorktreeGc, json: bool) -> Result<()> {
     if json {
         emit(&json!({
             "mode": if args.apply { "apply" } else { "dry-run" },
+            "allowed_generated": args.allowed_generated,
             "reaped": outcome.reaped
                 .iter()
                 .map(|p| p.display().to_string())
@@ -785,6 +791,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
     if args.force {
         bail!("--force is disabled: Worktree Zero never discards dirty work during garbage collection");
     }
+    let allowed_generated = validate_generated_policy(&args.allowed_generated)?;
     let older_than = parse_duration(&args.older_than)?;
     let live_cwds = live_working_directories()?;
     let mut reaped: Vec<PathBuf> = Vec::new();
@@ -832,7 +839,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
             }
             Ok(false) => {}
         }
-        if has_unknown_local_state(&entry.path)? {
+        if has_unknown_local_state(&entry.path, &allowed_generated)? {
             skipped.push((entry.path, "unowned-local-state"));
             continue;
         }
@@ -1097,7 +1104,7 @@ fn live_open_path(worktree: &Path) -> Result<Option<String>> {
         .map(str::to_owned))
 }
 
-fn has_unknown_local_state(worktree: &Path) -> Result<bool> {
+fn has_unknown_local_state(worktree: &Path, allowed_generated: &[PathBuf]) -> Result<bool> {
     let output = Command::new("git")
         .args([
             "status",
@@ -1123,11 +1130,50 @@ fn has_unknown_local_state(worktree: &Path) -> Result<bool> {
         let Some(path) = text.strip_prefix("!! ") else {
             return Ok(true);
         };
-        if !is_known_generated_path(Path::new(path)) {
+        let path = Path::new(path);
+        if !is_known_generated_path(path)
+            && !allowed_generated
+                .iter()
+                .any(|allowed| path == allowed || path.starts_with(allowed))
+        {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn validate_generated_policy(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut validated = Vec::new();
+    for path in paths {
+        if path.as_os_str().is_empty()
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            bail!(
+                "allowed generated path must be a safe relative path: {}",
+                path.display()
+            );
+        }
+        let sensitive = path.components().any(|component| {
+            let Component::Normal(name) = component else {
+                return true;
+            };
+            let name = name.to_string_lossy();
+            name.starts_with(".env") || name == ".dev.vars" || name == "secrets"
+        });
+        if sensitive {
+            bail!(
+                "sensitive paths cannot be allowed as generated state: {}",
+                path.display()
+            );
+        }
+        if !validated.contains(path) {
+            validated.push(path.clone());
+        }
+    }
+    Ok(validated)
 }
 
 fn is_known_generated_path(path: &Path) -> bool {
