@@ -652,10 +652,7 @@ fn platform_identity() -> Result<String> {
     let abi = if cfg!(target_os = "linux") {
         Command::new("ldd").arg("--version").output().ok()
     } else if cfg!(target_os = "macos") {
-        Command::new("sw_vers")
-            .arg("-productVersion")
-            .output()
-            .ok()
+        Command::new("sw_vers").arg("-productVersion").output().ok()
     } else {
         None
     }
