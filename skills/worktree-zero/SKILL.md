@@ -23,4 +23,6 @@ Use the repository's checked-in Worktree Zero adapter. Do not replace it with ra
 - Remove through `wt0 remove` only after the tool proves the worktree is clean and no owned process is live.
 - Use `wt0 gc --dry-run` before crash recovery. Never force cleanup of an unmarked or active path.
 
+For autonomous operation, prefer `--json` or the Worktree Zero MCP server. Preserve the returned runtime id and idempotency key across retries. If a mutation returns an intervention request, stop that mutation and surface the exact reason to the human owner.
+
 Until those commands ship, this skill is a contract preview. Use the design partner's existing checked-in lifecycle helper and do not invent substitute commands.

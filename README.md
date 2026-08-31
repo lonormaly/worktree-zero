@@ -43,6 +43,13 @@ Worktree Zero will provide:
 - class-aware storage and startup measurements;
 - reference adapters for common agent-era stacks.
 
+The core is vendor-neutral and non-interactive. Claude Code, Codex, Grok,
+Gemini CLI, Cursor, GitHub Copilot, OpenCode, NanoClaw, OpenClaw, Hermes, Slack
+bots, queue workers, and future autonomous agents should all call the same
+versioned protocol rather than receive separate lifecycle implementations.
+
+See [compatibility](docs/compatibility.md) and the [autonomous-agent protocol](docs/autonomous-agents.md).
+
 Source copy-on-write is one backend, not the whole product. Existing projects such as [simgit](https://github.com/abendrothj/simgit), [Worktrunk](https://github.com/max-sixty/worktrunk), and [agent-worktree](https://github.com/nekocode/agent-worktree) are prior art to benchmark, integrate with, or contribute to—not work to conceal or duplicate.
 
 ## First design partners

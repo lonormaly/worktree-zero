@@ -51,3 +51,5 @@ FLAM already has project-specific controls Worktree Zero must learn from:
 7. Clean removal reclaims every runtime-owned byte and remote resource.
 8. Crash reconciliation removes only orphaned, marked state.
 9. Builders Stack can adopt the same generic plugin and skill without FLAM vocabulary.
+10. Claude Code, Codex, and one headless autonomous FLAM teammate complete the same lifecycle through different adapters.
+11. macOS is measured first; Linux and Windows backends pass the shared lifecycle suite before 1.0.
