@@ -93,6 +93,7 @@ Finder still show the logical file size.
   FLAM adapter and thresholds are verified.
 
 See the [FLAM design-partner brief](docs/design-partners/flam.md),
+[prepared-environment contract](docs/prepared-environments.md),
 [compatibility contract](docs/compatibility.md), and
 [autonomous-agent protocol](docs/autonomous-agents.md).
 
