@@ -1,0 +1,3 @@
+interface:
+  display_name: "Worktree Zero"
+  short_description: "Create and clean thin agent worktrees safely"
