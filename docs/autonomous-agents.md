@@ -11,6 +11,24 @@ Worktree Zero will expose equivalent lifecycle operations through:
 - a portable Agent Skill for planning and safety behavior;
 - optional vendor plugins that install the skill and MCP/CLI dependency.
 
+The CLI owns lifecycle behavior. Agent adapters only translate invocation and
+return the result. They must not reimplement worktree creation, cache layout,
+runtime identity, safety checks, or cleanup.
+
+## Minimum integration
+
+An autonomous platform needs only three abilities:
+
+1. run `wt0 ... --json` or call the equivalent MCP tool;
+2. persist the returned runtime id and idempotency key with its job; and
+3. surface a structured intervention request to a human when Worktree Zero
+   refuses an unsafe action.
+
+This applies equally to NanoClaw, OpenClaw, Hermes, Grok Bot, Slack agents,
+queue workers, scheduled agents, and agents running without a visible terminal.
+Ordinary create, status, heartbeat, measure, stop, and clean-remove flows must
+never require a TTY, browser, prompt, or vendor-specific code path.
+
 ## Protocol laws
 
 1. Every mutating request accepts an idempotency key.
@@ -23,6 +41,22 @@ Worktree Zero will expose equivalent lifecycle operations through:
 8. `gc` defaults to dry-run and explains why each candidate is eligible.
 9. Receipts include physical allocation, logical size, cache decisions, created external resources, and reclaimed bytes.
 10. Secrets are referenced through the host's secret system; they are never copied into receipts or shared caches.
+11. Human-readable output is optional decoration; agents consume only the versioned structured result.
+12. A vendor adapter may add authentication and transport, but may not change lifecycle meaning or safety rules.
+
+## Ease-of-use acceptance test
+
+Every supported autonomous integration must prove this flow end to end:
+
+1. discover Worktree Zero and its capabilities;
+2. create a runtime from a branch and owner id in one request;
+3. start a task using only the returned checkout path and runtime id;
+4. survive a repeated create request with the same idempotency key;
+5. report status and physical storage without parsing terminal text;
+6. cleanly stop and remove the runtime in one request each; and
+7. turn a dirty-worktree refusal into a clear human action instead of forcing deletion.
+
+The test must run without a person pressing a button after setup.
 
 ## Planned command surface
 

@@ -25,4 +25,8 @@ Use the repository's checked-in Worktree Zero adapter. Do not replace it with ra
 
 For autonomous operation, prefer `--json` or the Worktree Zero MCP server. Preserve the returned runtime id and idempotency key across retries. If a mutation returns an intervention request, stop that mutation and surface the exact reason to the human owner.
 
+Do not parse decorated terminal output or reproduce lifecycle commands inside an
+agent-specific plugin. NanoClaw, OpenClaw, Hermes, Grok Bot, and other headless
+agents use the same JSON or MCP result and persist the same runtime receipt.
+
 Until those commands ship, this skill is a contract preview. Use the design partner's existing checked-in lifecycle helper and do not invent substitute commands.

@@ -27,8 +27,10 @@ The CLI and MCP server are the stable interfaces. Vendor integrations package th
 | Cursor | project rule/command plus MCP binding |
 | GitHub Copilot | repository skill/instructions plus CLI invocation |
 | OpenCode | plugin/skill plus MCP binding |
-| NanoClaw / OpenClaw | runtime adapter calling JSON CLI or MCP |
-| Hermes | runtime adapter calling JSON CLI or MCP |
+| NanoClaw | installable skill plus a small runtime adapter calling JSON CLI or MCP |
+| OpenClaw | installable skill plus a small runtime adapter calling JSON CLI or MCP |
+| Hermes | installable skill plus a small runtime adapter calling JSON CLI or MCP |
+| Grok Bot | installable instruction bundle plus JSON CLI or MCP tool binding |
 | Slack/queue/autonomous agents | headless JSON CLI or MCP; no TTY dependency |
 
 The [OpenAI developer platform](https://developers.openai.com/) explicitly supports plugins composed from skills and MCP servers, and its [Skills API](https://developers.openai.com/api/reference/go/resources/skills) supports versioned skill bundles. Worktree Zero should keep its skill portable while publishing a native Codex package.
@@ -42,4 +44,7 @@ Before 1.0, CI must prove:
 - Windows 11 on ReFS Dev Drive and NTFS fallback;
 - create, concurrent run, edit isolation, status, stop, clean remove, dirty refusal, live-process refusal, and crash reconciliation;
 - CLI JSON schema compatibility and MCP contract tests;
-- at least Claude Code, Codex, and one fully autonomous/headless adapter end to end.
+- Claude Code and Codex end to end;
+- NanoClaw, OpenClaw, Hermes, and Grok Bot adapter contract tests;
+- at least one fully autonomous/headless adapter end to end on every supported OS; and
+- proof that every adapter uses the same lifecycle engine and versioned result schema.

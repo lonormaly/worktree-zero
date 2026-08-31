@@ -48,6 +48,17 @@ Gemini CLI, Cursor, GitHub Copilot, OpenCode, NanoClaw, OpenClaw, Hermes, Slack
 bots, queue workers, and future autonomous agents should all call the same
 versioned protocol rather than receive separate lifecycle implementations.
 
+For an agent, the happy path must stay this small:
+
+```text
+wt0 create --branch agent/fix-checkout --owner <agent-id> --json
+```
+
+The result contains everything the caller needs to continue: runtime id,
+checkout path, branch, selected storage backends, lease, and cleanup handle.
+NanoClaw, OpenClaw, Hermes, Grok Bot, and other autonomous systems must not need
+their own Git, filesystem, package-cache, or cleanup implementation.
+
 See [compatibility](docs/compatibility.md) and the [autonomous-agent protocol](docs/autonomous-agents.md).
 
 Source copy-on-write is one backend, not the whole product. Existing projects such as [simgit](https://github.com/abendrothj/simgit), [Worktrunk](https://github.com/max-sixty/worktrunk), and [agent-worktree](https://github.com/nekocode/agent-worktree) are prior art to benchmark, integrate with, or contribute to—not work to conceal or duplicate.
@@ -68,6 +79,18 @@ See [the FLAM design-partner brief](docs/design-partners/flam.md).
 5. Extract generic adapters and the agent skill.
 6. Integrate the verified release into Builders Stack.
 7. Publish cold/warm and N-worktree benchmarks with raw receipts.
+
+## Ease-of-use release gate
+
+Worktree Zero is not ready for a stable release until a new agent integration can:
+
+1. install the CLI and portable skill without editing project source;
+2. discover capabilities with one non-interactive call;
+3. create a usable runtime with one non-interactive call;
+4. consume the same versioned result through JSON or MCP;
+5. retry safely after a timeout without creating a second runtime;
+6. request cleanup without learning project-specific paths; and
+7. receive a structured human-intervention request when cleanup is unsafe.
 
 ## License
 
