@@ -459,13 +459,16 @@ fn reuse_existing_runtime(
         &repo.common_git_dir,
         "reused",
         json!({
-            "worktree": existing,
+            "worktree": target,
             "branch": args.branch,
             "runtime_id": lease.runtime_id,
         }),
     );
+    // same_path proved `existing` and `target` name one location; report the
+    // request's resolved spelling so a retried create's receipt is
+    // byte-identical to the original on every platform.
     Ok(CreatedWorktree {
-        target: existing,
+        target: target.to_path_buf(),
         base: lease
             .base
             .clone()
