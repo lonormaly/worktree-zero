@@ -8,7 +8,7 @@ changes. Git already shares repository objects and history. Worktree Zero owns
 the remaining checked-out files, dependency layouts, generated caches,
 runtime-owned storage, storage leases, measurements, and cleanup.
 
-> Status: design-partner phase with signed, checksummed macOS and Linux
+> Status: design-partner phase with checksummed macOS and Linux
 > releases. FLAM and Builders Stack are the first measured design partners.
 
 ## One product

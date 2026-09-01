@@ -5,7 +5,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.1.10"
+version      = "0.1.11"
 edition      = "2021"
 # Floor set by edition-2024 dependencies in Cargo.lock; the msrv CI job
 # enforces it, so bump both together.
