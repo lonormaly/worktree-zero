@@ -1,0 +1,11 @@
+#!/bin/sh
+# Example .wt0/hooks/post-create for a Tilt project: verify the cluster is
+# reachable and pre-pull the namespace, so the agent's first `tilt up` is
+# fast and a broken cluster fails the create instead of the agent's task.
+set -eu
+
+kubectl version --request-timeout=10s >/dev/null || {
+    echo "kubernetes cluster unreachable; refusing to create a runtime without a test environment" >&2
+    exit 1
+}
+echo "runtime ${WT0_RUNTIME_ID} on slot ${WT0_SLOT} (ports from ${WT0_PORT_BASE})"

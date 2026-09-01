@@ -1,0 +1,13 @@
+# The shared Worktree Zero store. ReadWriteMany where the cluster offers it
+# (Longhorn RWX, NFS-backed classes); agent pods always mount it read-only.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wt0-store
+  labels:
+    app.kubernetes.io/part-of: worktree-zero
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 20Gi

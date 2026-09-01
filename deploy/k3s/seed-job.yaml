@@ -1,0 +1,38 @@
+# Warm the shared store once: clone the repository and publish sealed
+# prepared environments into WT0_STORE. Immutable entries are published by
+# atomic rename, so re-running the seeder is always safe.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wt0-store-seed
+  labels:
+    app.kubernetes.io/part-of: worktree-zero
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: seed
+          # Image must include git, the project's package manager, and wt0.
+          image: ghcr.io/example/wt0-agent:latest
+          env:
+            - name: REPO_URL
+              value: "https://github.com/example/project.git"
+            - name: WT0_STORE
+              value: /store
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              git clone --depth 1 "$REPO_URL" /work/repo
+              cd /work/repo
+              wt0 --json prepare --apply
+          volumeMounts:
+            - { name: store, mountPath: /store }
+            - { name: work, mountPath: /work }
+      volumes:
+        - name: store
+          persistentVolumeClaim:
+            claimName: wt0-store
+        - name: work
+          emptyDir: {}

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Example .wt0/hooks/pre-remove for a Tilt project: tear the per-worktree
+# environment down before the worktree is deleted. A failure here vetoes the
+# removal, so cluster state is never orphaned by cleanup.
+set -eu
+
+if command -v tilt >/dev/null 2>&1; then
+    tilt down --delete-namespaces
+fi
