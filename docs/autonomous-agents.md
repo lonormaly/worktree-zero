@@ -63,9 +63,14 @@ The test must run without a person pressing a button after setup.
 The current lifecycle ships capability discovery, path/branch-based ownership
 records, automatic 30-second heartbeats for `wt0 run`, explicit
 `wt0 heartbeat`, GC refusal for unowned, dirty, active, unknown-state, or
-detached worktrees, and the `wt0 mcp serve` stdio transport whose tools wrap
-the same JSON CLI (see [vendor integrations](vendor-integrations.md)).
-Runtime-ID lookup and idempotent create remain planned.
+detached worktrees, the `wt0 mcp serve` stdio transport whose tools wrap
+the same JSON CLI (see [vendor integrations](vendor-integrations.md)),
+idempotent create (`--idempotency-key`: a retried create with the same key
+and branch returns the existing runtime with `reused: true`; a different key
+is refused, never handed another job's runtime), and deterministic runtime
+slots (`slot` in every create receipt, `WT0_SLOT` and `WT0_PORT_BASE` in
+`wt0 run` and hook environments, so parallel agents get disjoint port
+windows without coordination). Runtime-ID lookup remains planned.
 
 ```text
 wt0 capabilities --json

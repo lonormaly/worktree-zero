@@ -3,6 +3,23 @@
 All notable changes to Worktree Zero. Versions follow semantic versioning;
 pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
+## Unreleased
+
+### Added
+
+- **Idempotent create and run**: `--idempotency-key` on `create`/`run` (and
+  the MCP `create_worktree` tool). A retried request with the same key and
+  branch returns the existing runtime with `reused: true` in the receipt; a
+  different key, path, or explicit `--base` is refused — never a second
+  runtime, never an overwrite. Ownership markers now record mode, base,
+  idempotency key, and slot.
+- **Deterministic runtime slots**: every runtime is assigned the smallest
+  free slot index under a cross-process lock, reported as `slot` in create
+  receipts and exported as `WT0_SLOT` and `WT0_PORT_BASE` (disjoint
+  hundred-port windows from 20000) to `wt0 run` commands and lifecycle
+  hooks; `wt0 run` also defaults `COMPOSE_PROJECT_NAME` per runtime so
+  Docker Compose stacks isolate per worktree.
+
 ## 0.1.12 — 2026-09-01
 
 ### Added

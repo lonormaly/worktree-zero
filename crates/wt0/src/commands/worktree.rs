@@ -60,6 +60,11 @@ pub struct WorktreeAdd {
     #[arg(long)]
     pub ephemeral: bool,
 
+    /// Idempotency key: a retried create with the same key and branch returns
+    /// the existing runtime instead of failing.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+
     /// JSON output.
     #[arg(long)]
     pub json: bool,
@@ -168,6 +173,11 @@ pub struct WorktreeRun {
     #[arg(long)]
     pub persistent: bool,
 
+    /// Idempotency key: a retried run with the same key and branch reuses
+    /// the existing runtime instead of failing.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+
     /// Command and arguments to execute in the new worktree.
     #[arg(required = true)]
     pub command: Vec<OsString>,
@@ -250,14 +260,19 @@ fn add(args: WorktreeAdd, json: bool) -> Result<()> {
             "worktree": created.target.display().to_string(),
             "branch": args.branch,
             "base": created.base,
-            "mode": created.mode.label(),
-            "ephemeral": args.ephemeral,
+            "mode": created.mode,
+            "ephemeral": created.ephemeral,
             "runtime_id": created.lease.runtime_id,
             "created_at_unix": created.lease.created_at_unix,
-            "heartbeat_at_unix": created.lease.created_at_unix,
+            "heartbeat_at_unix": created.lease.heartbeat_at_unix,
+            "slot": created.lease.slot,
+            "reused": created.reused,
         }));
     } else {
-        eprintln!("mode: {}", created.mode.label());
+        eprintln!("mode: {}", created.mode);
+        if created.reused {
+            eprintln!("reused existing runtime");
+        }
         eprintln!("runtime: {}", created.lease.runtime_id);
         println!("{}", created.target.display());
     }
@@ -267,19 +282,25 @@ fn add(args: WorktreeAdd, json: bool) -> Result<()> {
 struct CreatedWorktree {
     target: PathBuf,
     base: String,
-    mode: PopulateMode,
+    mode: String,
+    ephemeral: bool,
     lease: RuntimeLease,
+    reused: bool,
 }
 
 fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
     let repo = discover_repo(&std::env::current_dir()?)?;
-    validate_new_branch(&repo, &args.branch)?;
+    validate_branch_name(&repo, &args.branch)?;
     let base = resolve_commit(&repo, args.base.as_deref().unwrap_or("HEAD"))?;
     let target = absolute_path(
         args.path
             .clone()
             .unwrap_or_else(|| default_worktree_path(&repo.common_git_dir, &args.branch)),
     )?;
+
+    if branch_exists(&repo, &args.branch)? {
+        return reuse_existing_runtime(&repo, args, &base, &target);
+    }
 
     if target.exists() {
         bail!("worktree path already exists: {}", target.display());
@@ -298,12 +319,26 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         PopulateMode::GitCheckout => add_git_worktree(&repo, &args.branch, &target, &base)?,
     }
 
-    let lease = match mark_managed(&target, &args.branch, args.ephemeral) {
-        Ok(lease) => lease,
-        Err(error) => {
-            let _ = force_teardown(&repo, &target);
-            let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
-            return Err(error).context("record worktree ownership lease");
+    let lease = {
+        let _slot_lock = SlotLock::acquire(&repo.common_git_dir);
+        let slot = allocate_slot(&repo)?;
+        match mark_managed(
+            &target,
+            &RuntimeSpec {
+                branch: &args.branch,
+                ephemeral: args.ephemeral,
+                mode: mode.label(),
+                base: &base,
+                idempotency_key: args.idempotency_key.as_deref(),
+                slot,
+            },
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                let _ = force_teardown(&repo, &target);
+                let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
+                return Err(error).context("record worktree ownership lease");
+            }
         }
     };
     if args.ephemeral {
@@ -322,6 +357,8 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         ("WT0_RUNTIME_ID", lease.runtime_id.clone()),
         ("WT0_EPHEMERAL", args.ephemeral.to_string()),
         ("WT0_REPO_ROOT", repo.top_level.display().to_string()),
+        ("WT0_SLOT", lease.slot.to_string()),
+        ("WT0_PORT_BASE", port_base(lease.slot).to_string()),
     ];
     if let Err(error) =
         crate::hooks::run_hook(&target, crate::hooks::HookEvent::PostCreate, &hook_env)
@@ -334,8 +371,87 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
     Ok(CreatedWorktree {
         target,
         base,
-        mode,
+        mode: mode.label().to_owned(),
+        ephemeral: args.ephemeral,
         lease,
+        reused: false,
+    })
+}
+
+/// Reuse the existing runtime for `branch` when this create is an idempotent
+/// retry: the branch's worktree must be at the path this request resolves to,
+/// carry a Worktree Zero lease for the same branch and idempotency key, and —
+/// when `--base` was passed explicitly — have been created from the same base.
+/// Anything else is a refusal, never a second runtime and never an overwrite.
+fn reuse_existing_runtime(
+    repo: &RepoContext,
+    args: &WorktreeAdd,
+    requested_base: &str,
+    target: &Path,
+) -> Result<CreatedWorktree> {
+    let existing = worktree_path_for_branch(repo, &args.branch)?.with_context(|| {
+        format!(
+            "branch '{}' already exists but is not checked out in any worktree; \
+             delete the branch or choose another name",
+            args.branch
+        )
+    })?;
+    if existing != *target {
+        bail!(
+            "branch '{}' already exists in a different worktree: {} (this request resolves to {})",
+            args.branch,
+            existing.display(),
+            target.display()
+        );
+    }
+    let lease = stored_lease(&existing).with_context(|| {
+        format!(
+            "branch '{}' exists but its worktree has no ownership lease; \
+             adopt it with `wt0 migrate --apply --adopt` or choose another name",
+            args.branch
+        )
+    })?;
+    if lease.branch.as_deref() != Some(args.branch.as_str()) {
+        bail!(
+            "branch '{}' exists but its ownership lease names '{}'",
+            args.branch,
+            lease.branch.as_deref().unwrap_or("unknown")
+        );
+    }
+    if lease.idempotency_key.as_deref() != args.idempotency_key.as_deref() {
+        bail!(
+            "branch '{}' already exists with a different idempotency key; \
+             a retry must reuse the original key",
+            args.branch
+        );
+    }
+    if args.base.is_some() {
+        if let Some(marker_base) = lease.base.as_deref() {
+            if marker_base != requested_base {
+                bail!(
+                    "existing runtime for '{}' was created from {marker_base}, \
+                     but this request asked for {requested_base}; pass the same \
+                     --base or remove the worktree first",
+                    args.branch
+                );
+            }
+        }
+    }
+    Ok(CreatedWorktree {
+        target: existing,
+        base: lease
+            .base
+            .clone()
+            .unwrap_or_else(|| requested_base.to_owned()),
+        mode: lease.mode.clone().unwrap_or_else(|| "unknown".to_owned()),
+        ephemeral: lease.ephemeral,
+        lease: RuntimeLease {
+            runtime_id: lease.runtime_id,
+            created_at_unix: lease.created_at_unix,
+            heartbeat_at_unix: lease.heartbeat_at_unix,
+            slot: lease.slot.unwrap_or(0),
+        },
+        reused: true,
     })
 }
 
@@ -349,14 +465,17 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
         base: args.base,
         require_cow: args.require_cow,
         ephemeral: !args.persistent,
+        idempotency_key: args.idempotency_key,
         json: false,
     })?;
     eprintln!(
-        "worktree: {} (mode: {}, branch: {}, runtime: {})",
+        "worktree: {} (mode: {}, branch: {}, runtime: {}, slot: {}{})",
         created.target.display(),
-        created.mode.label(),
+        created.mode,
         args.branch,
-        created.lease.runtime_id
+        created.lease.runtime_id,
+        created.lease.slot,
+        if created.reused { ", reused" } else { "" }
     );
     crate::runtime::prepare_for_agent_run(&created.target)
         .context("prepare package-manager environment for agent command")?;
@@ -368,6 +487,14 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
     command.args(&command_args).current_dir(&created.target);
     for (name, value) in &generated.environment {
         command.env(name, value);
+    }
+    // Deterministic per-runtime identities so parallel agents never collide
+    // on ports or Compose projects; explicit caller values always win.
+    command.env("WT0_SLOT", created.lease.slot.to_string());
+    command.env("WT0_PORT_BASE", port_base(created.lease.slot).to_string());
+    if std::env::var_os("COMPOSE_PROJECT_NAME").is_none() {
+        let short_id: String = created.lease.runtime_id.chars().take(8).collect();
+        command.env("COMPOSE_PROJECT_NAME", format!("wt0-{short_id}"));
     }
     let mut child = command
         .spawn()
@@ -458,17 +585,98 @@ fn select_populate_mode(
     }
 }
 
-fn validate_new_branch(repo: &RepoContext, branch: &str) -> Result<()> {
+fn validate_branch_name(repo: &RepoContext, branch: &str) -> Result<()> {
     let format = git_output_common(repo, ["check-ref-format", "--branch", branch])?;
     if !format.status.success() {
         bail!("invalid branch name '{branch}'");
     }
+    Ok(())
+}
+
+fn branch_exists(repo: &RepoContext, branch: &str) -> Result<bool> {
     let reference = format!("refs/heads/{branch}");
     let exists = git_output_common(repo, ["show-ref", "--verify", "--quiet", &reference])?;
     match exists.status.code() {
-        Some(1) => Ok(()),
-        Some(0) => bail!("branch '{branch}' already exists"),
+        Some(1) => Ok(false),
+        Some(0) => Ok(true),
         _ => Err(git_failure("git show-ref --verify", &exists)),
+    }
+}
+
+/// Deterministic per-runtime port range: forty concurrent agents get disjoint
+/// hundred-port windows starting at 20000; slots wrap at 400 to stay inside
+/// the unprivileged range.
+pub(crate) fn port_base(slot: u64) -> u64 {
+    20000 + (slot % 400) * 100
+}
+
+/// Smallest slot index not held by any live managed worktree. Callers hold
+/// [`SlotLock`] across allocation and marker write so two concurrent creates
+/// cannot claim the same slot.
+pub(crate) fn allocate_slot(repo: &RepoContext) -> Result<u64> {
+    let mut used = HashSet::new();
+    for entry in list_worktrees(repo)? {
+        if let Ok(lease) = stored_lease(&entry.path) {
+            if let Some(slot) = lease.slot {
+                used.insert(slot);
+            }
+        }
+    }
+    Ok((0..).find(|slot| !used.contains(slot)).unwrap_or(0))
+}
+
+/// A best-effort cross-process mutex for slot allocation: an exclusive lock
+/// file in the state directory, stolen only when older than 30 seconds so a
+/// crashed holder cannot wedge every future create.
+pub(crate) struct SlotLock {
+    path: PathBuf,
+    held: bool,
+}
+
+impl SlotLock {
+    pub(crate) fn acquire(common_git_dir: &Path) -> Self {
+        let path = state_dir(common_git_dir).join("slot.lock");
+        let _ = fs::create_dir_all(state_dir(common_git_dir));
+        let deadline = SystemTime::now() + Duration::from_secs(5);
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Self { path, held: true },
+                Err(_) => {
+                    let stale = fs::metadata(&path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                        .is_some_and(|age| age > Duration::from_secs(30));
+                    if stale || SystemTime::now() > deadline {
+                        // Steal a stale lock, or proceed unlocked after the
+                        // bounded wait — slot collision is a lesser failure
+                        // than a wedged create.
+                        let _ = fs::remove_file(&path);
+                        if let Ok(_file) = fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&path)
+                        {
+                            return Self { path, held: true };
+                        }
+                        return Self { path, held: false };
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for SlotLock {
+    fn drop(&mut self) {
+        if self.held {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -1371,9 +1579,21 @@ fn now_unix_seconds() -> Result<u64> {
 pub(crate) struct RuntimeLease {
     pub(crate) runtime_id: String,
     pub(crate) created_at_unix: u64,
+    pub(crate) heartbeat_at_unix: u64,
+    pub(crate) slot: u64,
 }
 
-pub(crate) fn mark_managed(worktree: &Path, branch: &str, ephemeral: bool) -> Result<RuntimeLease> {
+/// Everything a new ownership marker records about a runtime.
+pub(crate) struct RuntimeSpec<'a> {
+    pub(crate) branch: &'a str,
+    pub(crate) ephemeral: bool,
+    pub(crate) mode: &'a str,
+    pub(crate) base: &'a str,
+    pub(crate) idempotency_key: Option<&'a str>,
+    pub(crate) slot: u64,
+}
+
+pub(crate) fn mark_managed(worktree: &Path, spec: &RuntimeSpec) -> Result<RuntimeLease> {
     let marker = managed_marker(worktree)?;
     if marker.is_file() {
         bail!(
@@ -1388,8 +1608,12 @@ pub(crate) fn mark_managed(worktree: &Path, branch: &str, ephemeral: bool) -> Re
         serde_json::to_vec_pretty(&json!({
             "schema_version": 1,
             "runtime_id": runtime_id,
-            "branch": branch,
-            "ephemeral": ephemeral,
+            "branch": spec.branch,
+            "ephemeral": spec.ephemeral,
+            "mode": spec.mode,
+            "base": spec.base,
+            "idempotency_key": spec.idempotency_key,
+            "slot": spec.slot,
             "created_at_unix": now,
             "heartbeat_at_unix": now,
         }))?,
@@ -1398,6 +1622,47 @@ pub(crate) fn mark_managed(worktree: &Path, branch: &str, ephemeral: bool) -> Re
     Ok(RuntimeLease {
         runtime_id,
         created_at_unix: now,
+        heartbeat_at_unix: now,
+        slot: spec.slot,
+    })
+}
+
+/// The lease stored in a worktree's ownership marker. Fields added after
+/// 0.1.12 are optional so pre-existing markers keep working.
+pub(crate) struct StoredLease {
+    pub(crate) runtime_id: String,
+    pub(crate) created_at_unix: u64,
+    pub(crate) heartbeat_at_unix: u64,
+    pub(crate) branch: Option<String>,
+    pub(crate) ephemeral: bool,
+    pub(crate) mode: Option<String>,
+    pub(crate) base: Option<String>,
+    pub(crate) idempotency_key: Option<String>,
+    pub(crate) slot: Option<u64>,
+}
+
+pub(crate) fn stored_lease(worktree: &Path) -> Result<StoredLease> {
+    let marker = managed_marker(worktree)?;
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(&marker)
+            .with_context(|| format!("read ownership marker {}", marker.display()))?,
+    )
+    .context("parse worktree ownership marker")?;
+    let runtime_id = value["runtime_id"]
+        .as_str()
+        .context("ownership marker has no runtime_id")?
+        .to_owned();
+    Uuid::parse_str(&runtime_id).context("ownership marker has an invalid runtime_id")?;
+    Ok(StoredLease {
+        runtime_id,
+        created_at_unix: value["created_at_unix"].as_u64().unwrap_or(0),
+        heartbeat_at_unix: value["heartbeat_at_unix"].as_u64().unwrap_or(0),
+        branch: value["branch"].as_str().map(str::to_owned),
+        ephemeral: value["ephemeral"].as_bool().unwrap_or(false),
+        mode: value["mode"].as_str().map(str::to_owned),
+        base: value["base"].as_str().map(str::to_owned),
+        idempotency_key: value["idempotency_key"].as_str().map(str::to_owned),
+        slot: value["slot"].as_u64(),
     })
 }
 

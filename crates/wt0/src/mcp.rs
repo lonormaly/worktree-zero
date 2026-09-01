@@ -176,6 +176,7 @@ fn tools() -> Vec<Tool> {
                 "base": { "type": "string", "description": "Commit-ish to start from. Defaults to HEAD." },
                 "require_cow": { "type": "boolean", "description": "Fail instead of falling back to a plain checkout when copy-on-write is unavailable." },
                 "ephemeral": { "type": "boolean", "description": "Mark the worktree for automatic gc selection." },
+                "idempotency_key": { "type": "string", "description": "A retried create with the same key and branch returns the existing runtime (reused: true) instead of failing." },
             }),
             required: &["branch"],
         },
@@ -364,6 +365,10 @@ fn build_argv(
             }
             if flag("ephemeral")? {
                 argv.push("--ephemeral".into());
+            }
+            if let Some(key) = text("idempotency_key")? {
+                argv.push("--idempotency-key".into());
+                argv.push(key.into());
             }
         }
         "remove_worktree" => {

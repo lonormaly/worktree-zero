@@ -468,7 +468,18 @@ fn migrate_one(
         }
         if adopt && !worktree::is_managed(root) {
             let branch = worktree_branch_label(root)?;
-            worktree::mark_managed(root, &branch, false)?;
+            let slot = worktree::allocate_slot(&repo)?;
+            worktree::mark_managed(
+                root,
+                &worktree::RuntimeSpec {
+                    branch: &branch,
+                    ephemeral: false,
+                    mode: "adopted",
+                    base: "",
+                    idempotency_key: None,
+                    slot,
+                },
+            )?;
         }
         "applied"
     };
