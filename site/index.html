@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Worktree Zero — wt0</title>
+<meta name="description" content="Copy-on-write Git worktrees with a full runtime lifecycle for coding agents. Every agent gets its own workspace for the disk cost of what it changes — with ports that never collide and cleanup that cannot destroy work.">
+<meta property="og:title" content="Worktree Zero — wt0">
+<meta property="og:description" content="Every agent gets a worktree. The disk barely notices.">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --paper: #f4f8f5;
+    --surface: #ffffff;
+    --ink: #13201a;
+    --dim: #5d7168;
+    --line: #d7e3db;
+    --accent: #15804f;
+    --accent-ink: #0d5c38;
+    --accent-soft: #dff1e6;
+    --terminal: #0d1512;
+    --terminal-ink: #d6e6db;
+    --terminal-dim: #6f8b7d;
+    --terminal-accent: #4fd28f;
+    --shared: #4fd28f;
+    --private: #f0b44a;
+    --on-accent: #ffffff;
+    --sans: 'IBM Plex Sans', -apple-system, 'Segoe UI', sans-serif;
+    --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    --display: 'Bricolage Grotesque', 'IBM Plex Sans', -apple-system, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #0c1310;
+      --surface: #131b17;
+      --ink: #d9e6dd;
+      --dim: #8ea597;
+      --line: #22302a;
+      --accent: #4fd28f;
+      --accent-ink: #7fe3ad;
+      --accent-soft: #163526;
+      --terminal: #070c0a;
+      --terminal-ink: #d6e6db;
+      --terminal-dim: #6f8b7d;
+      --terminal-accent: #4fd28f;
+      --on-accent: #07110b;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #0c1310;
+    --surface: #131b17;
+    --ink: #d9e6dd;
+    --dim: #8ea597;
+    --line: #22302a;
+    --accent: #4fd28f;
+    --accent-ink: #7fe3ad;
+    --accent-soft: #163526;
+    --terminal: #070c0a;
+    --terminal-ink: #d6e6db;
+    --terminal-dim: #6f8b7d;
+    --terminal-accent: #4fd28f;
+    --on-accent: #07110b;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--sans); font-size: 16px; line-height: 1.6; }
+  a { color: var(--accent-ink); text-decoration: none; }
+  a:hover, a:focus-visible { text-decoration: underline; }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+  code, pre { font-family: var(--mono); }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+  /* nav */
+  nav { display: flex; align-items: center; justify-content: space-between; padding: 22px 0; }
+  .wordmark { font-family: var(--display); font-weight: 800; font-size: 22px; letter-spacing: -.02em; color: var(--ink); }
+  .wordmark span { color: var(--accent); }
+  nav ul { list-style: none; display: flex; gap: 22px; margin: 0; padding: 0; font-size: 14.5px; font-weight: 500; }
+  nav ul a { color: var(--ink); }
+
+  /* hero */
+  .hero { display: grid; grid-template-columns: 1.05fr .95fr; gap: 48px; align-items: center; padding: 56px 0 72px; }
+  .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); margin: 0 0 16px; }
+  h1 { font-family: var(--display); font-weight: 800; font-size: clamp(38px, 5.4vw, 64px); line-height: 1.02; letter-spacing: -.03em; margin: 0 0 20px; text-wrap: balance; }
+  h1 em { font-style: normal; color: var(--accent); }
+  .lede { font-size: 18px; color: var(--dim); max-width: 34em; margin: 0 0 26px; }
+  .cmd { background: var(--terminal); color: var(--terminal-ink); border-radius: 8px; padding: 16px 18px; font-family: var(--mono); font-size: 14.5px; line-height: 1.6; overflow-x: auto; margin: 0 0 18px; }
+  .cmd .p { color: var(--terminal-dim); user-select: none; }
+  .cmd .k { color: var(--terminal-accent); }
+  .cmd .c { color: var(--terminal-dim); }
+  .ctas { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .btn { display: inline-block; padding: 10px 18px; border-radius: 6px; font-weight: 600; font-size: 15px; border: 1px solid var(--accent); }
+  .btn.primary { background: var(--accent); color: var(--on-accent); }
+  .btn.ghost { color: var(--accent-ink); }
+  .btn:hover { text-decoration: none; filter: brightness(1.06); }
+
+  /* block ledger */
+  .ledger { background: var(--terminal); border-radius: 12px; padding: 22px 22px 18px; color: var(--terminal-ink); }
+  .ledger .title { display: flex; justify-content: space-between; align-items: baseline; font-family: var(--mono); font-size: 12px; color: var(--terminal-dim); margin-bottom: 14px; letter-spacing: .06em; text-transform: uppercase; }
+  .row { display: grid; grid-template-columns: 96px 1fr; gap: 12px; align-items: center; margin: 8px 0; }
+  .row .lbl { font-family: var(--mono); font-size: 12.5px; color: var(--terminal-dim); }
+  .row .lbl b { color: var(--terminal-ink); font-weight: 500; }
+  .cells { display: grid; grid-template-columns: repeat(32, 1fr); gap: 3px; }
+  .cell { aspect-ratio: 1; border-radius: 2px; background: #1c2924; }
+  .cell.s { background: var(--shared); opacity: .35; }
+  .cell.b { background: var(--shared); }
+  .cell.p { background: var(--private); }
+  .legend { display: flex; gap: 18px; font-family: var(--mono); font-size: 12px; color: var(--terminal-dim); margin-top: 14px; flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: -1px; margin-right: 6px; }
+  .legend .tot { margin-left: auto; color: var(--terminal-ink); }
+  .legend .tot b { color: var(--terminal-accent); font-weight: 600; }
+  @media (prefers-reduced-motion: no-preference) {
+    .cell.b, .cell.p { animation: pop .5s ease-out both; }
+    .cell.s { animation: popshared .5s ease-out both; }
+  }
+  @keyframes pop { from { transform: scale(.4); opacity: 0; } to { transform: scale(1); } }
+  @keyframes popshared { from { transform: scale(.4); opacity: 0; } to { transform: scale(1); opacity: .35; } }
+
+  /* numbers */
+  .numbers { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin: 0 0 88px; }
+  .num { background: var(--surface); padding: 22px 22px 20px; }
+  .num .v { font-family: var(--display); font-weight: 800; font-size: 40px; letter-spacing: -.03em; line-height: 1; color: var(--accent-ink); font-variant-numeric: tabular-nums; }
+  .num .v small { font-size: 18px; font-weight: 700; letter-spacing: 0; margin-left: 2px; }
+  .num .l { font-size: 13.5px; color: var(--dim); margin-top: 8px; }
+
+  /* sections */
+  section { margin: 0 0 96px; }
+  h2 { font-family: var(--display); font-weight: 700; font-size: clamp(28px, 3.4vw, 38px); letter-spacing: -.025em; line-height: 1.1; margin: 0 0 12px; text-wrap: balance; }
+  .sub { color: var(--dim); max-width: 42em; margin: 0 0 32px; font-size: 17px; }
+  .three { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 24px 24px 22px; }
+  .card .tag { font-family: var(--mono); font-size: 11.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--private); margin: 0 0 10px; }
+  .card .tag.fix { color: var(--accent); }
+  .card h3 { font-family: var(--display); font-weight: 700; font-size: 21px; letter-spacing: -.02em; margin: 0 0 10px; }
+  .card p { margin: 0 0 10px; color: var(--ink); font-size: 15px; }
+  .card .arrow { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 14px; }
+  .card .arrow p { color: var(--dim); }
+  .card .arrow p b { color: var(--ink); font-weight: 600; }
+
+  /* contract */
+  .two { display: grid; grid-template-columns: 1.15fr .85fr; gap: 24px; align-items: start; }
+  pre.term { background: var(--terminal); color: var(--terminal-ink); border-radius: 10px; padding: 18px 20px; font-size: 13px; line-height: 1.55; overflow-x: auto; margin: 0; }
+  pre.term .k { color: var(--terminal-accent); }
+  pre.term .d { color: var(--terminal-dim); }
+  pre.term .n { color: var(--private); }
+  .hosts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+  .host { font-family: var(--mono); font-size: 12.5px; border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; color: var(--ink); background: var(--surface); }
+  .rules { list-style: none; padding: 0; margin: 0; }
+  .rules li { padding: 10px 0 10px 30px; position: relative; border-bottom: 1px solid var(--line); font-size: 15px; }
+  .rules li:last-child { border-bottom: none; }
+  .rules li::before { content: '✓'; position: absolute; left: 4px; top: 9px; color: var(--accent); font-weight: 700; font-family: var(--mono); }
+
+  /* install */
+  .install { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
+  .install .card h3 { font-size: 17px; }
+  .install pre { background: var(--terminal); color: var(--terminal-ink); border-radius: 8px; padding: 12px 14px; font-size: 13px; overflow-x: auto; margin: 0; }
+  .install pre .c { color: var(--terminal-dim); }
+
+  footer { border-top: 1px solid var(--line); padding: 28px 0 56px; color: var(--dim); font-size: 14px; display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+  footer p { margin: 0; max-width: 60em; }
+
+  @media (max-width: 860px) {
+    .hero, .two, .install { grid-template-columns: 1fr; }
+    .three { grid-template-columns: 1fr; }
+    .numbers { grid-template-columns: repeat(2, 1fr); }
+    .cells { grid-template-columns: repeat(24, 1fr); }
+    nav ul { gap: 14px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <a class="wordmark" href="#" aria-label="Worktree Zero">wt<span>0</span></a>
+    <ul>
+      <li><a href="#how">How it works</a></li>
+      <li><a href="#agents">For agents</a></li>
+      <li><a href="#install">Install</a></li>
+      <li><a href="https://github.com/lonormaly/worktree-zero">GitHub</a></li>
+    </ul>
+  </nav>
+
+  <header class="hero">
+    <div>
+      <p class="eyebrow">Worktree Zero · copy-on-write worktrees for agent swarms</p>
+      <h1>Every agent gets a worktree. <em>The disk barely notices.</em></h1>
+      <p class="lede">One command gives a coding agent its own disposable Git workspace — for the disk cost of what it changes, with ports that never collide and cleanup that cannot destroy work.</p>
+      <div class="cmd"><span class="p">$ </span><span class="k">wt0 run</span> agent/fix-checkout -- codex exec "fix the checkout bug"<br><span class="c"># CoW checkout · shared deps · unique ports · heartbeat lease · safe teardown</span></div>
+      <div class="ctas">
+        <a class="btn primary" href="#install">Install</a>
+        <a class="btn ghost" href="https://github.com/lonormaly/worktree-zero">Read the source</a>
+      </div>
+    </div>
+    <div class="ledger" aria-label="Physical disk blocks: one shared baseline, four worktrees that share it, private blocks only where an agent changed a file">
+      <div class="title"><span>physical blocks · 4 agents</span><span>same repo</span></div>
+      <div class="row"><div class="lbl"><b>baseline</b><br>main @ HEAD</div><div class="cells" data-kind="b"></div></div>
+      <div class="row"><div class="lbl"><b>agent/a</b><br>slot 0</div><div class="cells" data-kind="w" data-private="1,7"></div></div>
+      <div class="row"><div class="lbl"><b>agent/b</b><br>slot 1</div><div class="cells" data-kind="w" data-private="12,13,14"></div></div>
+      <div class="row"><div class="lbl"><b>agent/c</b><br>slot 2</div><div class="cells" data-kind="w" data-private="22"></div></div>
+      <div class="row"><div class="lbl"><b>agent/d</b><br>slot 3</div><div class="cells" data-kind="w" data-private="4,5,27,28"></div></div>
+      <div class="legend">
+        <span><i style="background:var(--shared)"></i>baseline, stored once</span>
+        <span><i style="background:var(--shared);opacity:.35"></i>shared by reference</span>
+        <span><i style="background:var(--private)"></i>private: what the agent changed</span>
+        <span class="tot">4 worktrees ≈ <b>1.08×</b> the disk of one</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="numbers" aria-label="Measured results">
+    <div class="num"><div class="v">97<small>%</small></div><div class="l">less disk per additional worktree — ~10 MiB instead of ~383 MiB, measured on a production Next.js template</div></div>
+    <div class="num"><div class="v">421<small>MiB</small></div><div class="l">for four full worktrees with dependencies, versus 1,532 MiB with native Git + Bun</div></div>
+    <div class="num"><div class="v">48</div><div class="l">simultaneous creates validated with disjoint slots and port windows; 24 run in CI on three OSes</div></div>
+    <div class="num"><div class="v">6</div><div class="l">prebuilt, checksummed targets: macOS, Linux, Windows — arm64 and x86_64</div></div>
+  </div>
+
+  <section id="how">
+    <h2>Agent swarms multiply everything about a checkout except the history.</h2>
+    <p class="sub">Git worktrees share commits and blobs, but every worktree materializes the full working tree again — and rebuilds everything Git ignores. Three failures follow. Worktree Zero answers each one.</p>
+    <div class="three">
+      <div class="card">
+        <p class="tag">Problem · duplication</p>
+        <h3>Forty copies of the same files</h3>
+        <p><code>node_modules</code>, <code>.next</code>, build caches, tracked assets — every worktree pays the full price again, gigabytes per agent.</p>
+        <div class="arrow"><p class="tag fix">Answer</p><p><b>Classify, then share.</b> Unchanged tracked files are copy-on-write clones of one canonical baseline (APFS, Btrfs/XFS, ReFS). Dependencies reuse the package manager's own store; only the verified residue is sealed once and cloned. Mutable build state stays private and owned.</p></div>
+      </div>
+      <div class="card">
+        <p class="tag">Problem · collision</p>
+        <h3>Everyone wants port 3000</h3>
+        <p>Parallel dev servers, Compose stacks, and a shared writable <code>.next</code> between two live agents corrupt each other.</p>
+        <div class="arrow"><p class="tag fix">Answer</p><p><b>Identity by construction.</b> Every runtime gets a slot, a hundred-port window claimed from a machine-global registry (bind-probed, unique across every repo on the machine), a Compose project name, and a UUID — exported to the agent's command and to Tilt.</p></div>
+      </div>
+      <div class="card">
+        <p class="tag">Problem · abandonment</p>
+        <h3>Nobody dares delete anything</h3>
+        <p>Crashed agents leave worktrees, stale branches, held ports, and gigabytes of generated state with no way to tell what's safe to remove.</p>
+        <div class="arrow"><p class="tag fix">Answer</p><p><b>Refusal-first cleanup.</b> Ownership markers, leases, and heartbeats make abandonment evidence. <code>wt0 gc</code> removes only with proof — owned, expired, Git-clean, no live process — and preserves and reports everything else.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="agents">
+    <h2>One versioned contract. Every agent host.</h2>
+    <p class="sub">JSON CLI, MCP server, and portable skill are the same implementation. Create is idempotent by key, receipts carry everything an orchestrator needs, and <code>fleet</code> is the map of the whole swarm in one call.</p>
+    <div class="two">
+      <pre class="term"><span class="d">$ wt0 --json create agent/fix-checkout --idempotency-key job-42</span>
+{
+  <span class="k">"schema_version"</span>: <span class="n">1</span>,
+  <span class="k">"worktree"</span>: "/work/repo/.git/wt0/worktrees/agent-fix-checkout",
+  <span class="k">"branch"</span>: "agent/fix-checkout",
+  <span class="k">"mode"</span>: "cow-clone",
+  <span class="k">"runtime_id"</span>: "0198f3a2-9d2c-7e11-a5f0-1234567890ab",
+  <span class="k">"slot"</span>: <span class="n">0</span>,
+  <span class="k">"port_base"</span>: <span class="n">20000</span>,
+  <span class="k">"reused"</span>: <span class="d">false</span>
+}
+<span class="d">$ wt0 --json create agent/fix-checkout --idempotency-key job-42   # retried</span>
+{ … <span class="k">"runtime_id"</span>: "0198f3a2-…", <span class="k">"reused"</span>: <span class="k">true</span> }   <span class="d">← same runtime, never a second one</span></pre>
+      <div>
+        <pre class="term"><span class="d">// any MCP client — the whole integration surface</span>
+{ <span class="k">"mcpServers"</span>: {
+    <span class="k">"worktree-zero"</span>: {
+      <span class="k">"command"</span>: "wt0", <span class="k">"args"</span>: ["mcp", "serve"] } } }</pre>
+        <div class="hosts">
+          <span class="host">Claude Code</span><span class="host">Codex</span><span class="host">Gemini CLI</span><span class="host">Cursor</span><span class="host">OpenCode</span><span class="host">NanoClaw</span><span class="host">OpenClaw</span><span class="host">Hermes</span><span class="host">Tilt</span><span class="host">any MCP client</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="safety">
+    <div class="two">
+      <div>
+        <h2>Cleanup that cannot destroy work.</h2>
+        <p class="sub"><code>wt0 gc</code> is a dry run by default and <code>--force</code> does not exist. A worktree is removed only when every condition holds; anything else is preserved and reported with the reason.</p>
+      </div>
+      <ul class="rules">
+        <li>Worktree Zero owns it, on a preserved branch — never a detached commit</li>
+        <li>Its lease has expired and Git reports no modified or untracked work</li>
+        <li>No process has a working directory or open path inside it</li>
+        <li>Every ignored path is recognized generated state or explicitly reviewed — <code>.env*</code> can never be allowed</li>
+        <li>Checked-in <code>pre-remove</code> hooks ran clean — a failing hook vetoes the deletion</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="install">
+    <h2>Install</h2>
+    <p class="sub">Prebuilt, checksummed binaries. Open source, MIT.</p>
+    <div class="install">
+      <div class="card"><h3>Humans</h3><pre>brew tap lonormaly/wt0
+brew install wt0                   <span class="c"># macOS, Linux</span>
+cargo binstall worktree-zero       <span class="c"># or from crates.io</span></pre></div>
+      <div class="card"><h3>Agents</h3><pre>claude plugin marketplace add lonormaly/worktree-zero
+claude plugin install worktree-zero@worktree-zero
+codex plugin add worktree-zero@worktree-zero
+npx skills add lonormaly/worktree-zero --skill worktree-zero</pre></div>
+    </div>
+  </section>
+
+  <footer>
+    <p><strong>Worktree Zero</strong> · MIT · The source engine began in <a href="https://github.com/abendrothj/simgit">simgit</a> by Jake Abendroth. Every number on this page is a filesystem free-space measurement, never a <code>du</code> estimate.</p>
+    <p><a href="https://github.com/lonormaly/worktree-zero">GitHub</a> · <a href="https://github.com/lonormaly/worktree-zero/blob/main/docs/autonomous-agents.md">Agent protocol</a> · <a href="https://github.com/lonormaly/worktree-zero/blob/main/docs/lifecycle.md">Lifecycle</a> · <a href="https://github.com/lonormaly/worktree-zero/releases">Releases</a></p>
+  </footer>
+</div>
+<script>
+  // Block ledger: the baseline row is fully "stored once"; each worktree row
+  // shares every block by reference except the few the agent changed.
+  document.querySelectorAll('.cells').forEach(function (grid, rowIndex) {
+    var kind = grid.dataset.kind;
+    var priv = (grid.dataset.private || '').split(',').filter(Boolean).map(Number);
+    var count = window.matchMedia('(max-width: 860px)').matches ? 24 : 32;
+    for (var i = 0; i < count; i++) {
+      var cell = document.createElement('div');
+      cell.className = 'cell ' + (kind === 'b' ? 'b' : (priv.indexOf(i) >= 0 ? 'p' : 's'));
+      cell.style.animationDelay = (kind === 'b' ? i * 12 : 400 + rowIndex * 120 + i * 8) + 'ms';
+      grid.appendChild(cell);
+    }
+  });
+</script>
+</body>
+</html>
