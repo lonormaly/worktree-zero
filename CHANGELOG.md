@@ -7,6 +7,19 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Added
 
+## Unreleased
+
+### Added
+
+- **Project lifecycle hooks**: checked-in `.wt0/hooks/post-create` and
+  `.wt0/hooks/pre-remove` run automatically with a `WT0_*` environment
+  contract and a `WT0_HOOK_TIMEOUT` bound (default 5m). Failure semantics
+  are safety-first: a failing post-create rolls the new worktree and branch
+  back, and a failing pre-remove aborts `wt0 remove` or skips the `gc`
+  candidate — a hook can veto cleanup but never be bypassed into a
+  deletion. `capabilities` reports the hooks a repository ships
+  (`project_hooks`), and Windows resolves the same events to
+  `.cmd`/`.bat`/`.ps1` files.
 - **Experimental Windows support.** Copy-on-write worktrees via ReFS / Dev
   Drive block cloning (probed at runtime, exactly like APFS and Linux
   reflink), with a plain-checkout fallback on NTFS whose mode is named in
@@ -27,7 +40,8 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   recreates symlinks explicitly.
 - Symlink validation and free-space measurement no longer depend on external
   `find` and (on Windows) `df`; process inspection lives in one shared
-  module for `gc`, `migrate`, and `prepare`.
+  module for `gc`, `migrate`, and `prepare`; path canonicalization strips
+  Windows verbatim prefixes Git cannot consume.
 
 ## 0.1.11 — 2026-09-01
 

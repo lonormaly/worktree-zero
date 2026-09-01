@@ -314,6 +314,23 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         }
     }
 
+    let hook_env = [
+        ("WT0_WORKTREE", target.display().to_string()),
+        ("WT0_BRANCH", args.branch.clone()),
+        ("WT0_BASE", base.clone()),
+        ("WT0_MODE", mode.label().to_owned()),
+        ("WT0_RUNTIME_ID", lease.runtime_id.clone()),
+        ("WT0_EPHEMERAL", args.ephemeral.to_string()),
+        ("WT0_REPO_ROOT", repo.top_level.display().to_string()),
+    ];
+    if let Err(error) =
+        crate::hooks::run_hook(&target, crate::hooks::HookEvent::PostCreate, &hook_env)
+    {
+        let _ = force_teardown(&repo, &target);
+        let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
+        return Err(error).context("post-create hook failed; worktree rolled back");
+    }
+
     Ok(CreatedWorktree {
         target,
         base,
@@ -616,6 +633,20 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         .or_else(|| overlay::branch(&repo, &target));
     // Detect overlay backing while the worktree is still mounted/registered.
     let overlay = overlay::state(&repo, &target);
+
+    let mut hook_env = vec![
+        ("WT0_WORKTREE", target.display().to_string()),
+        ("WT0_REPO_ROOT", repo.top_level.display().to_string()),
+    ];
+    if let Some(branch) = &branch {
+        let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+        hook_env.push(("WT0_BRANCH", short.to_owned()));
+    }
+    if let Ok(runtime_id) = runtime_identity(&target) {
+        hook_env.push(("WT0_RUNTIME_ID", runtime_id));
+    }
+    crate::hooks::run_hook(&target, crate::hooks::HookEvent::PreRemove, &hook_env)
+        .context("pre-remove hook failed; removal aborted")?;
 
     let mut committed = false;
     if args.commit {
@@ -991,6 +1022,20 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
         }
         if !args.apply {
             reaped.push(entry.path);
+            continue;
+        }
+        let mut hook_env = vec![
+            ("WT0_WORKTREE", entry.path.display().to_string()),
+            ("WT0_BRANCH", short.to_owned()),
+            ("WT0_REPO_ROOT", repo.top_level.display().to_string()),
+        ];
+        if let Ok(runtime_id) = runtime_identity(&entry.path) {
+            hook_env.push(("WT0_RUNTIME_ID", runtime_id));
+        }
+        if let Err(error) =
+            crate::hooks::run_hook(&entry.path, crate::hooks::HookEvent::PreRemove, &hook_env)
+        {
+            skipped.push((entry.path, format!("pre-remove-hook-failed: {error:#}")));
             continue;
         }
         match force_teardown(repo, &entry.path) {
@@ -1573,7 +1618,7 @@ fn is_known_generated_path(path: &Path) -> bool {
 
 /// Parse a compact duration like `90s`, `30m`, `24h`, `7d`. A bare number is
 /// seconds.
-fn parse_duration(text: &str) -> Result<Duration> {
+pub(crate) fn parse_duration(text: &str) -> Result<Duration> {
     let text = text.trim();
     let split = text
         .find(|c: char| c.is_ascii_alphabetic())
