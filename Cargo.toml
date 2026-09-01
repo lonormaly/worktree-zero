@@ -24,5 +24,9 @@ clap         = { version = "4", features = ["derive", "env"] }
 # UUIDs
 uuid         = { version = "1", features = ["v4", "v7"] }
 
+# Copy-on-write file cloning: APFS clonefile, Linux FICLONE reflink, and
+# Windows ReFS block cloning behind one API.
+reflink-copy = "0.1.30"
+
 # Error handling
 anyhow       = "1"

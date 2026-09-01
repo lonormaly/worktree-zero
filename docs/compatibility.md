@@ -8,9 +8,18 @@ Worktree Zero separates the runtime engine from agent-vendor packaging and files
 | --- | --- | --- | --- |
 | macOS | APFS `clonefile` copy-on-write | sparse/plain checkout with a clear warning | first reference platform |
 | Linux | Btrfs/XFS reflink | unprivileged overlay where available, then sparse/plain checkout | required before 1.0 |
-| Windows 11 24H2+ | ReFS Dev Drive block cloning | sparse/plain checkout on NTFS with a clear warning | required before 1.0 |
+| Windows 11 24H2+ / Server | ReFS Dev Drive block cloning (shipped, experimental) | plain checkout on NTFS with the mode named in every receipt | CI-tested on a ReFS volume |
 
-Windows support must not claim copy-on-write on ordinary NTFS. Microsoft documents [native block cloning for ReFS Dev Drive](https://learn.microsoft.com/en-us/windows/dev-drive/) on Windows 11 24H2 and Windows Server 2025. Worktree Zero will detect the volume and report the selected backend.
+Windows support must not claim copy-on-write on ordinary NTFS. Microsoft documents [native block cloning for ReFS Dev Drive](https://learn.microsoft.com/en-us/windows/dev-drive/) on Windows 11 24H2 and Windows Server 2025. Worktree Zero probes the actual volume at runtime — the same `wt0 capabilities` probe as on macOS and Linux — and reports the selected backend; ordinary NTFS falls back to a plain checkout with `"mode": "git-checkout"` in the creation receipt.
+
+Live-process guarding differs by design on Windows. Unix uses `lsof` to refuse
+cleanup while processes hold a worktree; Windows has no portable equivalent,
+but its filesystem enforces the same safety: a directory in use cannot be
+renamed, and open files cannot be replaced or deleted. Worktree Zero probes
+each cleanup target with a rename round-trip and lets mandatory locking refuse
+anything the probe misses — a locked tree surfaces as a preserved
+`remove-failed` skip, never a silent deletion. The `fuse-overlayfs` populate
+mode remains Linux-only.
 
 Every fallback keeps branch/worktree isolation and the lifecycle contract. A fallback may cost more disk; `wt0 capabilities --json` and every creation receipt must say so.
 

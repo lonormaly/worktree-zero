@@ -239,6 +239,9 @@ fn gc_preserves_unowned_and_unknown_ignored_state() -> Result<()> {
     Ok(())
 }
 
+// The live-cwd guard needs lsof and a POSIX shell; Windows covers the same
+// safety through the rename probe tested in `process::imp`.
+#[cfg(unix)]
 #[test]
 fn gc_refuses_a_live_working_directory() -> Result<()> {
     let fixture = Fixture::new()?;

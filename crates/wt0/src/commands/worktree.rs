@@ -924,7 +924,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
     }
     let allowed_generated = validate_generated_policy(&args.allowed_generated)?;
     let older_than = parse_duration(&args.older_than)?;
-    let live_cwds = live_working_directories()?;
+    let live_cwds = crate::process::live_working_directories()?;
     let mut reaped: Vec<PathBuf> = Vec::new();
     let mut skipped: Vec<(PathBuf, String)> = Vec::new();
     let mut retained_branches = Vec::new();
@@ -985,7 +985,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
             skipped.push((entry.path, "unowned-local-state".to_owned()));
             continue;
         }
-        if live_open_path(&entry.path)?.is_some() {
+        if crate::process::live_open_path(&entry.path)?.is_some() {
             skipped.push((entry.path, "active-open-path".to_owned()));
             continue;
         }
@@ -1447,38 +1447,6 @@ fn worktree_dirty(worktree: &Path) -> Result<bool> {
         return Err(git_failure("git status --porcelain", &output));
     }
     Ok(!output.stdout.is_empty())
-}
-
-fn live_working_directories() -> Result<Vec<PathBuf>> {
-    let output = Command::new("lsof")
-        .args(["-a", "-d", "cwd", "-Fn"])
-        .output()
-        .context("lsof is required for safe worktree garbage collection")?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        bail!("lsof failed while checking active worktree processes");
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.strip_prefix('n'))
-        .map(PathBuf::from)
-        .collect())
-}
-
-fn live_open_path(worktree: &Path) -> Result<Option<String>> {
-    let output = Command::new("lsof")
-        .args(["-Fn", "+D"])
-        .arg(worktree)
-        .output()
-        .context("lsof is required for safe worktree garbage collection")?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        bail!("lsof failed while checking open worktree paths");
-    }
-    let root = worktree.to_string_lossy();
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.strip_prefix('n'))
-        .find(|path| *path == root || path.starts_with(&format!("{root}/")))
-        .map(str::to_owned))
 }
 
 fn has_unknown_local_state(worktree: &Path, allowed_generated: &[PathBuf]) -> Result<bool> {

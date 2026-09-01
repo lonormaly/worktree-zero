@@ -3,6 +3,32 @@
 All notable changes to Worktree Zero. Versions follow semantic versioning;
 pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
+## Unreleased
+
+### Added
+
+- **Experimental Windows support.** Copy-on-write worktrees via ReFS / Dev
+  Drive block cloning (probed at runtime, exactly like APFS and Linux
+  reflink), with a plain-checkout fallback on NTFS whose mode is named in
+  every receipt. Windows release binaries (`x86_64` and `aarch64` MSVC) are
+  built and attached by the release workflow, and CI runs the full test
+  suite on Windows twice — on NTFS for the fallback paths and on a
+  freshly-formatted ReFS volume for the block-clone paths.
+- Live-process guarding on Windows uses a rename round-trip probe plus the
+  filesystem's mandatory locking (a tree in use cannot be renamed, replaced,
+  or deleted), replacing Unix's `lsof` enumeration; a locked tree surfaces
+  as a preserved `remove-failed` skip, never a silent deletion.
+
+### Changed
+
+- File cloning no longer shells out to platform `cp`: APFS clonefile, Linux
+  `FICLONE`, and Windows ReFS block cloning now go through one native API
+  (`reflink-copy`), and tree cloning preserves Unix permission bits and
+  recreates symlinks explicitly.
+- Symlink validation and free-space measurement no longer depend on external
+  `find` and (on Windows) `df`; process inspection lives in one shared
+  module for `gc`, `migrate`, and `prepare`.
+
 ## 0.1.11 — 2026-09-01
 
 ### Added
