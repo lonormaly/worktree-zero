@@ -21,6 +21,7 @@ serde_json.workspace   = true
 anyhow.workspace       = true
 uuid.workspace         = true
 reflink-copy.workspace = true
+dunce.workspace        = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

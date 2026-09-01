@@ -578,7 +578,8 @@ impl Fixture {
     fn new() -> Result<Self> {
         let root = std::env::temp_dir().join(format!("wt0-worktree-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root)?;
-        let root = root.canonicalize()?;
+        // dunce strips Windows verbatim prefixes Git cannot consume.
+        let root = dunce::canonicalize(&root)?;
         let repo = root.join("repo");
         fs::create_dir_all(&repo)?;
         git(&repo, ["init", "-q"])?;

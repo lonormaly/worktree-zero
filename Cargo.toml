@@ -28,5 +28,9 @@ uuid         = { version = "1", features = ["v4", "v7"] }
 # Windows ReFS block cloning behind one API.
 reflink-copy = "0.1.30"
 
+# Canonicalize without Windows verbatim (\\?\) prefixes, which Git for
+# Windows cannot consume. A passthrough on Unix.
+dunce        = "1"
+
 # Error handling
 anyhow       = "1"

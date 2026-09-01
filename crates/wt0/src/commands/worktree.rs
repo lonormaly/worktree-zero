@@ -1132,9 +1132,8 @@ fn generated_runtime(repo: &RepoContext, worktree: &Path) -> Result<Option<Gener
             format!("generated runtime has no owner: {}", owner_path.display())
         })?)
         .context("parse generated-runtime owner")?;
-    let expected_worktree = worktree
-        .canonicalize()
-        .unwrap_or_else(|_| worktree.to_path_buf());
+    let expected_worktree =
+        dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
     if owner["runtime_id"].as_str() != Some(runtime_id.as_str())
         || owner["worktree"].as_str() != Some(expected_worktree.to_string_lossy().as_ref())
     {
@@ -1154,8 +1153,7 @@ fn generated_runtime(repo: &RepoContext, worktree: &Path) -> Result<Option<Gener
 fn prepare_generated_runtime(worktree: &Path) -> Result<GeneratedRuntime> {
     let repo = discover_repo(worktree)?;
     let runtime_id = runtime_identity(worktree)?;
-    let worktree = worktree
-        .canonicalize()
+    let worktree = dunce::canonicalize(worktree)
         .with_context(|| format!("resolve worktree path {}", worktree.display()))?;
     let root = state_dir(&repo.common_git_dir)
         .join("generated")
