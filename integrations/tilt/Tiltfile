@@ -50,3 +50,24 @@ def wt0_namespace(prefix='wt0'):
 def wt0_compose_project():
     """The runtime's Docker Compose project name."""
     return os.getenv('COMPOSE_PROJECT_NAME', 'wt0-%s' % wt0_short_id())
+
+# --- Tier 1: shared services, private app -----------------------------------
+# See docs/dev-environments.md. The services tier (databases, queues,
+# emulators) boots once under a STABLE identity; each worktree's app tier
+# connects under a per-runtime resource name.
+
+def wt0_shared_namespace(prefix='wt0-shared'):
+    """The stable namespace for the once-per-cluster services tier."""
+    return prefix
+
+def wt0_resource_name(base):
+    """A per-runtime tenant name inside a shared service, e.g. a database
+    name: appdb_0198f3a2. Unique per runtime; a pre-remove hook must drop
+    it so tenant state never outlives the worktree."""
+    return '%s_%s' % (base, wt0_short_id())
+
+def wt0_slot_resource(base):
+    """A slot-keyed tenant name, e.g. appdb_wt0_3. Bounded and reusable,
+    but a reused slot inherits the previous tenant's state — use only for
+    resources a post-create hook resets."""
+    return '%s_wt0_%s' % (base, wt0_slot())

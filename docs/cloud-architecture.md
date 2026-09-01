@@ -95,7 +95,10 @@ environment per worktree. The primitives shipped in 0.1.x compose into this:
   down, and a failing hook vetoes cleanup instead of leaking;
 - the [Tilt extension](../integrations/tilt/README.md) maps those identities
   into Tilt: per-runtime namespaces, offset port forwards, and
-  `wt0 run agent/x -- tilt ci` as a one-shot per-worktree test environment.
+  `wt0 run agent/x -- tilt ci` as a one-shot per-worktree test environment;
+- [docs/dev-environments.md](dev-environments.md) defines the environment
+  tiers — fully isolated, shared-services/private-app (where HMR lives),
+  and the proposed `wt0 attach` warm preview pool.
 
 ## Non-goals
 

@@ -7,7 +7,10 @@ zero collisions, zero per-project port arithmetic.
 
 Status: experimental. The extension only reads the `WT0_*` environment that
 `wt0 run` and lifecycle hooks export; it never reimplements lifecycle
-behavior.
+behavior. Contribution to the official
+[tilt-extensions](https://github.com/tilt-dev/tilt-extensions) registry is
+planned so `load('ext://wt0', ...)` needs no `extension_repo` boilerplate;
+this directory stays the source of truth.
 
 ## Setup
 
@@ -66,6 +69,33 @@ tilt down --delete-namespaces || exit 1
 ```
 
 See [examples/](examples/) for complete hook scripts.
+
+## Shared services, private app (tier 1)
+
+Booting a full stack per worktree is tier 0. Most fleets want tier 1 (see
+[docs/dev-environments.md](../../docs/dev-environments.md)): databases,
+queues, and emulators boot **once** under the stable
+`wt0_shared_namespace()`, while each worktree runs only its own dev server —
+seconds to boot, native file watching, full HMR — connecting as a private
+tenant:
+
+```python
+load('ext://wt0', 'wt0_shared_namespace', 'wt0_resource_name', 'wt0_port')
+
+# Services tier: deployed once, stable identity, upgraded only from main.
+k8s_yaml(namespace_inject(read_file('k8s/services.yaml'), wt0_shared_namespace()))
+
+# App tier: private per worktree, tenant-named inside the shared services.
+db_name = wt0_resource_name('appdb')       # e.g. appdb_0198f3a2
+k8s_resource('web', port_forwards='%d:3000' % wt0_port(0))
+```
+
+Provision the tenant in `.wt0/hooks/post-create` (`createdb "$db"`), drop it
+in `.wt0/hooks/pre-remove` (`dropdb "$db"`) — a failing drop vetoes the
+removal, so tenant state never leaks. HMR works because the watcher runs in
+the worktree next to real files: prepared `node_modules` environments are
+private CoW clones, not symlink farms, so watchers and bundler caches behave
+exactly as on a plain install.
 
 ## Docker Compose projects
 
