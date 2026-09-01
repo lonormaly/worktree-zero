@@ -746,6 +746,12 @@ fn owner_slug_floor_and_orphan_events_cover_the_adapter_surface() {
 
     // The checkout vanishes outside wt0: prune must recover the identity
     // from the surviving registration and report it, not silently forget it.
+    // An overlay-backed worktree is a mountpoint, so "vanished" there means
+    // the mount went away first (a reboot) and then the directory did.
+    if receipt["mode"] == "overlay" {
+        let _ = Command::new("fusermount").arg("-u").arg(&worktree).status();
+        let _ = Command::new("umount").arg(&worktree).status();
+    }
     fs::remove_dir_all(&worktree).expect("simulate rm -rf of the checkout");
     let pruned = Command::new(wt0)
         .current_dir(&repo)
