@@ -81,5 +81,8 @@ worktree count, cold/warm condition, command, and refusal count with every
 published benchmark.
 
 Use `--json` for Codex, Claude Code, NanoClaw, OpenClaw, Hermes, Grok Bot,
-Slack agents, queue workers, and other autonomous hosts. Do not parse decorated
-terminal output or reimplement lifecycle behavior in a vendor plugin.
+Slack agents, queue workers, and other autonomous hosts. Hosts with an MCP
+client can call the identical lifecycle through the `wt0 mcp serve` stdio
+server instead; both transports return the same versioned payloads. Do not
+parse decorated terminal output or reimplement lifecycle behavior in a vendor
+plugin.

@@ -35,6 +35,7 @@
 
 mod capabilities;
 mod commands;
+mod mcp;
 mod runtime;
 
 use anyhow::Result;
@@ -82,6 +83,8 @@ enum Commands {
     Prepare(runtime::Prepare),
     /// Audit or safely migrate existing linked runtimes.
     Migrate(runtime::Migrate),
+    /// Serve the same lifecycle over the Model Context Protocol.
+    Mcp(mcp::Mcp),
     /// Compatibility namespace for the imported source engine.
     #[command(hide = true, subcommand)]
     Worktree(commands::worktree::Worktree),
@@ -118,6 +121,7 @@ fn main() -> Result<()> {
         Commands::Doctor(args) => runtime::doctor(args, cli.json),
         Commands::Prepare(args) => runtime::prepare(args, cli.json),
         Commands::Migrate(args) => runtime::migrate(args, cli.json),
+        Commands::Mcp(args) => mcp::run(args),
         Commands::Worktree(cmd) => commands::worktree::run(cmd, cli.json),
     }
 }

@@ -62,9 +62,10 @@ The test must run without a person pressing a button after setup.
 
 The current lifecycle ships capability discovery, path/branch-based ownership
 records, automatic 30-second heartbeats for `wt0 run`, explicit
-`wt0 heartbeat`, and GC refusal for unowned, dirty, active, unknown-state, or
-detached worktrees. Runtime-ID lookup, idempotent create, MCP transport, and
-vendor packages remain planned.
+`wt0 heartbeat`, GC refusal for unowned, dirty, active, unknown-state, or
+detached worktrees, and the `wt0 mcp serve` stdio transport whose tools wrap
+the same JSON CLI (see [vendor integrations](vendor-integrations.md)).
+Runtime-ID lookup and idempotent create remain planned.
 
 ```text
 wt0 capabilities --json
@@ -80,6 +81,7 @@ wt0 mcp serve
 ```
 
 Only `capabilities`, path-based create/run/remove/list, heartbeat, doctor,
-prepare, migrate, and guarded GC are shipped today. The remaining lines are the
-contract that vendor adapters must target; documentation must not present them
-as available commands before their tests pass.
+prepare, migrate, guarded GC, and `wt0 mcp serve` are shipped today. The
+remaining lines are the contract that vendor adapters must target;
+documentation must not present them as available commands before their tests
+pass.
