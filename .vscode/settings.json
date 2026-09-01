@@ -1,0 +1,25 @@
+{
+    "workbench.tree.indent": 20,
+    "search.exclude": {
+        "**/.yarn": true,
+        "**/.pnp.*": true
+    },
+    "workbench.colorCustomizations": {
+        "editor.background": "#000000",
+        "sideBar.background": "#1b1b1b",
+        "sideBar.foreground": "#FFFFFF",
+        "activityBar.background": "#1b1b1b",
+        "activityBar.foreground": "#FFFFFF",
+        "titleBar.activeBackground": "#1b1b1b",
+        "titleBar.activeForeground": "#FFFFFF",
+        "statusBar.foreground": "#FFFFFF",
+        "menu.foreground": "#FFFFFF",
+        "list.activeSelectionForeground": "#FFFFFF",
+        "dropdown.foreground": "#FFFFFF",
+        "terminal.background": "#000000",
+        "terminal.foreground": "#ffffff",
+        "terminalCursor.background": "#FFFFFF",
+        "terminalCursor.foreground": "#FFFFFF"
+    },
+    "immorterm.statusBarTheme": "Monochrome Dark"
+}
