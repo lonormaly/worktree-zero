@@ -80,7 +80,7 @@ removed, reaped, adopted) so orchestrators observe a fleet without polling.
 
 ```text
 wt0 capabilities --json
-wt0 create --branch <name> --owner <agent-id> --idempotency-key <uuid> --json
+wt0 create <name> --owner <agent-id> --idempotency-key <uuid> --require-free 20G --json
 wt0 status --runtime <id> --json
 wt0 heartbeat --runtime <id> --lease <duration> --json
 wt0 measure --runtime <id> --json
@@ -91,8 +91,10 @@ wt0 gc --apply --json
 wt0 mcp serve
 ```
 
-Only `capabilities`, path-based create/run/remove/list, heartbeat, doctor,
-prepare, migrate, guarded GC, and `wt0 mcp serve` are shipped today. The
+Only `capabilities`, path-based create/run/remove/list (with `--owner`,
+`--idempotency-key`, and `--require-free`), heartbeat, doctor, prepare,
+migrate, guarded GC, prune with orphan events, fleet, events, and
+`wt0 mcp serve` are shipped today. The
 remaining lines are the contract that vendor adapters must target;
 documentation must not present them as available commands before their tests
 pass.

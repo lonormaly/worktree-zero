@@ -177,6 +177,8 @@ fn tools() -> Vec<Tool> {
                 "require_cow": { "type": "boolean", "description": "Fail instead of falling back to a plain checkout when copy-on-write is unavailable." },
                 "ephemeral": { "type": "boolean", "description": "Mark the worktree for automatic gc selection." },
                 "idempotency_key": { "type": "string", "description": "A retried create with the same key and branch returns the existing runtime (reused: true) instead of failing." },
+                "owner": { "type": "string", "description": "Agent or session id that owns the runtime; recorded in the lease, receipts, fleet, and WT0_OWNER for hooks." },
+                "require_free": { "type": "string", "description": "Refuse to create when the destination volume has less free space than this (e.g. 20G)." },
             }),
             required: &["branch"],
         },
@@ -401,6 +403,14 @@ fn build_argv(
             if let Some(key) = text("idempotency_key")? {
                 argv.push("--idempotency-key".into());
                 argv.push(key.into());
+            }
+            if let Some(owner) = text("owner")? {
+                argv.push("--owner".into());
+                argv.push(owner.into());
+            }
+            if let Some(floor) = text("require_free")? {
+                argv.push("--require-free".into());
+                argv.push(floor.into());
             }
         }
         "remove_worktree" => {

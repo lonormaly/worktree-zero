@@ -7,6 +7,19 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Added
 
+- **The adapter surface a design partner needed** (from migrating FLAM's
+  bespoke worktree system onto wt0): `--owner <agent-id>` on create/run
+  (recorded in the lease, receipts, fleet, events, and `WT0_OWNER`; default
+  `$WT0_OWNER`); `WT0_SLUG`, a label-safe branch form for hostnames,
+  namespaces, and database names; the owned `WT0_GENERATED_ROOT` created
+  before `post-create` runs and passed to every hook; `pre-remove` hooks now
+  receive the full lease identity; `wt0 prune` reports `orphaned_runtimes`
+  and records `orphaned` events (with owner, slot, port window, generated
+  root) for checkouts that vanished outside wt0, releasing their port
+  windows; and a configurable free-disk floor (`--require-free`,
+  `WT0_REQUIRE_FREE`) that refuses creation below it. MCP `create_worktree`
+  gains `owner` and `require_free`.
+
 - **Homebrew tap**: `brew install lonormaly/wt0/wt0` installs the
   prebuilt, checksummed release binary on macOS (arm64/x86_64) and Linux
   (x86_64/arm64).

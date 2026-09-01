@@ -12,6 +12,7 @@ fn mark_test_managed(worktree: &Path, branch: &str, ephemeral: bool) -> Result<R
             idempotency_key: None,
             slot: 0,
             port_base: 20000,
+            owner: None,
         },
     )
 }
@@ -775,4 +776,30 @@ fn baselines_layer_across_shared_and_local_stores() -> Result<()> {
     assert!(local.starts_with(state_dir(&repo.common_git_dir)));
     assert_eq!(fs::read_to_string(local.join("file.txt"))?, "content\n");
     Ok(())
+}
+
+#[test]
+fn branch_slugs_are_label_safe_and_bounded() {
+    assert_eq!(
+        branch_slug("agent/Fix Checkout_Bug"),
+        "agent-fix-checkout-bug"
+    );
+    assert_eq!(
+        branch_slug("feat/the-house-has-a-voice"),
+        "feat-the-house-has-a-voice"
+    );
+    assert_eq!(branch_slug("///"), "branch");
+    let long = branch_slug(&"x".repeat(80));
+    assert_eq!(long.len(), 40);
+    assert!(!branch_slug("trailing-dash-").ends_with('-'));
+}
+
+#[test]
+fn byte_sizes_parse_binary_units_and_reject_garbage() {
+    assert_eq!(parse_bytes("512").unwrap(), 512);
+    assert_eq!(parse_bytes("20G").unwrap(), 20 * 1024 * 1024 * 1024);
+    assert_eq!(parse_bytes("1.5M").unwrap(), 1_572_864);
+    assert_eq!(parse_bytes(" 2 TiB ").unwrap(), 2 * 1024_u64.pow(4));
+    assert!(parse_bytes("lots").is_err());
+    assert!(parse_bytes("20X").is_err());
 }

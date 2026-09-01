@@ -23,6 +23,25 @@ wt0 migrate --all --source-only
 wt0 migrate --all --source-only --apply --adopt
 ```
 
+### Orphans: a checkout that vanished outside wt0
+
+An `rm -rf`, a wiped temp volume, or a crashed machine removes a checkout
+without running any hook. Its ownership marker survives in Git's worktree
+administration directory until `git worktree prune`, so `wt0 prune` recovers
+the identity first: every such registration is reported in the receipt as
+`orphaned_runtimes` (worktree, branch, runtime id, owner, slot, port window,
+generated root), recorded as an `orphaned` lifecycle event, and its port
+window released. A project reconciles its own external resources — a
+per-runtime database, a namespace — from those events; wt0 never deletes
+what only the project's hooks know about.
+
+### Free-disk floor
+
+`wt0 create --require-free 20G` (or `WT0_REQUIRE_FREE=20G`) refuses to create
+when the destination volume has less free space than the floor, so a fleet
+never pushes a machine into emergency capacity. The floor is per machine and
+per policy — there is no literal in the tool, and no floor when unset.
+
 ## Garbage collection
 
 Garbage collection is deliberately stricter than folder deletion. `wt0 gc`
@@ -88,12 +107,19 @@ Hooks run with the worktree as their working directory and receive:
 | `WT0_REPO_ROOT` | the main repository's top level |
 | `WT0_SLOT` | the runtime's slot index |
 | `WT0_PORT_BASE` | the machine-globally unique hundred-port window base |
+| `WT0_SLUG` | a label-safe form of the branch (lowercase, `[a-z0-9-]`, ≤40 chars) for hostnames, namespaces, database names |
+| `WT0_OWNER` | the agent or session that owns the runtime (`--owner` / `$WT0_OWNER`); absent when none was given |
+| `WT0_GENERATED_ROOT` | the owned per-runtime storage root (`.git/wt0/generated/<runtime id>`), created before `post-create` runs and retired with the runtime — put mutable project state (emulator persistence, local data) here |
 
 Each runtime's port window is claimed from a machine-global registry —
 unique across every repository on the machine, verified free with a bind
 probe, released on removal — so hooks can start collision-free dev servers
 with zero project logic. `wt0 run` additionally defaults
 `COMPOSE_PROJECT_NAME` so Docker Compose stacks isolate per worktree.
+
+`pre-remove` receives the same lease-derived identity (`WT0_RUNTIME_ID`,
+`WT0_SLOT`, `WT0_PORT_BASE`, `WT0_OWNER`, `WT0_SLUG`, `WT0_GENERATED_ROOT`)
+so teardown can retire external resources by exact identity.
 
 Use `post-create` for project setup (seed a database, copy a reviewed env
 template, boot a dev stack) and `pre-remove` for teardown (stop dev servers,

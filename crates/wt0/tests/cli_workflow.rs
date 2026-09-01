@@ -639,3 +639,146 @@ fn fleet_and_events_report_the_lifecycle() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+// The FLAM adapter surface: owner identity, a label-safe slug, the owned
+// generated root available to hooks from create onward, a configurable
+// free-disk floor, and orphan events when a checkout vanishes outside wt0.
+#[cfg(unix)]
+#[test]
+fn owner_slug_floor_and_orphan_events_cover_the_adapter_surface() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-adapter-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    let machine = root.join("machine-state");
+    fs::create_dir_all(&machine).expect("create machine-state fixture");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+    let hooks = repo.join(".wt0/hooks");
+    fs::create_dir_all(&hooks).expect("create hooks dir");
+    let hook = hooks.join("post-create");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$WT0_SLUG\" \"$WT0_OWNER\" \"$WT0_GENERATED_ROOT\" > \"$WT0_REPO_ROOT/hook-env\"\n",
+    )
+    .expect("write hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("mark executable");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let worktree = root.join("Agent Fix_Checkout");
+
+    // A floor no laptop satisfies refuses before anything is created.
+    let refused = Command::new(wt0)
+        .current_dir(&repo)
+        .env("WT0_MACHINE_STATE", &machine)
+        .args(["--json", "create", "agent/Fix_Checkout", "--path"])
+        .arg(&worktree)
+        .args(["--require-free", "100000T"])
+        .output()
+        .expect("create with impossible floor");
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("below the required floor"));
+    assert!(!worktree.exists());
+
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .env("WT0_MACHINE_STATE", &machine)
+        .args(["--json", "create", "agent/Fix_Checkout", "--path"])
+        .arg(&worktree)
+        .args([
+            "--owner",
+            "immorterm:41103-b78ffb92",
+            "--require-free",
+            "1M",
+        ])
+        .output()
+        .expect("create worktree");
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&created.stdout).expect("create JSON");
+    assert_eq!(receipt["owner"], "immorterm:41103-b78ffb92");
+    assert_eq!(receipt["slug"], "agent-fix-checkout");
+    let runtime_id = receipt["runtime_id"]
+        .as_str()
+        .expect("runtime id")
+        .to_owned();
+
+    let hook_env = fs::read_to_string(repo.join("hook-env")).expect("hook saw the environment");
+    let lines: Vec<&str> = hook_env.lines().collect();
+    assert_eq!(lines[0], "agent-fix-checkout");
+    assert_eq!(lines[1], "immorterm:41103-b78ffb92");
+    assert!(
+        Path::new(lines[2]).is_dir() && lines[2].ends_with(&runtime_id),
+        "generated root must exist at hook time: {}",
+        lines[2]
+    );
+
+    let fleet = Command::new(wt0)
+        .current_dir(&repo)
+        .env("WT0_MACHINE_STATE", &machine)
+        .args(["--json", "fleet"])
+        .output()
+        .expect("run fleet");
+    let fleet: serde_json::Value = serde_json::from_slice(&fleet.stdout).expect("fleet JSON");
+    let managed = fleet["runtimes"]
+        .as_array()
+        .expect("runtimes")
+        .iter()
+        .find(|runtime| runtime["managed"] == true)
+        .expect("managed runtime");
+    assert_eq!(managed["owner"], "immorterm:41103-b78ffb92");
+    assert_eq!(managed["slug"], "agent-fix-checkout");
+
+    // The checkout vanishes outside wt0: prune must recover the identity
+    // from the surviving registration and report it, not silently forget it.
+    fs::remove_dir_all(&worktree).expect("simulate rm -rf of the checkout");
+    let pruned = Command::new(wt0)
+        .current_dir(&repo)
+        .env("WT0_MACHINE_STATE", &machine)
+        .args(["--json", "prune"])
+        .output()
+        .expect("run prune");
+    assert!(
+        pruned.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&pruned.stderr)
+    );
+    let pruned: serde_json::Value = serde_json::from_slice(&pruned.stdout).expect("prune JSON");
+    let orphans = pruned["orphaned_runtimes"].as_array().expect("orphans");
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(orphans[0]["runtime_id"], runtime_id.as_str());
+    assert_eq!(orphans[0]["owner"], "immorterm:41103-b78ffb92");
+    assert!(orphans[0]["port_base"].as_u64().is_some());
+    assert!(orphans[0]["generated_root"].as_str().is_some());
+
+    let events = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "events"])
+        .output()
+        .expect("read events");
+    let events: serde_json::Value = serde_json::from_slice(&events.stdout).expect("events JSON");
+    let orphaned = events["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|event| event["event"] == "orphaned")
+        .expect("orphaned event recorded");
+    assert_eq!(orphaned["runtime_id"], runtime_id.as_str());
+
+    let _ = fs::remove_dir_all(root);
+}

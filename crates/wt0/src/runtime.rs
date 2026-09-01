@@ -482,6 +482,7 @@ fn migrate_one(
                     idempotency_key: None,
                     slot,
                     port_base,
+                    owner: std::env::var("WT0_OWNER").ok().as_deref(),
                 },
             )?;
             crate::events::record(
@@ -1798,7 +1799,7 @@ fn worktree_branch_label(root: &Path) -> Result<String> {
 }
 
 #[cfg(unix)]
-fn filesystem_free_bytes(path: &Path) -> Result<u64> {
+pub(crate) fn filesystem_free_bytes(path: &Path) -> Result<u64> {
     let output = Command::new("df")
         .args(["-Pk"])
         .arg(path)
@@ -1821,7 +1822,7 @@ fn filesystem_free_bytes(path: &Path) -> Result<u64> {
 }
 
 #[cfg(windows)]
-fn filesystem_free_bytes(path: &Path) -> Result<u64> {
+pub(crate) fn filesystem_free_bytes(path: &Path) -> Result<u64> {
     use std::os::windows::ffi::OsStrExt;
     let wide: Vec<u16> = path
         .as_os_str()
