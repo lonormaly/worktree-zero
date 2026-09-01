@@ -13,9 +13,9 @@ this table. Do not turn planned support into a shipped claim.
 | uv/Python | Native cache and private virtual-environment adapter planned |
 | Cargo/Rust | Shipped through `wt0 run`: native registry/git caches stay global; each runtime receives an owned external `CARGO_TARGET_DIR`; remove, GC and prune retire it. Shared sccache policy remains opt-in pending project benchmarks |
 | Go | Native module/build caches should be preserved; verification adapter planned |
-| Nx | Nx already shares task cache across Git worktrees; daemon/workspace-data policy is project integration work |
+| Nx | Shipped through `wt0 run`: Nx's worktree-aware task cache stays native and shared; `NX_WORKSPACE_DATA_DIRECTORY`, sockets, daemon and TUI state are isolated per runtime and retired |
 | Next/Turbopack | Cache is measurable, but one live writable `.next` must never be shared between agents |
-| Wrangler | Use its supported per-runtime persistence path; generic adapter is not yet shipped |
+| Wrangler | Shipped for direct `wrangler`, `npx wrangler`, `bunx wrangler`, pnpm and Yarn local commands: injects the supported `--persist-to` owned path unless the caller supplied one. Package-script/Vite configuration still belongs to the project wrapper |
 | macOS | Shipped and measured on APFS, Apple Silicon and Intel release binaries |
 | Linux | Shipped and measured on Btrfs plus overlay integration, x64 and ARM64 binaries |
 | Windows | No storage-saving release claim yet; private-view mechanism must be measured first |

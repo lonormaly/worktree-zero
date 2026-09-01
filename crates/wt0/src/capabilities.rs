@@ -145,8 +145,8 @@ fn generated_adapters(root: &Path) -> Vec<Adapter> {
         Adapter {
             id: "nx",
             detected: root.join("nx.json").is_file(),
-            support: "detected",
-            behavior: "audit .nx storage; project wrapper owns cache location and daemon policy",
+            support: "shipped-through-wt0-run",
+            behavior: "keep Nx's worktree-aware task cache native; move mutable workspace data and sockets into owned per-runtime storage",
         },
         Adapter {
             id: "next",
@@ -163,8 +163,8 @@ fn generated_adapters(root: &Path) -> Vec<Adapter> {
         Adapter {
             id: "wrangler",
             detected: has_named_file(root, &["wrangler.toml", "wrangler.json", "wrangler.jsonc"]),
-            support: "detected",
-            behavior: "move local persistence through Wrangler's supported --persist-to path",
+            support: "shipped-for-direct-local-commands",
+            behavior: "append Wrangler's supported --persist-to path for direct dev/--local commands and retire the owned local data with the runtime",
         },
         Adapter {
             id: "cargo-target",

@@ -46,7 +46,9 @@ wt0 heartbeat /absolute/path/to/worktree --json
 
 `wt0 run` prepares supported dependencies automatically, refreshes its own
 heartbeat every 30 seconds, and gives Cargo an owned `CARGO_TARGET_DIR` outside
-the checkout. Prefer it for headless agents that do not need a project wrapper.
+the checkout. It also isolates Nx mutable workspace data and direct Wrangler
+local persistence while leaving Nx's worktree-aware task cache shared. Prefer
+it for headless agents that do not need a project wrapper.
 
 ## Finish safely
 

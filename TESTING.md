@@ -80,3 +80,10 @@ tests/generated_cargo_integration.sh
 This creates a Rust project, runs it through `wt0 run`, proves Cargo writes to
 an owned path outside the worktree, and verifies both normal GC and raw-removal
 crash recovery retire that exact path.
+
+```bash
+tests/generated_js_integration.sh
+```
+
+This proves Nx mutable state and Wrangler local persistence stay outside the
+worktree, remain visible to `doctor`, and disappear with owned teardown.
