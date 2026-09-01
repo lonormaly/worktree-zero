@@ -138,6 +138,30 @@ The full handover — origin, decisions not to re-litigate, the FLAM constraints
 wt0 must not break, and the acceptance criteria — is in
 [flam-handover.md](flam-handover.md).
 
+## Interim receipts — Phase 2 in progress (2026-09-01)
+
+First `wt0` runtimes on the real FLAM fleet volume (99% full, other sessions
+writing concurrently, so `df` deltas carry roughly ±10 MiB of noise). wt0
+built from `main` after Phase 1 (#37); same commit `460abc44`.
+
+| Step | Wall clock | Physical (`df` delta) | Logical (`du`) |
+| --- | ---: | ---: | ---: |
+| First `wt0 create` (materializes the canonical baseline, then clones) | 10.5 s | 386 MiB | 378 MiB |
+| Second `wt0 create`, same base | 8.1 s | **7 MiB** | 378 MiB |
+| `wt0 remove --delete-branch` of the second | — | ~0 MiB returned (its cost was ~7 MiB) | — |
+
+Both receipts carried `mode: cow-clone`, disjoint slots (0, 1) and port
+windows (20000, 20100), the `--owner` identity, and the branch slug; the
+fleet view showed exactly one managed runtime after the removal.
+
+**Finding — baselines are per base commit.** The first worktree of any base
+commit pays a full materialization (~380 MiB here) before every later one
+clones for ~7 MiB; FLAM's store already held three commit baselines
+(~1.5 GB logical). On a fast-moving `main` that is a real cost. The
+optimization is the "nearest snapshot" strategy prepared environments
+already use: build a new baseline as a copy-on-write clone of the nearest
+existing baseline plus the commit diff. Tracked as wt0 gap #6.
+
 ## After
 
 _To be filled by the same instruments once the migration lands._
