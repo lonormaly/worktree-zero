@@ -70,7 +70,10 @@ and branch returns the existing runtime with `reused: true`; a different key
 is refused, never handed another job's runtime), and deterministic runtime
 slots (`slot` in every create receipt, `WT0_SLOT` and `WT0_PORT_BASE` in
 `wt0 run` and hook environments, so parallel agents get disjoint port
-windows without coordination). Runtime-ID lookup remains planned.
+windows without coordination), the `wt0 fleet` control view (every runtime
+with lease, slot, heartbeat age, mode, and owned generated storage), and the
+append-only lifecycle event log (`wt0 events [--follow]`; created, reused,
+removed, reaped, adopted) so orchestrators observe a fleet without polling.
 
 ```text
 wt0 capabilities --json

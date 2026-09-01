@@ -451,3 +451,97 @@ fn create_is_idempotent_and_allocates_disjoint_slots() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn fleet_and_events_report_the_lifecycle() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-fleet-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let worktree = root.join("agent");
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "create", "agent/fleet", "--path"])
+        .arg(&worktree)
+        .output()
+        .expect("create worktree");
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let fleet = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "fleet"])
+        .output()
+        .expect("run fleet");
+    assert!(
+        fleet.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&fleet.stderr)
+    );
+    let fleet: serde_json::Value = serde_json::from_slice(&fleet.stdout).expect("fleet JSON");
+    assert_eq!(fleet["schema_version"], 1);
+    let runtimes = fleet["runtimes"].as_array().expect("runtimes");
+    let managed = runtimes
+        .iter()
+        .find(|runtime| runtime["branch"] == "agent/fleet")
+        .expect("managed runtime listed");
+    assert_eq!(managed["managed"], true);
+    assert_eq!(managed["slot"], 0);
+    assert!(managed["runtime_id"].as_str().is_some());
+    assert!(managed["lease_age_seconds"].as_u64().is_some());
+    assert!(runtimes
+        .iter()
+        .any(|runtime| runtime["is_main"] == true && runtime["managed"] == false));
+
+    let removed = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["remove"])
+        .arg(&worktree)
+        .output()
+        .expect("remove worktree");
+    assert!(
+        removed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+
+    let events = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "events"])
+        .output()
+        .expect("read events");
+    assert!(
+        events.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&events.stderr)
+    );
+    let events: serde_json::Value = serde_json::from_slice(&events.stdout).expect("events JSON");
+    assert_eq!(events["schema_version"], 1);
+    let kinds: Vec<&str> = events["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter_map(|event| event["event"].as_str())
+        .collect();
+    assert!(kinds.contains(&"created"), "kinds: {kinds:?}");
+    assert!(kinds.contains(&"removed"), "kinds: {kinds:?}");
+
+    let _ = fs::remove_dir_all(root);
+}

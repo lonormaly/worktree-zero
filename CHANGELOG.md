@@ -13,6 +13,12 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   different key, path, or explicit `--base` is refused — never a second
   runtime, never an overwrite. Ownership markers now record mode, base,
   idempotency key, and slot.
+- **Fleet view and lifecycle events**: `wt0 fleet` reports every runtime
+  with its lease, slot, heartbeat age, mode, and owned generated storage;
+  lifecycle transitions (created, reused, removed, reaped, adopted) append
+  to `.git/wt0/events.jsonl`, readable and followable via `wt0 events`
+  and exposed as MCP tools. Recording is best-effort observability; markers
+  and receipts remain authoritative.
 - **Deterministic runtime slots**: every runtime is assigned the smallest
   free slot index under a cross-process lock, reported as `slot` in create
   receipts and exported as `WT0_SLOT` and `WT0_PORT_BASE` (disjoint

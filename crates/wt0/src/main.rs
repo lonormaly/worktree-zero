@@ -35,6 +35,7 @@
 
 mod capabilities;
 mod commands;
+mod events;
 mod hooks;
 mod mcp;
 mod process;
@@ -85,6 +86,10 @@ enum Commands {
     Prepare(runtime::Prepare),
     /// Audit or safely migrate existing linked runtimes.
     Migrate(runtime::Migrate),
+    /// Show every runtime with its lease, slot, and storage — the fleet view.
+    Fleet(commands::worktree::WorktreeFleet),
+    /// Read or follow the append-only lifecycle event log.
+    Events(events::Events),
     /// Serve the same lifecycle over the Model Context Protocol.
     Mcp(mcp::Mcp),
     /// Compatibility namespace for the imported source engine.
@@ -123,6 +128,8 @@ fn main() -> Result<()> {
         Commands::Doctor(args) => runtime::doctor(args, cli.json),
         Commands::Prepare(args) => runtime::prepare(args, cli.json),
         Commands::Migrate(args) => runtime::migrate(args, cli.json),
+        Commands::Fleet(args) => commands::worktree::fleet(args.json || cli.json),
+        Commands::Events(args) => events::run(args, cli.json),
         Commands::Mcp(args) => mcp::run(args),
         Commands::Worktree(cmd) => commands::worktree::run(cmd, cli.json),
     }

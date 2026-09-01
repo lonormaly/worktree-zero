@@ -184,6 +184,13 @@ pub struct WorktreeRun {
 }
 
 #[derive(Args, Default)]
+pub struct WorktreeFleet {
+    /// JSON output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Default)]
 pub struct WorktreeRepair {
     /// JSON output.
     #[arg(long)]
@@ -368,6 +375,17 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         return Err(error).context("post-create hook failed; worktree rolled back");
     }
 
+    crate::events::record(
+        &repo.common_git_dir,
+        "created",
+        json!({
+            "worktree": target,
+            "branch": args.branch,
+            "runtime_id": lease.runtime_id,
+            "slot": lease.slot,
+            "mode": mode.label(),
+        }),
+    );
     Ok(CreatedWorktree {
         target,
         base,
@@ -437,6 +455,15 @@ fn reuse_existing_runtime(
             }
         }
     }
+    crate::events::record(
+        &repo.common_git_dir,
+        "reused",
+        json!({
+            "worktree": existing,
+            "branch": args.branch,
+            "runtime_id": lease.runtime_id,
+        }),
+    );
     Ok(CreatedWorktree {
         target: existing,
         base: lease
@@ -851,6 +878,7 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     // Detect overlay backing while the worktree is still mounted/registered.
     let overlay = overlay::state(&repo, &target);
 
+    let removed_runtime_id = runtime_identity(&target).ok();
     let mut hook_env = vec![
         ("WT0_WORKTREE", target.display().to_string()),
         ("WT0_REPO_ROOT", repo.top_level.display().to_string()),
@@ -859,8 +887,8 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
         hook_env.push(("WT0_BRANCH", short.to_owned()));
     }
-    if let Ok(runtime_id) = runtime_identity(&target) {
-        hook_env.push(("WT0_RUNTIME_ID", runtime_id));
+    if let Some(runtime_id) = &removed_runtime_id {
+        hook_env.push(("WT0_RUNTIME_ID", runtime_id.clone()));
     }
     crate::hooks::run_hook(&target, crate::hooks::HookEvent::PreRemove, &hook_env)
         .context("pre-remove hook failed; removal aborted")?;
@@ -907,6 +935,16 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     if let Some(generated) = generated {
         retire_generated_runtime(&generated)?;
     }
+    crate::events::record(
+        &repo.common_git_dir,
+        "removed",
+        json!({
+            "worktree": target,
+            "branch": branch.as_deref().map(|branch| branch.strip_prefix("refs/heads/").unwrap_or(branch)),
+            "runtime_id": removed_runtime_id,
+            "committed": committed,
+        }),
+    );
     let mut branch_deleted = false;
     if args.delete_branch {
         let branch = branch.context("cannot delete branch for a detached worktree")?;
@@ -997,6 +1035,81 @@ fn list(json_output: bool) -> Result<()> {
             "worktrees": entries,
         }))?
     );
+    Ok(())
+}
+
+/// The swarm control view: every worktree with its lease, slot, heartbeat
+/// age, and owned generated storage — the data orchestrators render.
+pub fn fleet(json_output: bool) -> Result<()> {
+    let repo = discover_repo(&std::env::current_dir()?)?;
+    let now = now_unix_seconds()?;
+    let mut runtimes = Vec::new();
+    for entry in list_worktrees(&repo)? {
+        let branch = entry.branch.as_deref().map(|branch| {
+            branch
+                .strip_prefix("refs/heads/")
+                .unwrap_or(branch)
+                .to_owned()
+        });
+        if !is_managed(&entry.path) {
+            runtimes.push(json!({
+                "worktree": entry.path,
+                "is_main": entry.is_main,
+                "managed": false,
+                "branch": branch,
+            }));
+            continue;
+        }
+        let lease = stored_lease(&entry.path)?;
+        let generated = generated_runtime(&repo, &entry.path)
+            .ok()
+            .flatten()
+            .map(|runtime| generated_logical_bytes(&runtime.root))
+            .transpose()?
+            .unwrap_or(0);
+        runtimes.push(json!({
+            "worktree": entry.path,
+            "is_main": entry.is_main,
+            "managed": true,
+            "branch": branch,
+            "runtime_id": lease.runtime_id,
+            "slot": lease.slot,
+            "mode": lease.mode,
+            "ephemeral": lease.ephemeral,
+            "created_at_unix": lease.created_at_unix,
+            "heartbeat_at_unix": lease.heartbeat_at_unix,
+            "lease_age_seconds": now.saturating_sub(lease.heartbeat_at_unix),
+            "owned_generated_bytes": generated,
+        }));
+    }
+    if json_output {
+        emit(&json!({ "schema_version": 1, "runtimes": runtimes }));
+    } else {
+        println!("Worktree Zero fleet: {} worktree(s)", runtimes.len());
+        for runtime in &runtimes {
+            if runtime["managed"] == true {
+                println!(
+                    "  {}  slot {}  lease {}s  {}  {}",
+                    runtime["branch"].as_str().unwrap_or("detached"),
+                    runtime["slot"],
+                    runtime["lease_age_seconds"],
+                    runtime["mode"].as_str().unwrap_or("unknown"),
+                    runtime["worktree"].as_str().unwrap_or("")
+                );
+            } else {
+                println!(
+                    "  {}  unmanaged{}  {}",
+                    runtime["branch"].as_str().unwrap_or("detached"),
+                    if runtime["is_main"] == true {
+                        " (main)"
+                    } else {
+                        ""
+                    },
+                    runtime["worktree"].as_str().unwrap_or("")
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1241,13 +1354,14 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
             reaped.push(entry.path);
             continue;
         }
+        let reaped_runtime_id = runtime_identity(&entry.path).ok();
         let mut hook_env = vec![
             ("WT0_WORKTREE", entry.path.display().to_string()),
             ("WT0_BRANCH", short.to_owned()),
             ("WT0_REPO_ROOT", repo.top_level.display().to_string()),
         ];
-        if let Ok(runtime_id) = runtime_identity(&entry.path) {
-            hook_env.push(("WT0_RUNTIME_ID", runtime_id));
+        if let Some(runtime_id) = &reaped_runtime_id {
+            hook_env.push(("WT0_RUNTIME_ID", runtime_id.clone()));
         }
         if let Err(error) =
             crate::hooks::run_hook(&entry.path, crate::hooks::HookEvent::PreRemove, &hook_env)
@@ -1257,6 +1371,15 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
         }
         match force_teardown(repo, &entry.path) {
             Ok(()) => {
+                crate::events::record(
+                    &repo.common_git_dir,
+                    "reaped",
+                    json!({
+                        "worktree": entry.path,
+                        "branch": short,
+                        "runtime_id": reaped_runtime_id,
+                    }),
+                );
                 if args.delete_branches {
                     if let Some(branch) = &entry.branch {
                         if delete_local_branch(repo, branch, false).is_err() {

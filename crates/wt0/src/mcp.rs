@@ -181,6 +181,23 @@ fn tools() -> Vec<Tool> {
             required: &["branch"],
         },
         Tool {
+            name: "fleet",
+            title: "Fleet view",
+            description: "Every runtime with its lease, slot, heartbeat age, mode, and owned generated storage — the swarm control view.",
+            properties: json!({ "repo": repo }),
+            required: &[],
+        },
+        Tool {
+            name: "events",
+            title: "Lifecycle events",
+            description: "The newest entries from the append-only lifecycle event log (created, reused, removed, reaped, adopted).",
+            properties: json!({
+                "repo": repo,
+                "limit": { "type": "integer", "description": "Maximum number of newest events to return. Default 50.", "minimum": 1 },
+            }),
+            required: &[],
+        },
+        Tool {
             name: "list_worktrees",
             title: "List worktrees",
             description: "List linked worktrees from Git's native registry.",
@@ -322,6 +339,13 @@ fn build_argv(
             Some(_) => Err(format!("argument '{key}' must be a string")),
         }
     };
+    let number = |key: &str| -> Result<Option<u64>, String> {
+        match arguments.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Number(value)) if value.as_u64().is_some() => Ok(value.as_u64()),
+            Some(_) => Err(format!("argument '{key}' must be a non-negative integer")),
+        }
+    };
     let flag = |key: &str| -> Result<bool, String> {
         match arguments.get(key) {
             None | Some(Value::Null) => Ok(false),
@@ -347,6 +371,14 @@ fn build_argv(
     match name {
         "capabilities" => argv.push("capabilities".into()),
         "doctor" => argv.push("doctor".into()),
+        "fleet" => argv.push("fleet".into()),
+        "events" => {
+            argv.push("events".into());
+            if let Some(limit) = number("limit")? {
+                argv.push("--limit".into());
+                argv.push(limit.to_string().into());
+            }
+        }
         "list_worktrees" => argv.push("list".into()),
         "repair" => argv.push("repair".into()),
         "create_worktree" => {

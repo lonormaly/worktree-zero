@@ -469,7 +469,7 @@ fn migrate_one(
         if adopt && !worktree::is_managed(root) {
             let branch = worktree_branch_label(root)?;
             let slot = worktree::allocate_slot(&repo)?;
-            worktree::mark_managed(
+            let lease = worktree::mark_managed(
                 root,
                 &worktree::RuntimeSpec {
                     branch: &branch,
@@ -480,6 +480,16 @@ fn migrate_one(
                     slot,
                 },
             )?;
+            crate::events::record(
+                &repo.common_git_dir,
+                "adopted",
+                json!({
+                    "worktree": root,
+                    "branch": branch,
+                    "runtime_id": lease.runtime_id,
+                    "slot": lease.slot,
+                }),
+            );
         }
         "applied"
     };

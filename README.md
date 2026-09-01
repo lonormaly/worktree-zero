@@ -178,6 +178,15 @@ writable `.next` directory between two running agents would be unsafe. Copying
 the same tracked video forty times is unnecessary. The tool must classify the
 data before deciding whether to share, isolate, or remove it.
 
+### The fleet view and event log
+
+`wt0 fleet --json` is the swarm control view: every runtime with its branch,
+`runtime_id`, slot, lease age, populate mode, and owned generated storage in
+one call. `wt0 events --follow` streams the append-only lifecycle log
+(created, reused, removed, reaped, adopted) so orchestrators react to fleet
+changes without polling; both are also MCP tools. The log is observability,
+never authority — ownership markers and receipts remain the source of truth.
+
 ### Forgotten worktrees are a lifecycle problem
 
 Every worktree created by Worktree Zero receives a private ownership record and
