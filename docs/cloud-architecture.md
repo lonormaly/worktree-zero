@@ -37,8 +37,11 @@ Two placements survive that constraint:
 
 ## Stage 1 — one relocatable store (`WT0_STORE` unification)
 
-Today only prepared environments honor `WT0_STORE`; baselines live inside
-`.git/wt0`. Stage 1 makes every immutable store relocatable and layerable:
+Status: shipped for baselines (layered lookup, versioned layout, read-only
+shared levels, CoW-placement probes, `store_levels` in `capabilities`);
+prepared environments honor a single `WT0_STORE` level today and gain the
+same layering next, after the environment-adapter deduplication. Stage 1
+makes every immutable store relocatable and layerable:
 
 - `WT0_STORE` covers baselines and environments under one versioned layout
   (`store-version` file; mismatch is an error, never a guess).

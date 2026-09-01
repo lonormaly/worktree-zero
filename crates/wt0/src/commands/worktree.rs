@@ -720,7 +720,8 @@ impl Drop for SlotLock {
 }
 
 fn add_cow_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str) -> Result<()> {
-    let baseline = cow::ensure_baseline(repo, base)?;
+    let clone_hint = target.parent().context("worktree path has no parent")?;
+    let baseline = cow::ensure_baseline(repo, base, Some(clone_hint))?;
     let add_result = run_git_common(
         repo,
         [
@@ -775,7 +776,9 @@ fn add_git_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str)
 /// `lowerdir` is the shared read-only baseline, and a per-worktree `upperdir`
 /// captures writes. Unchanged files cost no disk, on any Linux filesystem.
 fn add_overlay_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str) -> Result<()> {
-    let baseline = cow::ensure_baseline(repo, base)?;
+    // Overlay lowerdirs only need to be readable, so no clone hint: a
+    // shared-store hit on any volume serves every mount.
+    let baseline = cow::ensure_baseline(repo, base, None)?;
 
     let overlay_dir = overlay::root(&repo.common_git_dir).join(Uuid::new_v4().to_string());
     let upper = overlay_dir.join("upper");
@@ -2175,7 +2178,7 @@ pub(crate) fn migrate_identical_source(
             worktree.display()
         );
     }
-    let baseline_tree = cow::ensure_baseline(&repo, &report.baseline_commit)?;
+    let baseline_tree = cow::ensure_baseline(&repo, &report.baseline_commit, Some(worktree))?;
 
     for candidate in candidates {
         let source = baseline_tree.join(&candidate.relative);

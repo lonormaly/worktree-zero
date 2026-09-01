@@ -7,6 +7,17 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Added
 
+- **Layered baseline stores (cloud RFC stage 1)**: `WT0_STORE` now also
+  serves source baselines, searched shared-level-first with the repo-local
+  store as writable overflow. Store roots carry a `store-version` layout
+  stamp (mismatch is an error, never a guess), read-only shared levels are
+  used in place and never written or pruned from a consuming repository,
+  and a shared level that cannot serve copy-on-write clones onto the
+  destination volume is skipped explicitly instead of degrading to full
+  copies. `capabilities` reports the resolved `store_levels`. Prepared
+  environments keep their single-level `WT0_STORE` support; layering for
+  them follows the environment-adapter deduplication.
+
 - **Idempotent create and run**: `--idempotency-key` on `create`/`run` (and
   the MCP `create_worktree` tool). A retried request with the same key and
   branch returns the existing runtime with `reused: true` in the receipt; a
