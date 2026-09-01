@@ -107,6 +107,9 @@ fn remove_accepts_an_absolute_worktree_path_from_outside_the_repository() {
     fs::remove_dir_all(root).expect("remove fixture");
 }
 
+// Drives the agent command through `sh`; the equivalent Windows coverage is
+// the MCP end-to-end test plus the unit suite on the ReFS CI volume.
+#[cfg(unix)]
 #[test]
 fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
     let root = std::env::temp_dir().join(format!(

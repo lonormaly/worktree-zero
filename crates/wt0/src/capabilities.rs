@@ -257,7 +257,7 @@ fn source_backend() -> &'static str {
     } else if cfg!(target_os = "linux") {
         "linux-reflink"
     } else if cfg!(target_os = "windows") {
-        "refs-block-clone-planned"
+        "refs-block-clone"
     } else {
         "plain-fallback"
     }

@@ -37,6 +37,7 @@ mod capabilities;
 mod commands;
 mod hooks;
 mod mcp;
+mod process;
 mod runtime;
 
 use anyhow::Result;

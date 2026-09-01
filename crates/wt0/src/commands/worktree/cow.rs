@@ -1,76 +1,112 @@
 use super::{run_command, state_dir, RepoContext};
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 const BASELINE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// Probe whether the filesystem holding both the state directory and the
+/// destination supports copy-on-write cloning: APFS `clonefile` on macOS,
+/// `FICLONE` reflink on Linux (Btrfs/XFS), and ReFS block cloning on Windows
+/// (Dev Drive / ReFS volumes). Plain filesystems — ext4, HFS+, NTFS — probe
+/// false and callers fall back with an explicit mode in the receipt.
 pub(crate) fn clone_supported(common_git_dir: &Path, destination_dir: &Path) -> Result<bool> {
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (common_git_dir, destination_dir);
-        return Ok(false);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        let probe = state_dir(common_git_dir).join("clone-probes");
-        fs::create_dir_all(&probe)?;
-        let token = Uuid::new_v4().to_string();
-        let source = probe.join(format!("{token}.source"));
-        let destination = destination_dir.join(format!(".wt0-clone-probe-{token}"));
-        fs::write(&source, b"wt0-cow-probe")?;
-        let status = clone_file_command(&source, &destination)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let _ = fs::remove_file(&source);
-        let _ = fs::remove_file(&destination);
-        Ok(status.map(|status| status.success()).unwrap_or(false))
-    }
+    let probe = state_dir(common_git_dir).join("clone-probes");
+    fs::create_dir_all(&probe)?;
+    let token = Uuid::new_v4().to_string();
+    let source = probe.join(format!("{token}.source"));
+    let destination = destination_dir.join(format!(".wt0-clone-probe-{token}"));
+    fs::write(&source, b"wt0-cow-probe")?;
+    let supported = reflink_copy::reflink(&source, &destination).is_ok();
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(&destination);
+    Ok(supported)
 }
 
-#[cfg(target_os = "macos")]
-fn clone_file_command(source: &Path, destination: &Path) -> Command {
-    let mut command = Command::new("cp");
-    command.args([
-        OsStr::new("-c"),
-        OsStr::new("-p"),
-        source.as_os_str(),
-        destination.as_os_str(),
-    ]);
-    command
-}
-
-#[cfg(target_os = "linux")]
-fn clone_file_command(source: &Path, destination: &Path) -> Command {
-    let mut command = Command::new("cp");
-    command.args([
-        OsStr::new("--reflink=always"),
-        OsStr::new("--preserve=mode,timestamps"),
-        source.as_os_str(),
-        destination.as_os_str(),
-    ]);
-    command
-}
-
+/// Clone one file with copy-on-write extents, preserving the source's
+/// permission bits. Fails — never silently degrades to a byte copy — when the
+/// filesystem cannot clone.
 pub(crate) fn clone_file(source: &Path, destination: &Path) -> Result<()> {
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (source, destination);
-        bail!("copy-on-write file cloning is not supported on this platform");
-    }
+    reflink_copy::reflink(source, destination).with_context(|| {
+        format!(
+            "copy-on-write clone {} -> {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    copy_permissions(source, destination)
+}
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+/// Clone the contents of `source` into the existing directory `destination`:
+/// directories are recreated, files become CoW clones, and symlinks are
+/// recreated as symlinks. Equivalent to the former `cp -c -R source/. dest`
+/// without the platform-specific `cp` dependency.
+pub(crate) fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
+    for entry in
+        fs::read_dir(source).with_context(|| format!("read clone source {}", source.display()))?
     {
-        let mut command = clone_file_command(source, destination);
-        run_command(&mut command, "copy-on-write file clone")
+        let entry = entry?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            fs::create_dir(&to).with_context(|| format!("create directory {}", to.display()))?;
+            copy_permissions(&from, &to)?;
+            clone_tree(&from, &to)?;
+        } else if kind.is_symlink() {
+            let target =
+                fs::read_link(&from).with_context(|| format!("read symlink {}", from.display()))?;
+            create_symlink(&target, &from, &to)?;
+        } else {
+            clone_file(&from, &to)?;
+        }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_permissions(source: &Path, destination: &Path) -> Result<()> {
+    let permissions = fs::metadata(source)?.permissions();
+    fs::set_permissions(destination, permissions)
+        .with_context(|| format!("preserve permissions on {}", destination.display()))
+}
+
+#[cfg(not(unix))]
+fn copy_permissions(_source: &Path, _destination: &Path) -> Result<()> {
+    // Windows has no Unix permission bits; ReFS cloning preserves attributes.
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, _source: &Path, destination: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, destination)
+        .with_context(|| format!("recreate symlink {}", destination.display()))
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, source: &Path, destination: &Path) -> Result<()> {
+    // Git on Windows usually materializes symlinks as plain files, so real
+    // symlinks are rare. When one exists, recreating it needs Developer Mode
+    // or symlink privilege; fail loudly rather than substituting a copy.
+    let resolved = source
+        .parent()
+        .map(|parent| parent.join(target))
+        .unwrap_or_else(|| target.to_path_buf());
+    let result = if resolved.is_dir() {
+        std::os::windows::fs::symlink_dir(target, destination)
+    } else {
+        std::os::windows::fs::symlink_file(target, destination)
+    };
+    result.with_context(|| {
+        format!(
+            "recreate symlink {} (Windows requires Developer Mode or symlink privilege)",
+            destination.display()
+        )
+    })
 }
 
 /// Return an immutable checkout cache for `commit`.
@@ -144,29 +180,6 @@ fn materialize_baseline(repo: &RepoContext, commit: &str, destination: &Path) ->
     );
     let _ = fs::remove_file(index);
     result
-}
-
-pub(crate) fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("cp");
-        command.args(["-c", "-R"]);
-        command
-    };
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = Command::new("cp");
-        command.args(["--reflink=always", "-R"]);
-        command
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    bail!("CoW tree cloning is not supported on this platform");
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        command.arg(source.join(".")).arg(destination);
-        run_command(&mut command, "copy-on-write tree clone")
-    }
 }
 
 pub(super) fn prune_baselines(

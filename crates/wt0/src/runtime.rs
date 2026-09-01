@@ -237,7 +237,7 @@ pub fn migrate(args: Migrate, json_output: bool) -> Result<()> {
     } else {
         vec![root]
     };
-    let (live_cwds, process_inspection_error) = match live_working_directories() {
+    let (live_cwds, process_inspection_error) = match crate::process::live_working_directories() {
         Ok(paths) => (Some(paths), None),
         Err(error) => (None, Some(format!("{error:#}"))),
     };
@@ -430,7 +430,7 @@ fn migrate_one(
         "skipped"
     } else if !apply {
         "planned"
-    } else if let Some(path) = live_open_path(root)? {
+    } else if let Some(path) = crate::process::live_open_path(root)? {
         blockers.push(format!("open file or process detected at {path}"));
         "skipped"
     } else {
@@ -588,7 +588,7 @@ fn prepare_bun(root: &Path, apply: bool, json_output: bool) -> Result<()> {
     }
     let modules = root.join("node_modules");
     if modules.exists() {
-        if let Some(path) = live_open_path(&modules)? {
+        if let Some(path) = crate::process::live_open_path(&modules)? {
             bail!("refusing dependency repair while a process uses {path}");
         }
     }
@@ -651,7 +651,7 @@ fn prepare_node_environment(
     }
     let modules = root.join("node_modules");
     if modules.exists() {
-        if let Some(path) = live_open_path(&modules)? {
+        if let Some(path) = crate::process::live_open_path(&modules)? {
             bail!("refusing dependency preparation while a process uses {path}");
         }
     }
@@ -955,6 +955,7 @@ fn prepared_environment_store(root: &Path) -> Result<PathBuf> {
     Ok(store)
 }
 
+#[cfg(unix)]
 fn platform_identity() -> Result<String> {
     let uname = Command::new("uname")
         .args(["-s", "-r", "-m"])
@@ -987,6 +988,24 @@ fn platform_identity() -> Result<String> {
     })
     .unwrap_or_else(|| "unknown".to_owned());
     Ok(format!("uname={uname};abi={abi}"))
+}
+
+#[cfg(windows)]
+fn platform_identity() -> Result<String> {
+    // `cmd /c ver` reports the exact kernel build, which stands in for the
+    // ABI identity that uname/ldd provide on Unix.
+    let ver = Command::new("cmd")
+        .args(["/C", "ver"])
+        .output()
+        .context("read operating-system identity")?;
+    if !ver.status.success() {
+        bail!("ver failed while identifying the prepared-environment platform");
+    }
+    let build = String::from_utf8_lossy(&ver.stdout).trim().to_owned();
+    Ok(format!(
+        "uname=Windows {};abi={build}",
+        std::env::consts::ARCH
+    ))
 }
 
 fn bun_environment_key(root: &Path, bun_version: &str) -> Result<String> {
@@ -1450,36 +1469,39 @@ fn write_prepared_marker_for(
     .context("write prepared-environment marker")
 }
 
+/// Walk the tree natively (no external `find`) and refuse symlinks whose
+/// absolute target points back into the worktree.
 fn validate_environment_links(root: &Path, path: &Path) -> Result<()> {
-    let output = Command::new("find")
-        .arg(path)
-        .args(["-type", "l", "-print0"])
-        .output()
-        .context("list prepared-environment links")?;
-    if !output.status.success() {
-        bail!("find failed while validating prepared-environment links");
-    }
-    for raw in output.stdout.split(|byte| *byte == 0) {
-        if raw.is_empty() {
-            continue;
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("list prepared-environment links in {}", path.display()))
         }
-        let child = PathBuf::from(
-            std::str::from_utf8(raw).context("non-UTF-8 dependency link path is unsupported")?,
-        );
-        let target = fs::read_link(&child)?;
-        if target.is_absolute() && target.starts_with(root) {
-            bail!(
-                "prepared environment contains a worktree-absolute link: {} -> {}",
-                child.display(),
-                target.display()
-            );
+    };
+    for entry in entries {
+        let entry = entry?;
+        let child = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            let target = fs::read_link(&child)?;
+            if target.is_absolute() && target.starts_with(root) {
+                bail!(
+                    "prepared environment contains a worktree-absolute link: {} -> {}",
+                    child.display(),
+                    target.display()
+                );
+            }
+        } else if kind.is_dir() {
+            validate_environment_links(root, &child)?;
         }
     }
     Ok(())
 }
 
 fn replace_dependency_tree(root: &Path) -> Result<()> {
-    if let Some(path) = live_working_directory(root)? {
+    if let Some(path) = crate::process::live_working_directory(root)? {
         bail!(
             "refusing dependency replacement while a process works inside {}: {path}",
             root.display()
@@ -1577,45 +1599,6 @@ fn bun_backup_paths(root: &Path) -> Result<Vec<PathBuf>> {
             Err(error) => Some(Err(error.into())),
         })
         .collect()
-}
-
-fn live_working_directory(root: &Path) -> Result<Option<String>> {
-    Ok(live_working_directories()?
-        .into_iter()
-        .find(|path| path.starts_with(root))
-        .map(|path| path.display().to_string()))
-}
-
-fn live_working_directories() -> Result<Vec<PathBuf>> {
-    let output = Command::new("lsof")
-        .args(["-a", "-d", "cwd", "-Fn"])
-        .output()
-        .context("lsof is required for safe migration")?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        bail!("lsof failed while checking active processes");
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.strip_prefix('n'))
-        .map(PathBuf::from)
-        .collect())
-}
-
-fn live_open_path(root: &Path) -> Result<Option<String>> {
-    let output = Command::new("lsof")
-        .args(["-Fn", "+D"])
-        .arg(root)
-        .output()
-        .context("lsof is required for safe migration apply")?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        bail!("lsof failed while checking open worktree paths");
-    }
-    let root_text = root.to_string_lossy();
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.strip_prefix('n'))
-        .find(|path| *path == root_text || path.starts_with(&format!("{root_text}/")))
-        .map(str::to_owned))
 }
 
 struct BunReport {
@@ -1789,6 +1772,7 @@ fn worktree_branch_label(root: &Path) -> Result<String> {
     ))
 }
 
+#[cfg(unix)]
 fn filesystem_free_bytes(path: &Path) -> Result<u64> {
     let output = Command::new("df")
         .args(["-Pk"])
@@ -1809,6 +1793,32 @@ fn filesystem_free_bytes(path: &Path) -> Result<u64> {
     available_kib
         .checked_mul(1024)
         .context("filesystem free-space value overflow")
+}
+
+#[cfg(windows)]
+fn filesystem_free_bytes(path: &Path) -> Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut available: u64 = 0;
+    let mut total: u64 = 0;
+    let mut free: u64 = 0;
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            &mut total,
+            &mut free,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("measure filesystem free space for {}", path.display()));
+    }
+    Ok(available)
 }
 
 fn dependency_storage(root: &Path) -> Result<DependencyStorage> {

@@ -239,6 +239,9 @@ fn gc_preserves_unowned_and_unknown_ignored_state() -> Result<()> {
     Ok(())
 }
 
+// The live-cwd guard needs lsof and a POSIX shell; Windows covers the same
+// safety through the rename probe tested in `process::imp`.
+#[cfg(unix)]
 #[test]
 fn gc_refuses_a_live_working_directory() -> Result<()> {
     let fixture = Fixture::new()?;
@@ -406,8 +409,10 @@ fn native_worktree_fallback_is_clean_and_registered() -> Result<()> {
     let base = resolve_commit(&repo, "HEAD")?;
     add_git_worktree(&repo, "fallback-test", &target, &base)?;
     ensure_clean(&target)?;
-    let listed = git_output_common(&repo, ["worktree", "list", "--porcelain"])?;
-    assert!(String::from_utf8_lossy(&listed.stdout).contains(target.to_string_lossy().as_ref()));
+    // Git prints forward slashes on Windows; compare paths component-wise
+    // through the porcelain parser instead of by substring.
+    let listed = list_worktrees(&repo)?;
+    assert!(listed.iter().any(|entry| entry.path == target));
     Ok(())
 }
 
@@ -575,10 +580,14 @@ impl Fixture {
     fn new() -> Result<Self> {
         let root = std::env::temp_dir().join(format!("wt0-worktree-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root)?;
-        let root = root.canonicalize()?;
+        // dunce strips Windows verbatim prefixes Git cannot consume.
+        let root = dunce::canonicalize(&root)?;
         let repo = root.join("repo");
         fs::create_dir_all(&repo)?;
         git(&repo, ["init", "-q"])?;
+        // Runner images set core.autocrlf=true globally on Windows; content
+        // assertions target exact bytes, so pin checkout to raw LF.
+        git(&repo, ["config", "core.autocrlf", "false"])?;
         git(&repo, ["config", "user.email", "test@example.com"])?;
         git(&repo, ["config", "user.name", "Test User"])?;
         git(

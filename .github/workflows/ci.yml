@@ -112,6 +112,34 @@ jobs:
           TMPDIR: /mnt/wt0-btrfs
         run: WT0_BIN="$PWD/target/debug/wt0" bash tests/prepared_node_integration.sh npm
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit and workflow tests (NTFS plain-fallback paths)
+        run: cargo test --all
+      - name: Create a ReFS volume
+        shell: pwsh
+        run: |
+          $script = @"
+          create vdisk file=C:\wt0-refs.vhdx maximum=6144 type=expandable
+          attach vdisk
+          create partition primary
+          format fs=refs quick label=wt0
+          assign letter=R
+          "@
+          Set-Content -Path diskpart.txt -Value $script
+          diskpart /s diskpart.txt
+          New-Item -ItemType Directory -Path R:\tmp | Out-Null
+          Get-Volume -DriveLetter R
+      - name: Tests on ReFS (block-clone CoW paths)
+        env:
+          TMP: R:\tmp
+          TEMP: R:\tmp
+        run: cargo test --all
+
   linux-arm64:
     runs-on: ubuntu-latest
     steps:
