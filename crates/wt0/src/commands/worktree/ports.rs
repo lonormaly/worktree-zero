@@ -207,9 +207,11 @@ mod tests {
             let base = allocate(&worktree).expect("claim window");
             let claim = claim_path(machine_dir, base);
             assert!(claim.is_file());
+            // Fresh and markerless: live only by virtue of the grace period.
+            assert!(claim_live(&claim, base));
 
             // Age the claim past the grace period; with no marker at the
-            // worktree the claim is stale and the window is handed out again.
+            // worktree the claim is stale and reclaimable.
             let stale = std::time::SystemTime::now() - CLAIM_GRACE - Duration::from_secs(5);
             let file = fs::OpenOptions::new()
                 .append(true)
@@ -217,10 +219,24 @@ mod tests {
                 .expect("open claim");
             file.set_modified(stale).expect("age claim");
             drop(file);
+            assert!(!claim_live(&claim, base));
 
+            // A new allocation overwrites the stale claim — unless a foreign
+            // listener happens to hold the base port right now, in which case
+            // skipping the window is the correct behavior, not a failure.
             let other = std::env::temp_dir().join(format!("wt0-po-{}", uuid::Uuid::new_v4()));
             let reused = allocate(&other).expect("reclaim stale window");
-            assert_eq!(reused, base);
+            if reused == base {
+                let rewritten: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&claim).expect("read claim"))
+                        .expect("claim json");
+                assert_eq!(rewritten["worktree"], other.to_string_lossy().as_ref());
+            } else {
+                assert!(
+                    TcpListener::bind(("127.0.0.1", base as u16)).is_err(),
+                    "window {base} was skipped although its base port is free"
+                );
+            }
         });
     }
 }
