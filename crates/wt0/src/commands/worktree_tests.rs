@@ -11,6 +11,7 @@ fn mark_test_managed(worktree: &Path, branch: &str, ephemeral: bool) -> Result<R
             base: "",
             idempotency_key: None,
             slot: 0,
+            port_base: 20000,
         },
     )
 }

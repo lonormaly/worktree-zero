@@ -168,7 +168,7 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "create_worktree",
             title: "Create a thin worktree",
-            description: "Create a real Git linked worktree populated with copy-on-write clones where supported. Returns the worktree path, populate mode, and ownership receipt.",
+            description: "Create a real Git linked worktree populated with copy-on-write clones where supported. The receipt carries the worktree path, populate mode, runtime id, slot, and a machine-globally unique port_base — use ports from that window so parallel runtimes never collide.",
             properties: json!({
                 "repo": repo,
                 "branch": { "type": "string", "description": "New branch name, e.g. agent/fix-checkout." },
@@ -183,7 +183,7 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "fleet",
             title: "Fleet view",
-            description: "Every runtime with its lease, slot, heartbeat age, mode, and owned generated storage — the swarm control view.",
+            description: "Every runtime with its lease, slot, port window (port_base), heartbeat age, mode, and owned generated storage — the map agents read to reason about the whole fleet.",
             properties: json!({ "repo": repo }),
             required: &[],
         },

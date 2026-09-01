@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 pub(crate) mod cow;
 mod overlay;
+pub(crate) mod ports;
 
 #[derive(Subcommand)]
 pub enum Worktree {
@@ -273,6 +274,7 @@ fn add(args: WorktreeAdd, json: bool) -> Result<()> {
             "created_at_unix": created.lease.created_at_unix,
             "heartbeat_at_unix": created.lease.heartbeat_at_unix,
             "slot": created.lease.slot,
+            "port_base": created.lease.port_base,
             "reused": created.reused,
         }));
     } else {
@@ -329,6 +331,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
     let lease = {
         let _slot_lock = StateLock::slots(&repo.common_git_dir);
         let slot = allocate_slot(&repo)?;
+        let port_base = allocate_port_base(&target, slot);
         match mark_managed(
             &target,
             &RuntimeSpec {
@@ -338,10 +341,12 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
                 base: &base,
                 idempotency_key: args.idempotency_key.as_deref(),
                 slot,
+                port_base,
             },
         ) {
             Ok(lease) => lease,
             Err(error) => {
+                ports::release(&target);
                 let _ = force_teardown(&repo, &target);
                 let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
                 return Err(error).context("record worktree ownership lease");
@@ -365,7 +370,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         ("WT0_EPHEMERAL", args.ephemeral.to_string()),
         ("WT0_REPO_ROOT", repo.top_level.display().to_string()),
         ("WT0_SLOT", lease.slot.to_string()),
-        ("WT0_PORT_BASE", port_base(lease.slot).to_string()),
+        ("WT0_PORT_BASE", lease.port_base.to_string()),
     ];
     if let Err(error) =
         crate::hooks::run_hook(&target, crate::hooks::HookEvent::PostCreate, &hook_env)
@@ -383,6 +388,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
             "branch": args.branch,
             "runtime_id": lease.runtime_id,
             "slot": lease.slot,
+            "port_base": lease.port_base,
             "mode": mode.label(),
         }),
     );
@@ -480,6 +486,9 @@ fn reuse_existing_runtime(
             created_at_unix: lease.created_at_unix,
             heartbeat_at_unix: lease.heartbeat_at_unix,
             slot: lease.slot.unwrap_or(0),
+            port_base: lease
+                .port_base
+                .unwrap_or_else(|| port_base(lease.slot.unwrap_or(0))),
         },
         reused: true,
     })
@@ -521,7 +530,7 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
     // Deterministic per-runtime identities so parallel agents never collide
     // on ports or Compose projects; explicit caller values always win.
     command.env("WT0_SLOT", created.lease.slot.to_string());
-    command.env("WT0_PORT_BASE", port_base(created.lease.slot).to_string());
+    command.env("WT0_PORT_BASE", created.lease.port_base.to_string());
     if std::env::var_os("COMPOSE_PROJECT_NAME").is_none() {
         let short_id: String = created.lease.runtime_id.chars().take(8).collect();
         command.env("COMPOSE_PROJECT_NAME", format!("wt0-{short_id}"));
@@ -642,11 +651,30 @@ fn same_path(left: &Path, right: &Path) -> bool {
     left == right
 }
 
-/// Deterministic per-runtime port range: forty concurrent agents get disjoint
-/// hundred-port windows starting at 20000; slots wrap at 400 to stay inside
-/// the unprivileged range.
+/// Slot-derived fallback window, used only for markers written before the
+/// machine-global port registry existed and when the registry itself is
+/// unavailable. Slots wrap at 400 to stay inside the unprivileged range.
 pub(crate) fn port_base(slot: u64) -> u64 {
     20000 + (slot % 400) * 100
+}
+
+/// Claim a machine-globally free port window for this runtime. The registry
+/// is the authority (two repositories' slot-0 runtimes must not share port
+/// 20000); when it cannot allocate — an unwritable machine state directory,
+/// every window claimed or occupied — fall back to the slot-derived window
+/// with a warning rather than failing a create that may never open a port.
+fn allocate_port_base(worktree: &Path, slot: u64) -> u64 {
+    match ports::allocate(worktree) {
+        Ok(base) => base,
+        Err(error) => {
+            let fallback = port_base(slot);
+            eprintln!(
+                "wt0: machine port registry unavailable ({error:#}); \
+                 falling back to slot-derived port window {fallback}"
+            );
+            fallback
+        }
+    }
 }
 
 /// Smallest slot index not held by any live managed worktree. Callers hold
@@ -706,8 +734,19 @@ impl StateLock {
     }
 
     fn acquire(common_git_dir: &Path, name: &str, wait: Duration, stale_after: Duration) -> Self {
-        let path = state_dir(common_git_dir).join(name);
-        let _ = fs::create_dir_all(state_dir(common_git_dir));
+        Self::acquire_in(&state_dir(common_git_dir), name, wait, stale_after)
+    }
+
+    /// Acquire a lock file in an arbitrary directory — the machine-global
+    /// port registry lives outside any one repository's state directory.
+    pub(crate) fn acquire_in(
+        dir: &Path,
+        name: &str,
+        wait: Duration,
+        stale_after: Duration,
+    ) -> Self {
+        let path = dir.join(name);
+        let _ = fs::create_dir_all(dir);
         let deadline = SystemTime::now() + wait;
         loop {
             match fs::OpenOptions::new()
@@ -893,6 +932,7 @@ fn force_teardown(repo: &RepoContext, target: &Path) -> Result<()> {
         remove_worktree_force(repo, target)
     };
     result?;
+    ports::release(target);
     if let Some(generated) = generated {
         retire_generated_runtime(&generated)?;
     }
@@ -980,6 +1020,7 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         run_command(&mut command, "git worktree remove")?;
     }
 
+    ports::release(&target);
     if let Some(generated) = generated {
         retire_generated_runtime(&generated)?;
     }
@@ -1128,6 +1169,7 @@ pub fn fleet(json_output: bool) -> Result<()> {
             "branch": branch,
             "runtime_id": lease.runtime_id,
             "slot": lease.slot,
+            "port_base": lease.port_base.or(lease.slot.map(port_base)),
             "mode": lease.mode,
             "ephemeral": lease.ephemeral,
             "created_at_unix": lease.created_at_unix,
@@ -1143,9 +1185,10 @@ pub fn fleet(json_output: bool) -> Result<()> {
         for runtime in &runtimes {
             if runtime["managed"] == true {
                 println!(
-                    "  {}  slot {}  lease {}s  {}  {}",
+                    "  {}  slot {}  ports {}+  lease {}s  {}  {}",
                     runtime["branch"].as_str().unwrap_or("detached"),
                     runtime["slot"],
+                    runtime["port_base"],
                     runtime["lease_age_seconds"],
                     runtime["mode"].as_str().unwrap_or("unknown"),
                     runtime["worktree"].as_str().unwrap_or("")
@@ -1774,6 +1817,7 @@ pub(crate) struct RuntimeLease {
     pub(crate) created_at_unix: u64,
     pub(crate) heartbeat_at_unix: u64,
     pub(crate) slot: u64,
+    pub(crate) port_base: u64,
 }
 
 /// Everything a new ownership marker records about a runtime.
@@ -1784,6 +1828,7 @@ pub(crate) struct RuntimeSpec<'a> {
     pub(crate) base: &'a str,
     pub(crate) idempotency_key: Option<&'a str>,
     pub(crate) slot: u64,
+    pub(crate) port_base: u64,
 }
 
 pub(crate) fn mark_managed(worktree: &Path, spec: &RuntimeSpec) -> Result<RuntimeLease> {
@@ -1807,6 +1852,7 @@ pub(crate) fn mark_managed(worktree: &Path, spec: &RuntimeSpec) -> Result<Runtim
             "base": spec.base,
             "idempotency_key": spec.idempotency_key,
             "slot": spec.slot,
+            "port_base": spec.port_base,
             "created_at_unix": now,
             "heartbeat_at_unix": now,
         }))?,
@@ -1817,6 +1863,7 @@ pub(crate) fn mark_managed(worktree: &Path, spec: &RuntimeSpec) -> Result<Runtim
         created_at_unix: now,
         heartbeat_at_unix: now,
         slot: spec.slot,
+        port_base: spec.port_base,
     })
 }
 
@@ -1832,6 +1879,7 @@ pub(crate) struct StoredLease {
     pub(crate) base: Option<String>,
     pub(crate) idempotency_key: Option<String>,
     pub(crate) slot: Option<u64>,
+    pub(crate) port_base: Option<u64>,
 }
 
 pub(crate) fn stored_lease(worktree: &Path) -> Result<StoredLease> {
@@ -1856,6 +1904,7 @@ pub(crate) fn stored_lease(worktree: &Path) -> Result<StoredLease> {
         base: value["base"].as_str().map(str::to_owned),
         idempotency_key: value["idempotency_key"].as_str().map(str::to_owned),
         slot: value["slot"].as_u64(),
+        port_base: value["port_base"].as_u64(),
     })
 }
 

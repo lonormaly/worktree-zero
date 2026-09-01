@@ -91,9 +91,11 @@ stage 2 proves demand.
 Storage isolation is half the sandbox; the other half is a runnable test
 environment per worktree. The primitives shipped in 0.1.x compose into this:
 
-- every runtime has a **slot** with a disjoint port window (`WT0_SLOT`,
-  `WT0_PORT_BASE`) and a default `COMPOSE_PROJECT_NAME`, so N agents run N
-  dev stacks side by side with zero project logic;
+- every runtime has a **slot** and a port window claimed from a
+  machine-global registry (`WT0_SLOT`, `WT0_PORT_BASE` — unique across every
+  repository on the node, bind-probed against foreign listeners) and a
+  default `COMPOSE_PROJECT_NAME`, so N agents run N dev stacks side by side
+  with zero project logic;
 - `.wt0/hooks/post-create` boots the environment, `pre-remove` tears it
   down, and a failing hook vetoes cleanup instead of leaking;
 - the [Tilt extension](../integrations/tilt/README.md) maps those identities

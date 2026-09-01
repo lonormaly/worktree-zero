@@ -26,7 +26,13 @@ def wt0_slot():
     return int(os.getenv('WT0_SLOT', '0'))
 
 def wt0_port(offset=0):
-    """A port inside this runtime's disjoint hundred-port window."""
+    """A port inside this runtime's hundred-port window.
+
+    WT0_PORT_BASE is claimed from wt0's machine-global port registry, so the
+    window never overlaps another runtime's — not even one from a different
+    repository on the same machine — and the base port was bind-probed free
+    when the runtime was created.
+    """
     if offset < 0 or offset > 99:
         fail('wt0_port offset must be 0..99 so runtimes stay disjoint, got %s' % offset)
     return int(os.getenv('WT0_PORT_BASE', '20000')) + offset

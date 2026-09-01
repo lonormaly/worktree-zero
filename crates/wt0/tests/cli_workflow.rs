@@ -452,6 +452,100 @@ fn create_is_idempotent_and_allocates_disjoint_slots() {
     let _ = fs::remove_dir_all(root);
 }
 
+// Slots are per-repository, so before the machine-global port registry two
+// repositories' slot-0 runtimes both derived port 20000 — a real collision
+// the moment both start a dev server or a Tilt environment.
+#[test]
+fn two_repositories_on_one_machine_get_disjoint_port_windows() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-ports-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let machine = root.join("machine-state");
+    fs::create_dir_all(&machine).expect("create machine-state fixture");
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+
+    let mut receipts = Vec::new();
+    for name in ["alpha", "beta"] {
+        let repo = root.join(name);
+        fs::create_dir_all(&repo).expect("create repository");
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test User"]);
+        fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-q", "-m", "initial"]);
+
+        let created = Command::new(wt0)
+            .current_dir(&repo)
+            .env("WT0_MACHINE_STATE", &machine)
+            .args(["--json", "create", "agent/task", "--path"])
+            .arg(root.join(format!("wt-{name}")))
+            .output()
+            .expect("create worktree");
+        assert!(
+            created.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&created.stdout).expect("create JSON");
+        receipts.push(receipt);
+    }
+
+    // Both repositories hand out slot 0, but the port windows must differ.
+    assert_eq!(receipts[0]["slot"], 0);
+    assert_eq!(receipts[1]["slot"], 0);
+    let first = receipts[0]["port_base"].as_u64().expect("first port base");
+    let second = receipts[1]["port_base"].as_u64().expect("second port base");
+    assert_ne!(first, second, "port windows overlapped: {receipts:?}");
+
+    // Removing the first runtime releases its window for the next claimant.
+    let removed = Command::new(wt0)
+        .current_dir(root.join("alpha"))
+        .env("WT0_MACHINE_STATE", &machine)
+        .arg("remove")
+        .arg(root.join("wt-alpha"))
+        .output()
+        .expect("remove worktree");
+    assert!(
+        removed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let reclaimed = Command::new(wt0)
+        .current_dir(root.join("alpha"))
+        .env("WT0_MACHINE_STATE", &machine)
+        .args(["--json", "create", "agent/second", "--path"])
+        .arg(root.join("wt-second"))
+        .output()
+        .expect("create after release");
+    let reclaimed: serde_json::Value =
+        serde_json::from_slice(&reclaimed.stdout).expect("reclaim JSON");
+    assert_eq!(reclaimed["port_base"].as_u64(), Some(first));
+
+    let fleet = Command::new(wt0)
+        .current_dir(root.join("beta"))
+        .env("WT0_MACHINE_STATE", &machine)
+        .args(["--json", "fleet"])
+        .output()
+        .expect("run fleet");
+    let fleet: serde_json::Value = serde_json::from_slice(&fleet.stdout).expect("fleet JSON");
+    let managed = fleet["runtimes"]
+        .as_array()
+        .expect("runtimes")
+        .iter()
+        .find(|runtime| runtime["managed"] == true)
+        .expect("managed runtime listed");
+    assert_eq!(managed["port_base"].as_u64(), Some(second));
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn fleet_and_events_report_the_lifecycle() {
     let root = std::env::temp_dir().join(format!(
