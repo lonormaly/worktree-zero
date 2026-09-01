@@ -526,7 +526,15 @@ fn two_repositories_on_one_machine_get_disjoint_port_windows() {
         .expect("create after release");
     let reclaimed: serde_json::Value =
         serde_json::from_slice(&reclaimed.stdout).expect("reclaim JSON");
-    assert_eq!(reclaimed["port_base"].as_u64(), Some(first));
+    let reclaimed_base = reclaimed["port_base"].as_u64().expect("reclaimed base");
+    if reclaimed_base != first {
+        // Only a foreign listener on the released window's base port may
+        // keep it from being handed out again.
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", first as u16)).is_err(),
+            "released window {first} was not reclaimed although its port is free"
+        );
+    }
 
     let fleet = Command::new(wt0)
         .current_dir(root.join("beta"))
