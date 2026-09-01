@@ -5,18 +5,54 @@ name: Release
 # naming matches the [package.metadata.binstall] config in wt0/Cargo.toml, so
 # `cargo binstall worktree-zero` fetches these prebuilt binaries instead of
 # compiling.
+#
+# A manual run (workflow_dispatch) first tags the dispatched commit as
+# v<workspace version> using the workflow's own token, then releases that tag
+# — so a release can be cut end to end without local tag-push access. A tag
+# pushed by the workflow token does not re-trigger this workflow, so a manual
+# run never doubles up with the push trigger.
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  tag:
+    # Resolve the release tag: the pushed tag, or (on manual runs) the
+    # workspace version tagged at the dispatched commit, created if missing.
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve and create the version tag
+        id: resolve
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$version"
+          tag="v$version"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "tag $tag already exists; releasing it as-is"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "Worktree Zero $version" "$GITHUB_SHA"
+            git push origin "refs/tags/$tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
   create-release:
     # Create the release exactly once, before the build matrix fans out, so
-    # four jobs never race `gh release create` against each other.
+    # six jobs never race `gh release create` against each other.
+    needs: tag
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -24,12 +60,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="$GITHUB_REF_NAME"
+          tag="${{ needs.tag.outputs.tag }}"
           gh release view "$tag" >/dev/null 2>&1 \
             || gh release create "$tag" --verify-tag --title "$tag" --generate-notes
 
   build:
-    needs: create-release
+    needs: [tag, create-release]
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +85,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Build the exact commit the release tag names, on both trigger
+          # paths (a pushed tag, or a pre-existing tag on a manual run).
+          ref: ${{ needs.tag.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -79,7 +119,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="$GITHUB_REF_NAME"
+          tag="${{ needs.tag.outputs.tag }}"
           gh release upload "$tag" \
             "wt0-${{ matrix.target }}.tar.gz" \
             "wt0-${{ matrix.target }}.tar.gz.sha256" \
