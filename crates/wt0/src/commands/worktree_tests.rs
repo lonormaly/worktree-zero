@@ -11,6 +11,7 @@ fn mark_test_managed(worktree: &Path, branch: &str, ephemeral: bool) -> Result<R
             base: "",
             idempotency_key: None,
             slot: 0,
+            port_base: 20000,
         },
     )
 }
@@ -453,6 +454,23 @@ fn concurrent_baseline_creation_publishes_one_complete_tree() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     assert!(paths.windows(2).all(|pair| pair[0] == pair[1]));
     assert_eq!(fs::read_to_string(paths[0].join("file.txt"))?, "content\n");
+    Ok(())
+}
+
+// The exact interleaving the Btrfs stress job caught: a creator whose store
+// lookup missed, but whose materialize started after another creator's
+// atomic publish landed. It must reuse the published baseline, not refuse
+// it as incomplete.
+#[test]
+fn late_arriving_creator_reuses_a_published_baseline() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let commit = resolve_commit(&repo, "HEAD")?;
+    let store = state_dir(&repo.common_git_dir);
+    let first = cow::materialize_baseline_at(&store, &repo, &commit)?;
+    let second = cow::materialize_baseline_at(&store, &repo, &commit)?;
+    assert_eq!(first, second);
+    assert_eq!(fs::read_to_string(second.join("file.txt"))?, "content\n");
     Ok(())
 }
 

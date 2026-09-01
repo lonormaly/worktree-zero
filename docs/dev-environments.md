@@ -19,7 +19,8 @@ already uses.
 
 ## Tier 0 — fully isolated (shipped)
 
-One complete environment per worktree: slot-scoped ports (`WT0_PORT_BASE`),
+One complete environment per worktree: machine-globally unique port
+windows (`WT0_PORT_BASE`),
 per-runtime `COMPOSE_PROJECT_NAME`, per-runtime Tilt namespaces, lifecycle
 hooks for boot/teardown. Maximum safety, cost = full stack boot per
 worktree. Right for integration tests and hostile workloads.

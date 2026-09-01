@@ -244,7 +244,11 @@ pub(crate) fn ensure_baseline_in(
     )
 }
 
-fn materialize_baseline_at(store_root: &Path, repo: &RepoContext, commit: &str) -> Result<PathBuf> {
+pub(super) fn materialize_baseline_at(
+    store_root: &Path,
+    repo: &RepoContext,
+    commit: &str,
+) -> Result<PathBuf> {
     let root = store_root.join("baselines");
     let final_dir = root.join(commit);
     let final_tree = final_dir.join("tree");
@@ -252,6 +256,13 @@ fn materialize_baseline_at(store_root: &Path, repo: &RepoContext, commit: &str) 
 
     fs::create_dir_all(&root)?;
     if final_dir.exists() {
+        // Publishes are a single atomic rename of a directory that already
+        // contains `tree` and `ready`, so an existing complete directory
+        // means another creator won between our store lookup and here —
+        // reuse it. Only a directory without its `ready` stamp is torn.
+        if ready.is_file() && final_tree.is_dir() {
+            return Ok(final_tree);
+        }
         bail!(
             "cached baseline {} is incomplete; run `wt0 prune --all`",
             final_dir.display()

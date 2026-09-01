@@ -18,6 +18,19 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   environments keep their single-level `WT0_STORE` support; layering for
   them follows the environment-adapter deduplication.
 
+- **Machine-global port windows**: `WT0_PORT_BASE` is now claimed from a
+  machine-wide port registry instead of being derived from the per-repo
+  slot, so two repositories' fleets on one machine can never hand two
+  runtimes the same window, and a window whose base port a foreign process
+  already owns is skipped via a bind probe. The claimed window is recorded
+  in the ownership marker, reported as `port_base` in create receipts,
+  `wt0 fleet`, and lifecycle events, exported to `wt0 run` commands and
+  hooks, and released on remove/gc; claims self-heal after crashes (a claim
+  without a live marker expires). The registry lives in the platform state
+  directory (`WT0_MACHINE_STATE` overrides it); if it is unavailable the
+  create falls back to the slot-derived window with a warning. Tilt's
+  `wt0_port` inherits the guarantee unchanged.
+
 - **Registry serialization for N-agent fleets**: every git invocation that
   iterates or rewrites the shared worktree registry or branch refs
   (worktree add/remove/prune/list, branch deletion) now runs under a

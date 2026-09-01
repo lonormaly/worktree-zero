@@ -25,6 +25,10 @@ fn agent_count() -> usize {
         .unwrap_or(8)
 }
 
+fn machine_state(root: &Path) -> PathBuf {
+    root.join("machine-state")
+}
+
 fn fixture_repo(label: &str) -> (PathBuf, PathBuf) {
     let root = std::env::temp_dir().join(format!(
         "worktree-zero-stress-{label}-{}-{}",
@@ -42,6 +46,7 @@ fn fixture_repo(label: &str) -> (PathBuf, PathBuf) {
     fs::write(repo.join("README.md"), "base\n").expect("write fixture");
     git(&repo, &["add", "README.md"]);
     git(&repo, &["commit", "-q", "-m", "initial"]);
+    fs::create_dir_all(machine_state(&root)).expect("create machine-state fixture");
     (root, repo)
 }
 
@@ -94,6 +99,7 @@ fn concurrent_creates_allocate_disjoint_slots_and_a_consistent_fleet() {
             std::thread::spawn(move || {
                 Command::new(env!("CARGO_BIN_EXE_wt0"))
                     .current_dir(repo.as_path())
+                    .env("WT0_MACHINE_STATE", machine_state(&root))
                     .args([
                         "--json",
                         "create",
@@ -109,6 +115,7 @@ fn concurrent_creates_allocate_disjoint_slots_and_a_consistent_fleet() {
         .collect();
 
     let mut slots = HashSet::new();
+    let mut ports = HashSet::new();
     let mut runtime_ids = HashSet::new();
     for handle in creates {
         let created = receipt(&handle.join().expect("create thread"), "concurrent create");
@@ -117,6 +124,10 @@ fn concurrent_creates_allocate_disjoint_slots_and_a_consistent_fleet() {
         assert!(
             slots.insert(created["slot"].as_u64().expect("slot")),
             "duplicate slot in {created}"
+        );
+        assert!(
+            ports.insert(created["port_base"].as_u64().expect("port base")),
+            "duplicate port window in {created}"
         );
         assert!(
             runtime_ids.insert(
@@ -147,6 +158,7 @@ fn concurrent_creates_allocate_disjoint_slots_and_a_consistent_fleet() {
             std::thread::spawn(move || {
                 Command::new(env!("CARGO_BIN_EXE_wt0"))
                     .current_dir(repo.as_path())
+                    .env("WT0_MACHINE_STATE", machine_state(&root))
                     .arg("remove")
                     .arg(root.join(format!("wt-{index}")))
                     .arg("--delete-branch")
@@ -185,6 +197,7 @@ fn contended_creates_for_one_runtime_resolve_to_a_single_owner() {
             std::thread::spawn(move || {
                 Command::new(env!("CARGO_BIN_EXE_wt0"))
                     .current_dir(repo.as_path())
+                    .env("WT0_MACHINE_STATE", machine_state(&root))
                     .args(["--json", "create", "agent/contended", "--path"])
                     .arg(root.join("contended"))
                     .args(["--idempotency-key", "job-contended"])
@@ -215,6 +228,7 @@ fn contended_creates_for_one_runtime_resolve_to_a_single_owner() {
     for winner in &winners {
         assert_eq!(winner["runtime_id"], owner_id);
         assert_eq!(winner["worktree"], winners[0]["worktree"]);
+        assert_eq!(winner["port_base"], winners[0]["port_base"]);
     }
 
     // Whatever the racers left behind, the runtime must be settled: a retry
@@ -222,6 +236,7 @@ fn contended_creates_for_one_runtime_resolve_to_a_single_owner() {
     // one managed runtime.
     let retry = Command::new(env!("CARGO_BIN_EXE_wt0"))
         .current_dir(repo.as_path())
+        .env("WT0_MACHINE_STATE", machine_state(&root))
         .args(["--json", "create", "agent/contended", "--path"])
         .arg(root.join("contended"))
         .args(["--idempotency-key", "job-contended"])

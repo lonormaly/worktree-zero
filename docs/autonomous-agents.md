@@ -68,10 +68,13 @@ the same JSON CLI (see [vendor integrations](vendor-integrations.md)),
 idempotent create (`--idempotency-key`: a retried create with the same key
 and branch returns the existing runtime with `reused: true`; a different key
 is refused, never handed another job's runtime), and deterministic runtime
-slots (`slot` in every create receipt, `WT0_SLOT` and `WT0_PORT_BASE` in
-`wt0 run` and hook environments, so parallel agents get disjoint port
-windows without coordination), the `wt0 fleet` control view (every runtime
-with lease, slot, heartbeat age, mode, and owned generated storage), and the
+slots plus machine-global port windows (`slot` and `port_base` in every
+create receipt, `WT0_SLOT` and `WT0_PORT_BASE` in `wt0 run` and hook
+environments; windows are claimed from a machine-wide registry with a bind
+probe, so they never overlap — not even across different repositories on
+one machine), the `wt0 fleet` control view (every runtime with lease, slot,
+port window, heartbeat age, mode, and owned generated storage — the map an
+orchestrating agent reads to reason about the fleet), and the
 append-only lifecycle event log (`wt0 events [--follow]`; created, reused,
 removed, reaped, adopted) so orchestrators observe a fleet without polling.
 
