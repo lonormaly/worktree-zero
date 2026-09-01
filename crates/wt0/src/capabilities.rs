@@ -36,7 +36,7 @@ pub fn run(args: Capabilities, json_output: bool) -> Result<()> {
         "protocol": {
             "json_cli": "shipped",
             "portable_skill": "shipped",
-            "mcp": "planned",
+            "mcp": "shipped",
             "non_interactive": true,
         },
         "source": {
@@ -73,8 +73,8 @@ pub fn run(args: Capabilities, json_output: bool) -> Result<()> {
         }
         print_detected("package", &package);
         print_detected("generated", &generated);
-        println!("  agent protocol:   JSON CLI + portable skill");
-        println!("  MCP transport:    planned");
+        println!("  agent protocol:   JSON CLI + portable skill + MCP");
+        println!("  MCP transport:    wt0 mcp serve (stdio)");
     }
     Ok(())
 }
@@ -195,8 +195,8 @@ fn agent_host_adapters() -> Vec<Adapter> {
     .map(|id| Adapter {
         id,
         detected: false,
-        support: "json-cli-and-skill",
-        behavior: "invoke the same versioned, non-interactive lifecycle; vendor package must not reimplement safety",
+        support: "json-cli-skill-and-mcp",
+        behavior: "invoke the same versioned, non-interactive lifecycle over the JSON CLI or `wt0 mcp serve`; vendor package must not reimplement safety",
     })
     .collect()
 }
@@ -292,6 +292,6 @@ mod tests {
         }
         assert!(hosts
             .iter()
-            .all(|host| host.support == "json-cli-and-skill"));
+            .all(|host| host.support == "json-cli-skill-and-mcp"));
     }
 }

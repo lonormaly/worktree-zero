@@ -53,9 +53,13 @@ provided one. Package scripts and the Cloudflare Vite plugin still need the
 project wrapper to pass the same owned path; Worktree Zero does not rewrite a
 project's source configuration.
 
-The shipped portable skill and JSON CLI are the current stable agent
-interfaces. The same versioned result will also be available through the
-planned Worktree Zero MCP server.
+The shipped portable skill, JSON CLI, and MCP server are the stable agent
+interfaces. `wt0 mcp serve` speaks the Model Context Protocol over stdio
+(spec revision 2026-07-28, negotiating down to 2024-11-05) and returns the
+same versioned payloads as the JSON CLI, so Claude Code, Codex, Gemini CLI,
+Cursor, OpenClaw, NanoClaw, Hermes, Grok Bot, and any other MCP client call
+one implementation. See [vendor integrations](docs/vendor-integrations.md)
+for per-host setup.
 
 Before creating a runtime, an agent can discover exactly what this installation
 can do:
@@ -91,10 +95,19 @@ claude plugin marketplace add lonormaly/worktree-zero
 claude plugin install worktree-zero@worktree-zero
 ```
 
-Gemini CLI, GitHub Copilot, Cursor, OpenCode, Grok, NanoClaw, OpenClaw,
-Hermes, Slack agents, and other headless workers use the same portable skill
-and `wt0 ... --json` commands. Their wrappers may translate transport and
-installation, but must not reimplement cleanup or weaken a refusal.
+Gemini CLI installs the same repository as an extension bundling the MCP
+server:
+
+```bash
+gemini extensions install https://github.com/lonormaly/worktree-zero
+```
+
+GitHub Copilot, Cursor, OpenCode, Grok, NanoClaw, OpenClaw, Hermes, Slack
+agents, and other headless workers use the same portable skill, the
+`wt0 ... --json` commands, or `wt0 mcp serve` as a stdio MCP server — see
+[vendor integrations](docs/vendor-integrations.md) for each host's exact
+configuration. Wrappers may translate transport and installation, but must
+not reimplement cleanup or weaken a refusal.
 
 ## What was already solved
 

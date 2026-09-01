@@ -16,21 +16,23 @@ Every fallback keeps branch/worktree isolation and the lifecycle contract. A fal
 
 ## Agent and vendor surfaces
 
-The CLI and MCP server are the stable interfaces. Vendor integrations package the same skill and commands.
+The CLI and MCP server (`wt0 mcp serve`) are the stable interfaces. Vendor
+integrations package the same skill, commands, and MCP configuration — see
+[vendor integrations](vendor-integrations.md) for each host's setup.
 
 | Surface | Current integration |
 | --- | --- |
-| Claude Code | portable skill + JSON CLI shipped; plugin packaging planned |
-| OpenAI Codex | portable skill + JSON CLI shipped; native plugin and MCP packaging planned |
-| Grok and Grok Bot | portable instructions + JSON CLI shipped; packaged binding planned |
-| Gemini CLI | portable instructions + JSON CLI shipped; extension packaging planned |
-| Cursor | repository instruction + JSON CLI shipped; packaged binding planned |
+| Claude Code | plugin shipped (skill + bundled MCP server) |
+| OpenAI Codex | plugin manifest + skill shipped; MCP via `codex mcp add` |
+| Grok and Grok Bot | skill + JSON CLI + stdio MCP shipped; packaged binding planned |
+| Gemini CLI | extension shipped (`gemini-extension.json` bundles the MCP server) |
+| Cursor | JSON CLI + documented `.cursor/mcp.json` configuration shipped |
 | GitHub Copilot | repository instruction + JSON CLI shipped; packaged binding planned |
-| OpenCode | portable skill + JSON CLI shipped; plugin packaging planned |
-| NanoClaw | headless JSON CLI contract shipped; installable adapter package planned |
-| OpenClaw | headless JSON CLI contract shipped; installable adapter package planned |
-| Hermes | headless JSON CLI contract shipped; installable adapter package planned |
-| Slack/queue/autonomous agents | headless JSON CLI shipped; no TTY dependency |
+| OpenCode | skill + documented MCP configuration shipped; plugin packaging planned |
+| NanoClaw | skill + JSON CLI + stdio MCP shipped; ClawHub publication planned |
+| OpenClaw | skill + JSON CLI + stdio MCP shipped; ClawHub publication planned |
+| Hermes | skill + documented `mcp_servers` configuration shipped |
+| Slack/queue/autonomous agents | headless JSON CLI and stdio MCP shipped; no TTY dependency |
 
 The [OpenAI developer platform](https://developers.openai.com/) explicitly supports plugins composed from skills and MCP servers, and its [Skills API](https://developers.openai.com/api/reference/go/resources/skills) supports versioned skill bundles. Worktree Zero should keep its skill portable while publishing a native Codex package.
 
