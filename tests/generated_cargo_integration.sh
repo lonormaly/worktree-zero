@@ -43,7 +43,7 @@ echo "Cargo output stayed outside the worktree and owned teardown removed it"
 
 (
   cd "$repo"
-  "$binary" run agent/crash --require-cow -- cargo test --quiet
+  WT0_POPULATE=checkout "$binary" run agent/crash -- cargo test --quiet
 )
 crash_worktree="$(git -C "$repo" worktree list --porcelain | awk '/^worktree / { path=$2 } END { print path }')"
 crash_generated="$(find "$repo/.git/wt0/generated" -mindepth 1 -maxdepth 1 -type d -print -quit)"
