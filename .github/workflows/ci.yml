@@ -6,6 +6,33 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Shellcheck integration and benchmark scripts
+        run: shellcheck tests/*.sh
+      - name: Plugin manifest versions match the workspace version
+        run: |
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$version"
+          for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json; do
+            jq -e --arg v "$version" '.version == $v' "$manifest" >/dev/null \
+              || { echo "$manifest version does not match workspace $version"; exit 1; }
+          done
+
+  msrv:
+    # The floor is set by edition-2024 dependencies in Cargo.lock; keep this in
+    # sync with rust-version in Cargo.toml.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --locked
+
   check:
     strategy:
       fail-fast: false
@@ -17,6 +44,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
       - uses: oven-sh/setup-bun@v2
         if: runner.os == 'macOS'
         with:
@@ -47,11 +75,42 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Install fuse-overlayfs
         run: sudo apt-get update && sudo apt-get install -y fuse-overlayfs
       - run: cargo build --release
       - name: Overlay integration test
         run: WT0="$PWD/target/release/wt0" bash tests/overlay_integration.sh
+
+  reflink-linux:
+    # ubuntu-latest runners use ext4, where clone_supported() is false and every
+    # CoW code path silently early-returns. A loopback Btrfs volume makes the
+    # Linux reflink path a tested claim instead of a macOS-only one.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Mount a loopback Btrfs volume
+        run: |
+          sudo apt-get update && sudo apt-get install -y btrfs-progs
+          truncate -s 4G /tmp/wt0-btrfs.img
+          mkfs.btrfs -q /tmp/wt0-btrfs.img
+          sudo mkdir -p /mnt/wt0-btrfs
+          sudo mount -o loop /tmp/wt0-btrfs.img /mnt/wt0-btrfs
+          sudo chown "$USER" /mnt/wt0-btrfs
+      - name: Unit and workflow tests on a reflink filesystem
+        env:
+          TMPDIR: /mnt/wt0-btrfs
+        run: cargo test --all
+      - name: Owned Cargo generated-runtime integration on reflink
+        env:
+          TMPDIR: /mnt/wt0-btrfs
+        run: WT0_BIN="$PWD/target/debug/wt0" bash tests/generated_cargo_integration.sh
+      - name: Prepared npm environment integration on reflink
+        env:
+          TMPDIR: /mnt/wt0-btrfs
+        run: WT0_BIN="$PWD/target/debug/wt0" bash tests/prepared_node_integration.sh npm
 
   linux-arm64:
     runs-on: ubuntu-latest
@@ -60,6 +119,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
       - name: Install Linux ARM64 linker
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
       - name: Cross-build

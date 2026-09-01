@@ -27,7 +27,8 @@ pub fn run(args: Capabilities, json_output: bool) -> Result<()> {
     let package = package_adapters(&root);
     let generated = generated_adapters(&root);
     let host = agent_host_adapters();
-    let selected_package = select_package_manager(&package)?;
+    let detected_managers = crate::runtime::detect_javascript_package_managers(&root);
+    let (selected_package, package_conflict) = select_package_manager(&detected_managers);
 
     let report = json!({
         "schema_version": 1,
@@ -45,6 +46,7 @@ pub fn run(args: Capabilities, json_output: bool) -> Result<()> {
         },
         "package_managers": adapters_json(&package),
         "selected_javascript_package_manager": selected_package,
+        "javascript_package_manager_conflict": package_conflict,
         "generated_state": adapters_json(&generated),
         "agent_hosts": adapters_json(&host),
     });
@@ -58,10 +60,17 @@ pub fn run(args: Capabilities, json_output: bool) -> Result<()> {
             if cow_supported { "yes" } else { "no" },
             source_backend()
         );
-        println!(
-            "  package manager:  {}",
-            selected_package.as_deref().unwrap_or("none detected")
-        );
+        if package_conflict.is_empty() {
+            println!(
+                "  package manager:  {}",
+                selected_package.as_deref().unwrap_or("none detected")
+            );
+        } else {
+            println!(
+                "  package manager:  conflict ({}); remove stale lockfiles before prepare/run",
+                package_conflict.join(", ")
+            );
+        }
         print_detected("package", &package);
         print_detected("generated", &generated);
         println!("  agent protocol:   JSON CLI + portable skill");
@@ -94,7 +103,9 @@ fn package_adapters(root: &Path) -> Vec<Adapter> {
     vec![
         Adapter {
             id: "bun",
-            detected: root.join("bun.lock").is_file() || root.join("bunfig.toml").is_file(),
+            detected: root.join("bun.lock").is_file()
+                || root.join("bun.lockb").is_file()
+                || root.join("bunfig.toml").is_file(),
             support: "shipped",
             behavior: "isolated global-store verification and private CoW prepared environments",
         },
@@ -190,19 +201,18 @@ fn agent_host_adapters() -> Vec<Adapter> {
     .collect()
 }
 
-fn select_package_manager(adapters: &[Adapter]) -> Result<Option<String>> {
-    let selected = adapters
-        .iter()
-        .filter(|adapter| adapter.detected && matches!(adapter.id, "bun" | "pnpm" | "yarn" | "npm"))
-        .map(|adapter| adapter.id)
-        .collect::<Vec<_>>();
-    if selected.len() > 1 {
-        bail!(
-            "multiple package-manager lockfiles detected ({}); remove stale lockfiles or configure an explicit adapter",
-            selected.join(", ")
-        );
+/// Discovery never refuses to describe the repository: an ambiguous lockfile
+/// set is reported as data, and only the commands that must act on one manager
+/// (`prepare`, `doctor`, `run`) treat it as an error.
+fn select_package_manager(detected: &[&'static str]) -> (Option<String>, Vec<String>) {
+    match detected {
+        [] => (None, Vec::new()),
+        [one] => (Some((*one).to_owned()), Vec::new()),
+        many => (
+            None,
+            many.iter().map(|manager| (*manager).to_owned()).collect(),
+        ),
     }
-    Ok(selected.first().map(|value| (*value).to_owned()))
 }
 
 fn has_named_file(root: &Path, names: &[&str]) -> bool {
@@ -255,28 +265,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selects_one_manager_and_refuses_ambiguous_lockfiles() {
-        let one = vec![Adapter {
-            id: "bun",
-            detected: true,
-            support: "shipped",
-            behavior: "test",
-        }];
+    fn selects_one_manager_and_reports_ambiguous_lockfiles_as_data() {
+        assert_eq!(select_package_manager(&[]), (None, Vec::new()));
         assert_eq!(
-            select_package_manager(&one).unwrap().as_deref(),
-            Some("bun")
+            select_package_manager(&["bun"]),
+            (Some("bun".to_owned()), Vec::new())
         );
-
-        let ambiguous = vec![
-            one[0],
-            Adapter {
-                id: "npm",
-                detected: true,
-                support: "planned",
-                behavior: "test",
-            },
-        ];
-        assert!(select_package_manager(&ambiguous).is_err());
+        assert_eq!(
+            select_package_manager(&["yarn", "npm"]),
+            (None, vec!["yarn".to_owned(), "npm".to_owned()])
+        );
     }
 
     #[test]

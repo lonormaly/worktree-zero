@@ -7,6 +7,9 @@ members = [
 [workspace.package]
 version      = "0.1.10"
 edition      = "2021"
+# Floor set by edition-2024 dependencies in Cargo.lock; the msrv CI job
+# enforces it, so bump both together.
+rust-version = "1.85"
 license      = "MIT"
 authors      = ["Worktree Zero contributors"]
 repository   = "https://github.com/lonormaly/worktree-zero"

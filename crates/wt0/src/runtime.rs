@@ -1662,9 +1662,11 @@ fn bun_report(root: &Path) -> Option<BunReport> {
     })
 }
 
-fn javascript_package_manager(root: &Path) -> Result<Option<String>> {
+/// One detection contract shared by `capabilities` (which reports conflicts as
+/// data) and the runtime commands (which refuse to act on them).
+pub(crate) fn detect_javascript_package_managers(root: &Path) -> Vec<&'static str> {
     let candidates = [
-        ("bun", ["bun.lock", "bun.lockb"].as_slice()),
+        ("bun", ["bun.lock", "bun.lockb", "bunfig.toml"].as_slice()),
         ("pnpm", ["pnpm-lock.yaml"].as_slice()),
         ("yarn", ["yarn.lock"].as_slice()),
         (
@@ -1672,11 +1674,15 @@ fn javascript_package_manager(root: &Path) -> Result<Option<String>> {
             ["package-lock.json", "npm-shrinkwrap.json"].as_slice(),
         ),
     ];
-    let detected = candidates
+    candidates
         .iter()
         .filter(|(_, files)| files.iter().any(|file| root.join(file).is_file()))
         .map(|(manager, _)| *manager)
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn javascript_package_manager(root: &Path) -> Result<Option<String>> {
+    let detected = detect_javascript_package_managers(root);
     if detected.len() > 1 {
         bail!(
             "multiple JavaScript package-manager lockfiles detected ({}); remove stale lockfiles or configure an explicit adapter",

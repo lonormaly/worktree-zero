@@ -104,6 +104,10 @@ pub struct WorktreePrune {
     /// Also delete every cached baseline, including recently used entries.
     #[arg(long)]
     pub all: bool,
+
+    /// JSON output.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Default)]
@@ -223,7 +227,10 @@ pub fn run(cmd: Worktree, global_json: bool) -> Result<()> {
             remove(args, json)
         }
         Worktree::List(args) => list(args.json || global_json),
-        Worktree::Prune(args) => prune(args),
+        Worktree::Prune(args) => {
+            let json = args.json || global_json;
+            prune(args, json)
+        }
         Worktree::Gc(args) => {
             let json = args.json || global_json;
             gc(args, json)
@@ -239,14 +246,19 @@ fn add(args: WorktreeAdd, json: bool) -> Result<()> {
 
     if json {
         emit(&json!({
+            "schema_version": 1,
             "worktree": created.target.display().to_string(),
             "branch": args.branch,
             "base": created.base,
             "mode": created.mode.label(),
             "ephemeral": args.ephemeral,
+            "runtime_id": created.lease.runtime_id,
+            "created_at_unix": created.lease.created_at_unix,
+            "heartbeat_at_unix": created.lease.created_at_unix,
         }));
     } else {
         eprintln!("mode: {}", created.mode.label());
+        eprintln!("runtime: {}", created.lease.runtime_id);
         println!("{}", created.target.display());
     }
     Ok(())
@@ -256,6 +268,7 @@ struct CreatedWorktree {
     target: PathBuf,
     base: String,
     mode: PopulateMode,
+    lease: RuntimeLease,
 }
 
 fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
@@ -285,11 +298,14 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         PopulateMode::GitCheckout => add_git_worktree(&repo, &args.branch, &target, &base)?,
     }
 
-    if let Err(error) = mark_managed(&target, &args.branch, args.ephemeral) {
-        let _ = force_teardown(&repo, &target);
-        let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
-        return Err(error).context("record worktree ownership lease");
-    }
+    let lease = match mark_managed(&target, &args.branch, args.ephemeral) {
+        Ok(lease) => lease,
+        Err(error) => {
+            let _ = force_teardown(&repo, &target);
+            let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
+            return Err(error).context("record worktree ownership lease");
+        }
+    };
     if args.ephemeral {
         if let Err(error) = mark_ephemeral(&target) {
             let _ = force_teardown(&repo, &target);
@@ -298,7 +314,12 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         }
     }
 
-    Ok(CreatedWorktree { target, base, mode })
+    Ok(CreatedWorktree {
+        target,
+        base,
+        mode,
+        lease,
+    })
 }
 
 fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
@@ -314,10 +335,11 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
         json: false,
     })?;
     eprintln!(
-        "worktree: {} (mode: {}, branch: {})",
+        "worktree: {} (mode: {}, branch: {}, runtime: {})",
         created.target.display(),
         created.mode.label(),
-        args.branch
+        args.branch,
+        created.lease.runtime_id
     );
     crate::runtime::prepare_for_agent_run(&created.target)
         .context("prepare package-manager environment for agent command")?;
@@ -333,7 +355,13 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
     let mut child = command
         .spawn()
         .with_context(|| format!("run command in {}", created.target.display()))?;
+    // Tolerate transient heartbeat failures (a brief ENOSPC, an indexer
+    // holding the marker) instead of killing a possibly hours-long agent run
+    // on the first error. Three consecutive failures spend 90 seconds of the
+    // lease, still well inside the default 24-hour GC threshold.
+    const MAX_CONSECUTIVE_HEARTBEAT_FAILURES: u32 = 3;
     let mut seconds_since_heartbeat = 0_u64;
+    let mut heartbeat_failures = 0_u32;
     let status = loop {
         if let Some(status) = child.try_wait().context("inspect agent command")? {
             break status;
@@ -341,10 +369,21 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
         std::thread::sleep(Duration::from_secs(1));
         seconds_since_heartbeat += 1;
         if seconds_since_heartbeat >= 30 {
-            if let Err(error) = refresh_heartbeat(&created.target) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.context("agent heartbeat failed; command stopped"));
+            match refresh_heartbeat(&created.target) {
+                Ok(_) => heartbeat_failures = 0,
+                Err(error) => {
+                    heartbeat_failures += 1;
+                    if heartbeat_failures >= MAX_CONSECUTIVE_HEARTBEAT_FAILURES {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error.context(format!(
+                            "agent heartbeat failed {heartbeat_failures} consecutive times; command stopped"
+                        )));
+                    }
+                    eprintln!(
+                        "wt0: heartbeat failed ({heartbeat_failures}/{MAX_CONSECUTIVE_HEARTBEAT_FAILURES}), retrying: {error:#}"
+                    );
+                }
             }
             seconds_since_heartbeat = 0;
         }
@@ -628,6 +667,7 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     }
     if json {
         emit(&json!({
+            "schema_version": 1,
             "removed": target.display().to_string(),
             "committed": committed,
             "branch_deleted": branch_deleted,
@@ -702,11 +742,17 @@ fn list(json_output: bool) -> Result<()> {
     if !current.is_empty() {
         entries.push(serde_json::Value::Object(current));
     }
-    println!("{}", serde_json::to_string_pretty(&entries)?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "worktrees": entries,
+        }))?
+    );
     Ok(())
 }
 
-fn prune(args: WorktreePrune) -> Result<()> {
+fn prune(args: WorktreePrune, json: bool) -> Result<()> {
     let repo = discover_repo(&std::env::current_dir()?)?;
     run_git_common(&repo, [OsStr::new("worktree"), OsStr::new("prune")])?;
     let (generated_removed, generated_preserved) = retire_orphan_generated_runtimes(&repo)?;
@@ -715,9 +761,18 @@ fn prune(args: WorktreePrune) -> Result<()> {
         .filter_map(|entry| overlay::state(&repo, &entry.path).and_then(|state| state.lower))
         .collect();
     let removed = cow::prune_baselines(&repo.common_git_dir, args.all, &protected)?;
-    println!(
-        "pruned {removed} cached baseline(s), retired {generated_removed} owned generated runtime(s), preserved {generated_preserved} ambiguous generated path(s)"
-    );
+    if json {
+        emit(&json!({
+            "schema_version": 1,
+            "pruned_baselines": removed,
+            "retired_generated_runtimes": generated_removed,
+            "preserved_generated_paths": generated_preserved,
+        }));
+    } else {
+        println!(
+            "pruned {removed} cached baseline(s), retired {generated_removed} owned generated runtime(s), preserved {generated_preserved} ambiguous generated path(s)"
+        );
+    }
     Ok(())
 }
 
@@ -781,6 +836,7 @@ fn gc(args: WorktreeGc, json: bool) -> Result<()> {
 
     if json {
         emit(&json!({
+            "schema_version": 1,
             "mode": if args.apply { "apply" } else { "dry-run" },
             "allowed_generated": args.allowed_generated,
             "reaped": outcome.reaped
@@ -827,6 +883,7 @@ fn repair(json_output: bool) -> Result<()> {
     }
     if json_output {
         emit(&json!({
+            "schema_version": 1,
             "repaired": repaired.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             "healthy": healthy.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             "failed": failed.iter().map(|(p, error)| json!({
@@ -1266,7 +1323,14 @@ fn now_unix_seconds() -> Result<u64> {
         .as_secs())
 }
 
-pub(crate) fn mark_managed(worktree: &Path, branch: &str, ephemeral: bool) -> Result<()> {
+/// The ownership lease recorded for a managed worktree, returned so create
+/// receipts can surface the runtime identity an agent must persist.
+pub(crate) struct RuntimeLease {
+    pub(crate) runtime_id: String,
+    pub(crate) created_at_unix: u64,
+}
+
+pub(crate) fn mark_managed(worktree: &Path, branch: &str, ephemeral: bool) -> Result<RuntimeLease> {
     let marker = managed_marker(worktree)?;
     if marker.is_file() {
         bail!(
@@ -1275,18 +1339,23 @@ pub(crate) fn mark_managed(worktree: &Path, branch: &str, ephemeral: bool) -> Re
         );
     }
     let now = now_unix_seconds()?;
+    let runtime_id = Uuid::now_v7().to_string();
     fs::write(
         marker,
         serde_json::to_vec_pretty(&json!({
             "schema_version": 1,
-            "runtime_id": Uuid::now_v7().to_string(),
+            "runtime_id": runtime_id,
             "branch": branch,
             "ephemeral": ephemeral,
             "created_at_unix": now,
             "heartbeat_at_unix": now,
         }))?,
     )
-    .context("write worktree ownership marker")
+    .context("write worktree ownership marker")?;
+    Ok(RuntimeLease {
+        runtime_id,
+        created_at_unix: now,
+    })
 }
 
 pub(crate) fn is_managed(worktree: &Path) -> bool {
@@ -1337,6 +1406,7 @@ fn heartbeat(args: WorktreeHeartbeat, json_output: bool) -> Result<()> {
     let (runtime_id, heartbeat_at_unix) = refresh_heartbeat(&target)?;
     if json_output || args.json {
         emit(&json!({
+            "schema_version": 1,
             "worktree": target,
             "runtime_id": runtime_id,
             "heartbeat_at_unix": heartbeat_at_unix,

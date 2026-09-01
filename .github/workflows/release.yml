@@ -14,7 +14,22 @@ permissions:
   contents: write
 
 jobs:
+  create-release:
+    # Create the release exactly once, before the build matrix fans out, so
+    # four jobs never race `gh release create` against each other.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --verify-tag --title "$tag" --generate-notes
+
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -53,9 +68,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="$GITHUB_REF_NAME"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --verify-tag --title "$tag" --generate-notes || sleep 3
-          fi
           gh release upload "$tag" \
             "wt0-${{ matrix.target }}.tar.gz" \
             "wt0-${{ matrix.target }}.tar.gz.sha256" \
