@@ -228,6 +228,29 @@ as `policy_bytes`. The file obeys the same validation: sensitive paths make
 the policy invalid, and an invalid policy blocks garbage collection for that
 worktree instead of widening it.
 
+### Project lifecycle hooks
+
+A repository can check in executable lifecycle hooks under `.wt0/hooks/`:
+
+```text
+.wt0/hooks/post-create    runs after a worktree is created and leased
+.wt0/hooks/pre-remove     runs before wt0 remove or gc --apply deletes one
+```
+
+Hooks run with the worktree as their working directory and receive
+`WT0_EVENT`, `WT0_WORKTREE`, `WT0_BRANCH`, `WT0_BASE`, `WT0_MODE`,
+`WT0_RUNTIME_ID`, `WT0_EPHEMERAL`, and `WT0_REPO_ROOT`. Use `post-create` for
+project setup (seed a database, copy a reviewed env template, claim a port)
+and `pre-remove` for teardown (stop dev servers, release resources). Failure
+semantics are safety-first: a failing `post-create` rolls the new worktree
+and branch back; a failing `pre-remove` aborts the removal or skips the GC
+candidate with a `pre-remove-hook-failed` receipt — a hook can veto cleanup
+but can never be bypassed into a deletion. `WT0_HOOK_TIMEOUT` (default `5m`)
+bounds every hook so unattended `gc` cannot hang. On Windows the same events
+resolve to `.cmd`, `.bat`, or `.ps1` files. `wt0 capabilities` reports which
+hooks a repository ships. With hooks checked in, most projects no longer
+need a wrapper script around `wt0`.
+
 ## Why Git worktrees still repeat tracked files
 
 ### What branch isolation means

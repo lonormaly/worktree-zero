@@ -48,6 +48,12 @@ pub fn run(args: Capabilities, json_output: bool) -> Result<()> {
         "selected_javascript_package_manager": selected_package,
         "javascript_package_manager_conflict": package_conflict,
         "generated_state": adapters_json(&generated),
+        "project_hooks": {
+            "post_create": crate::hooks::hook_path(&root, crate::hooks::HookEvent::PostCreate)
+                .is_some(),
+            "pre_remove": crate::hooks::hook_path(&root, crate::hooks::HookEvent::PreRemove)
+                .is_some(),
+        },
         "agent_hosts": adapters_json(&host),
     });
 
@@ -73,6 +79,17 @@ pub fn run(args: Capabilities, json_output: bool) -> Result<()> {
         }
         print_detected("package", &package);
         print_detected("generated", &generated);
+        let hooks: Vec<&str> = [
+            crate::hooks::HookEvent::PostCreate,
+            crate::hooks::HookEvent::PreRemove,
+        ]
+        .into_iter()
+        .filter(|event| crate::hooks::hook_path(&root, *event).is_some())
+        .map(crate::hooks::HookEvent::name)
+        .collect();
+        if !hooks.is_empty() {
+            println!("  project hooks:    {}", hooks.join(", "));
+        }
         println!("  agent protocol:   JSON CLI + portable skill + MCP");
         println!("  MCP transport:    wt0 mcp serve (stdio)");
     }

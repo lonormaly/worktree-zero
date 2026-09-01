@@ -10,10 +10,12 @@ copied folders, copied `node_modules`, or shared writable build directories.
 
 ## Choose the entrypoint
 
-Prefer the repository's checked-in wrapper, such as
-`ops/dev/worktree.sh <branch>`, because it may add project-specific databases,
-ports, generated-path policy, and teardown. Use the `wt0` CLI directly only
-when no project wrapper exists.
+Repositories can check project-specific setup and teardown into
+`.wt0/hooks/post-create` and `.wt0/hooks/pre-remove`; `wt0` runs them
+automatically, so a wrapper script is usually unnecessary. If a repository
+still ships a checked-in wrapper such as `ops/dev/worktree.sh <branch>`,
+prefer it — it may predate hooks and add policy the hooks do not carry.
+`wt0 capabilities` reports which hooks the repository ships.
 
 Before creating a checkout:
 
