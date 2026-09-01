@@ -41,7 +41,7 @@ fn remove_accepts_an_absolute_worktree_path_from_outside_the_repository() {
     let wt0 = env!("CARGO_BIN_EXE_wt0");
     let created = Command::new(wt0)
         .current_dir(&repo)
-        .args(["create", "absolute/remove", "--path"])
+        .args(["--json", "create", "absolute/remove", "--path"])
         .arg(&worktree)
         .output()
         .expect("create worktree");
@@ -50,6 +50,14 @@ fn remove_accepts_an_absolute_worktree_path_from_outside_the_repository() {
         "stderr: {}",
         String::from_utf8_lossy(&created.stderr)
     );
+    let receipt: serde_json::Value = serde_json::from_slice(&created.stdout).expect("create JSON");
+    assert_eq!(receipt["schema_version"], 1);
+    assert_eq!(receipt["worktree"], worktree.to_string_lossy().as_ref());
+    let created_runtime_id = receipt["runtime_id"]
+        .as_str()
+        .expect("create receipt carries the runtime id")
+        .to_owned();
+    assert!(receipt["created_at_unix"].as_u64().is_some());
 
     let heartbeat = Command::new(wt0)
         .current_dir(&root)
@@ -64,8 +72,23 @@ fn remove_accepts_an_absolute_worktree_path_from_outside_the_repository() {
     );
     let heartbeat: serde_json::Value =
         serde_json::from_slice(&heartbeat.stdout).expect("heartbeat JSON");
+    assert_eq!(heartbeat["schema_version"], 1);
     assert_eq!(heartbeat["worktree"], worktree.to_string_lossy().as_ref());
-    assert!(heartbeat["runtime_id"].as_str().is_some());
+    assert_eq!(heartbeat["runtime_id"], created_runtime_id.as_str());
+
+    let pruned = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "prune"])
+        .output()
+        .expect("prune with global json flag");
+    assert!(
+        pruned.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&pruned.stderr)
+    );
+    let pruned: serde_json::Value = serde_json::from_slice(&pruned.stdout).expect("prune JSON");
+    assert_eq!(pruned["schema_version"], 1);
+    assert!(pruned["pruned_baselines"].as_u64().is_some());
 
     let removed = Command::new(wt0)
         .current_dir(&root)

@@ -85,3 +85,23 @@ prepare, migrate, guarded GC, and `wt0 mcp serve` are shipped today. The
 remaining lines are the contract that vendor adapters must target;
 documentation must not present them as available commands before their tests
 pass.
+
+## Exit codes and result envelopes
+
+Every command follows the same conventions today:
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | The request succeeded (for dry-run commands: the report was produced). |
+| `1` | The request failed **or was refused for safety**; the reason is a single human-readable line on stderr. |
+| `2` | The command line itself was invalid (produced by the argument parser). |
+
+Distinct exit codes separating "refused for safety" from "failed" are planned;
+until then agents must treat exit 1 as "do not retry blindly — read stderr and
+surface the reason".
+
+Every `--json` payload is an object carrying `schema_version` (currently `1`)
+at the top level. Additive fields may appear within a schema version; removing
+or renaming a field requires a version bump. Streams (`wt0 run`) are the one
+exception: the agent command's output owns stdout, and the runtime receipt is
+printed to stderr before the command starts.

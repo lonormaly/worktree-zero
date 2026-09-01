@@ -220,6 +220,14 @@ Each path must be relative and appears in the JSON receipt. Sensitive paths
 such as `.env*`, `.dev.vars`, or a `secrets` directory cannot be allowed through
 this option. Unknown ignored paths continue to block removal.
 
+A project can also check the same reviewed paths into the repository as a
+`.wt0-generated` file (one relative path per line, `#` comments allowed), so
+every agent and every `wt0 gc` invocation shares one policy without repeating
+`--allow-generated` flags. `wt0 doctor` reports the policy paths' logical size
+as `policy_bytes`. The file obeys the same validation: sensitive paths make
+the policy invalid, and an invalid policy blocks garbage collection for that
+worktree instead of widening it.
+
 ## Why Git worktrees still repeat tracked files
 
 ### What branch isolation means

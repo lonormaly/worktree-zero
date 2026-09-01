@@ -1,9 +1,10 @@
 [package]
 name        = "worktree-zero"
 description = "One complete, thin development runtime for coding agents"
-version.workspace     = true
-edition.workspace     = true
-license.workspace     = true
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
 repository.workspace  = true
 homepage    = "https://github.com/lonormaly/worktree-zero"
 readme      = "../../README.md"

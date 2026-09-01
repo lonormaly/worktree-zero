@@ -10,7 +10,7 @@ cargo test --workspace
 ```
 
 You'll need:
-- Rust stable (1.75+)
+- Rust stable (1.85+ — the `rust-version` in `Cargo.toml`, enforced by the `msrv` CI job)
 - Git (any recent version)
 - macOS: no extra dependencies (APFS `clonefile`)
 - Linux: no extra dependencies (`overlayfs`, with a reflink-clone fallback)
