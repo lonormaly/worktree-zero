@@ -377,3 +377,171 @@ fn create_runs_the_post_create_hook_and_rolls_back_when_it_fails() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn create_is_idempotent_and_allocates_disjoint_slots() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-idempotent-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let create = |branch: &str, path: &str, key: Option<&str>| {
+        let mut command = Command::new(wt0);
+        command
+            .current_dir(&repo)
+            .args(["--json", "create", branch, "--path"])
+            .arg(root.join(path));
+        if let Some(key) = key {
+            command.args(["--idempotency-key", key]);
+        }
+        command.output().expect("run create")
+    };
+
+    let first = create("agent/idem", "one", Some("job-42"));
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).expect("first JSON");
+    assert_eq!(first["reused"], false);
+    assert_eq!(first["slot"], 0);
+
+    // A retried create with the same key and path returns the same runtime.
+    let retry = create("agent/idem", "one", Some("job-42"));
+    assert!(
+        retry.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let retry: serde_json::Value = serde_json::from_slice(&retry.stdout).expect("retry JSON");
+    assert_eq!(retry["reused"], true);
+    assert_eq!(retry["runtime_id"], first["runtime_id"]);
+    assert_eq!(retry["slot"], first["slot"]);
+    assert_eq!(retry["worktree"], first["worktree"]);
+
+    // A different key must be refused, never handed someone else's runtime.
+    let stolen = create("agent/idem", "one", Some("job-43"));
+    assert!(!stolen.status.success());
+    assert!(String::from_utf8_lossy(&stolen.stderr).contains("different idempotency key"));
+
+    // A second runtime gets the next slot and a disjoint port window.
+    let second = create("agent/other", "two", None);
+    assert!(
+        second.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).expect("second JSON");
+    assert_eq!(second["slot"], 1);
+    assert_ne!(second["runtime_id"], first["runtime_id"]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn fleet_and_events_report_the_lifecycle() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-fleet-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let worktree = root.join("agent");
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "create", "agent/fleet", "--path"])
+        .arg(&worktree)
+        .output()
+        .expect("create worktree");
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let fleet = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "fleet"])
+        .output()
+        .expect("run fleet");
+    assert!(
+        fleet.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&fleet.stderr)
+    );
+    let fleet: serde_json::Value = serde_json::from_slice(&fleet.stdout).expect("fleet JSON");
+    assert_eq!(fleet["schema_version"], 1);
+    let runtimes = fleet["runtimes"].as_array().expect("runtimes");
+    let managed = runtimes
+        .iter()
+        .find(|runtime| runtime["branch"] == "agent/fleet")
+        .expect("managed runtime listed");
+    assert_eq!(managed["managed"], true);
+    assert_eq!(managed["slot"], 0);
+    assert!(managed["runtime_id"].as_str().is_some());
+    assert!(managed["lease_age_seconds"].as_u64().is_some());
+    assert!(runtimes
+        .iter()
+        .any(|runtime| runtime["is_main"] == true && runtime["managed"] == false));
+
+    let removed = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["remove"])
+        .arg(&worktree)
+        .output()
+        .expect("remove worktree");
+    assert!(
+        removed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+
+    let events = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "events"])
+        .output()
+        .expect("read events");
+    assert!(
+        events.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&events.stderr)
+    );
+    let events: serde_json::Value = serde_json::from_slice(&events.stdout).expect("events JSON");
+    assert_eq!(events["schema_version"], 1);
+    let kinds: Vec<&str> = events["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter_map(|event| event["event"].as_str())
+        .collect();
+    assert!(kinds.contains(&"created"), "kinds: {kinds:?}");
+    assert!(kinds.contains(&"removed"), "kinds: {kinds:?}");
+
+    let _ = fs::remove_dir_all(root);
+}

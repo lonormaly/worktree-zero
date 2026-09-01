@@ -1,6 +1,20 @@
 use super::*;
 use std::sync::{Arc, Barrier};
 
+fn mark_test_managed(worktree: &Path, branch: &str, ephemeral: bool) -> Result<RuntimeLease> {
+    mark_managed(
+        worktree,
+        &RuntimeSpec {
+            branch,
+            ephemeral,
+            mode: "git-checkout",
+            base: "",
+            idempotency_key: None,
+            slot: 0,
+        },
+    )
+}
+
 #[test]
 fn branch_names_become_unique_safe_path_components() {
     let nested = safe_path_component("feat/auth");
@@ -55,14 +69,14 @@ fn gc_reaps_ephemeral_and_by_prefix_but_spares_others() -> Result<()> {
 
     let eph = fixture.root.join("eph");
     add_git_worktree(&repo, "exp/eph", &eph, &base)?;
-    mark_managed(&eph, "exp/eph", true)?;
+    mark_test_managed(&eph, "exp/eph", true)?;
     mark_ephemeral(&eph)?;
     let keep = fixture.root.join("keep");
     add_git_worktree(&repo, "exp/keep", &keep, &base)?;
-    mark_managed(&keep, "exp/keep", false)?;
+    mark_test_managed(&keep, "exp/keep", false)?;
     let other = fixture.root.join("other");
     add_git_worktree(&repo, "feat/other", &other, &base)?;
-    mark_managed(&other, "feat/other", true)?;
+    mark_test_managed(&other, "feat/other", true)?;
     mark_ephemeral(&other)?;
 
     let args = WorktreeGc {
@@ -97,7 +111,7 @@ fn gc_skips_dirty_worktrees_without_force() -> Result<()> {
     let base = resolve_commit(&repo, "HEAD")?;
     let dirty = fixture.root.join("dirty");
     add_git_worktree(&repo, "dirty", &dirty, &base)?;
-    mark_managed(&dirty, "dirty", false)?;
+    mark_test_managed(&dirty, "dirty", false)?;
     fs::write(dirty.join("scratch.txt"), "uncommitted")?;
 
     let outcome = run_gc(
@@ -130,7 +144,7 @@ fn gc_deletes_merged_branches_when_requested() -> Result<()> {
     let base = resolve_commit(&repo, "HEAD")?;
     let target = fixture.root.join("merged");
     add_git_worktree(&repo, "agent/merged", &target, &base)?;
-    mark_managed(&target, "agent/merged", false)?;
+    mark_test_managed(&target, "agent/merged", false)?;
 
     let outcome = run_gc(
         &repo,
@@ -155,7 +169,7 @@ fn gc_retains_unmerged_branches_without_force() -> Result<()> {
     let base = resolve_commit(&repo, "HEAD")?;
     let target = fixture.root.join("unmerged");
     add_git_worktree(&repo, "agent/unmerged", &target, &base)?;
-    mark_managed(&target, "agent/unmerged", false)?;
+    mark_test_managed(&target, "agent/unmerged", false)?;
     fs::write(target.join("agent.txt"), "result")?;
     run_git_at(&target, ["add", "."])?;
     run_git_at(&target, ["commit", "-q", "-m", "agent result"])?;
@@ -191,7 +205,7 @@ fn gc_preserves_unowned_and_unknown_ignored_state() -> Result<()> {
     add_git_worktree(&repo, "agent/unowned", &unowned, &base)?;
     let secret = fixture.root.join("secret");
     add_git_worktree(&repo, "agent/secret", &secret, &base)?;
-    mark_managed(&secret, "agent/secret", false)?;
+    mark_test_managed(&secret, "agent/secret", false)?;
     fs::write(secret.join(".env.local"), "must survive\n")?;
     let detached = fixture.root.join("detached");
     run_git_common(
@@ -204,10 +218,10 @@ fn gc_preserves_unowned_and_unknown_ignored_state() -> Result<()> {
             OsStr::new(&base),
         ],
     )?;
-    mark_managed(&detached, "detached:test", false)?;
+    mark_test_managed(&detached, "detached:test", false)?;
     let custom = fixture.root.join("custom");
     add_git_worktree(&repo, "agent/custom", &custom, &base)?;
-    mark_managed(&custom, "agent/custom", false)?;
+    mark_test_managed(&custom, "agent/custom", false)?;
     fs::create_dir(custom.join(".generated-cache"))?;
     fs::write(custom.join(".generated-cache/data"), "generated\n")?;
 
@@ -249,7 +263,7 @@ fn gc_refuses_a_live_working_directory() -> Result<()> {
     let base = resolve_commit(&repo, "HEAD")?;
     let target = fixture.root.join("active");
     add_git_worktree(&repo, "agent/active", &target, &base)?;
-    mark_managed(&target, "agent/active", false)?;
+    mark_test_managed(&target, "agent/active", false)?;
     let mut process = Command::new("sh")
         .args(["-c", "sleep 30"])
         .current_dir(&target)
@@ -293,13 +307,13 @@ fn gc_honors_the_checked_in_generated_policy_and_blocks_sensitive_policies() -> 
 
     let governed = fixture.root.join("governed");
     add_git_worktree(&repo, "agent/governed", &governed, &base)?;
-    mark_managed(&governed, "agent/governed", false)?;
+    mark_test_managed(&governed, "agent/governed", false)?;
     fs::create_dir(governed.join(".project-cache"))?;
     fs::write(governed.join(".project-cache/data"), "generated\n")?;
 
     let sensitive = fixture.root.join("sensitive");
     add_git_worktree(&repo, "agent/sensitive", &sensitive, &base)?;
-    mark_managed(&sensitive, "agent/sensitive", false)?;
+    mark_test_managed(&sensitive, "agent/sensitive", false)?;
     fs::write(sensitive.join(GENERATED_POLICY_FILE), ".env.local\n")?;
     run_git_at(&sensitive, ["commit", "-aqm", "sensitive policy"])?;
 
@@ -646,7 +660,7 @@ fn gc_runs_pre_remove_hooks_and_skips_worktrees_whose_hook_fails() -> Result<()>
     let vetoed_base = resolve_commit(&repo, "HEAD")?;
     let vetoed = fixture.root.join("vetoed");
     add_git_worktree(&repo, "agent/vetoed", &vetoed, &vetoed_base)?;
-    mark_managed(&vetoed, "agent/vetoed", false)?;
+    mark_test_managed(&vetoed, "agent/vetoed", false)?;
 
     fs::write(
         &hook,
@@ -656,7 +670,7 @@ fn gc_runs_pre_remove_hooks_and_skips_worktrees_whose_hook_fails() -> Result<()>
     let recording_base = resolve_commit(&repo, "HEAD")?;
     let reapable = fixture.root.join("reapable");
     add_git_worktree(&repo, "agent/reapable", &reapable, &recording_base)?;
-    mark_managed(&reapable, "agent/reapable", false)?;
+    mark_test_managed(&reapable, "agent/reapable", false)?;
 
     let outcome = run_gc(
         &repo,

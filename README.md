@@ -39,7 +39,10 @@ Worktree Zero will:
 
 `wt0 run` is the complete headless path: it creates the CoW checkout, prepares
 supported dependencies, exports runtime-owned generated paths, starts the agent
-command, and refreshes the ownership heartbeat. For Cargo projects it keeps the
+command, and refreshes the ownership heartbeat. Create and run are idempotent
+for orchestrators: pass `--idempotency-key` and a retried request returns the
+existing runtime (`"reused": true` in the receipt) instead of failing or
+creating a second one. For Cargo projects it keeps the
 native global registry/git caches and sets a private `CARGO_TARGET_DIR` outside
 the checkout. Normal remove/GC retires that directory. If the checkout is
 deleted outside Worktree Zero, `wt0 prune` verifies its ownership receipt and
@@ -175,6 +178,15 @@ writable `.next` directory between two running agents would be unsafe. Copying
 the same tracked video forty times is unnecessary. The tool must classify the
 data before deciding whether to share, isolate, or remove it.
 
+### The fleet view and event log
+
+`wt0 fleet --json` is the swarm control view: every runtime with its branch,
+`runtime_id`, slot, lease age, populate mode, and owned generated storage in
+one call. `wt0 events --follow` streams the append-only lifecycle log
+(created, reused, removed, reaped, adopted) so orchestrators react to fleet
+changes without polling; both are also MCP tools. The log is observability,
+never authority — ownership markers and receipts remain the source of truth.
+
 ### Forgotten worktrees are a lifecycle problem
 
 Every worktree created by Worktree Zero receives a private ownership record and
@@ -240,7 +252,11 @@ A repository can check in executable lifecycle hooks under `.wt0/hooks/`:
 
 Hooks run with the worktree as their working directory and receive
 `WT0_EVENT`, `WT0_WORKTREE`, `WT0_BRANCH`, `WT0_BASE`, `WT0_MODE`,
-`WT0_RUNTIME_ID`, `WT0_EPHEMERAL`, and `WT0_REPO_ROOT`. Use `post-create` for
+`WT0_RUNTIME_ID`, `WT0_EPHEMERAL`, `WT0_REPO_ROOT`, `WT0_SLOT`, and
+`WT0_PORT_BASE` (each runtime owns a disjoint hundred-port window starting
+at 20000, so hooks can start collision-free dev servers with zero project
+logic; `wt0 run` additionally defaults `COMPOSE_PROJECT_NAME` so Docker
+Compose stacks isolate per worktree). Use `post-create` for
 project setup (seed a database, copy a reviewed env template, claim a port)
 and `pre-remove` for teardown (stop dev servers, release resources). Failure
 semantics are safety-first: a failing `post-create` rolls the new worktree
