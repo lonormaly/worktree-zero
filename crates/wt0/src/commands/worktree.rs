@@ -322,9 +322,11 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
     crate::runtime::prepare_for_agent_run(&created.target)
         .context("prepare package-manager environment for agent command")?;
     let generated = prepare_generated_runtime(&created.target)?;
-    let (program, command_args) = args.command.split_first().context("command is required")?;
+    let program = args.command.first().context("command is required")?;
+    let mut command_args = args.command.iter().skip(1).cloned().collect::<Vec<_>>();
+    adapt_generated_command(program, &mut command_args, &generated)?;
     let mut command = Command::new(program);
-    command.args(command_args).current_dir(&created.target);
+    command.args(&command_args).current_dir(&created.target);
     for (name, value) in &generated.environment {
         command.env(name, value);
     }
@@ -1130,12 +1132,68 @@ fn prepare_generated_runtime(worktree: &Path) -> Result<GeneratedRuntime> {
             cargo_target.into_os_string(),
         ));
     }
+    if worktree.join("nx.json").is_file() {
+        let nx_workspace_data = root.join("nx-workspace-data");
+        let nx_sockets = root.join("nx-sockets");
+        fs::create_dir_all(&nx_workspace_data).context("create owned Nx workspace data")?;
+        fs::create_dir_all(&nx_sockets).context("create owned Nx socket directory")?;
+        for (name, value) in [
+            (
+                "NX_WORKSPACE_DATA_DIRECTORY",
+                nx_workspace_data.into_os_string(),
+            ),
+            ("NX_SOCKET_DIR", nx_sockets.into_os_string()),
+            ("NX_DAEMON", OsString::from("false")),
+            ("NX_TUI", OsString::from("false")),
+        ] {
+            if std::env::var_os(name).is_none() {
+                environment.push((OsString::from(name), value));
+            }
+        }
+    }
     Ok(GeneratedRuntime {
         root,
         runtime_id,
         worktree,
         environment,
     })
+}
+
+fn adapt_generated_command(
+    program: &OsStr,
+    args: &mut Vec<OsString>,
+    generated: &GeneratedRuntime,
+) -> Result<()> {
+    if !is_local_wrangler_command(program, args) || has_persist_to(args) {
+        return Ok(());
+    }
+    let persist = generated.root.join("wrangler");
+    fs::create_dir_all(&persist).context("create owned Wrangler persistence directory")?;
+    args.push(OsString::from("--persist-to"));
+    args.push(persist.into_os_string());
+    Ok(())
+}
+
+fn is_local_wrangler_command(program: &OsStr, args: &[OsString]) -> bool {
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let words = args
+        .iter()
+        .filter_map(|arg| arg.to_str())
+        .collect::<Vec<_>>();
+    let invokes_wrangler = program == "wrangler"
+        || (matches!(program, "npx" | "bunx") && words.first() == Some(&"wrangler"))
+        || (matches!(program, "pnpm" | "yarn")
+            && words.iter().take(2).any(|word| *word == "wrangler"));
+    invokes_wrangler && (words.contains(&"dev") || words.contains(&"--local"))
+}
+
+fn has_persist_to(args: &[OsString]) -> bool {
+    args.iter()
+        .filter_map(|arg| arg.to_str())
+        .any(|arg| arg == "--persist-to" || arg.strip_prefix("--persist-to=").is_some())
 }
 
 fn retire_generated_runtime(generated: &GeneratedRuntime) -> Result<()> {

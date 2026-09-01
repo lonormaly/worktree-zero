@@ -26,6 +26,8 @@ jobs:
       - run: cargo test --all
       - name: Owned Cargo generated-runtime integration
         run: WT0_BIN="$PWD/target/debug/wt0" bash tests/generated_cargo_integration.sh
+      - name: Owned Nx and Wrangler generated-runtime integration
+        run: WT0_BIN="$PWD/target/debug/wt0" bash tests/generated_js_integration.sh
       - name: Prepared Bun environment integration
         if: runner.os == 'macOS'
         run: WT0="$PWD/target/debug/wt0" bash tests/prepared_bun_integration.sh

@@ -23,6 +23,31 @@ fn parse_duration_accepts_units_and_rejects_overflow() {
 }
 
 #[test]
+fn wrangler_adapter_targets_only_local_state_and_preserves_explicit_paths() {
+    assert!(is_local_wrangler_command(
+        OsStr::new("wrangler"),
+        &[OsString::from("dev")]
+    ));
+    assert!(is_local_wrangler_command(
+        OsStr::new("npx"),
+        &[
+            OsString::from("wrangler"),
+            OsString::from("d1"),
+            OsString::from("--local")
+        ]
+    ));
+    assert!(!is_local_wrangler_command(
+        OsStr::new("wrangler"),
+        &[OsString::from("deploy")]
+    ));
+    assert!(has_persist_to(&[OsString::from("--persist-to=custom")]));
+    assert!(has_persist_to(&[
+        OsString::from("--persist-to"),
+        OsString::from("custom")
+    ]));
+}
+
+#[test]
 fn gc_reaps_ephemeral_and_by_prefix_but_spares_others() -> Result<()> {
     let fixture = Fixture::new()?;
     let repo = discover_repo(&fixture.repo)?;

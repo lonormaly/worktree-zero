@@ -45,6 +45,14 @@ deleted outside Worktree Zero, `wt0 prune` verifies its ownership receipt and
 retires the orphan. One writable Cargo target directory is never shared blindly
 between live agents.
 
+For Nx workspaces, `wt0 run` preserves Nx's native worktree-aware task cache
+and moves only mutable workspace graph data, sockets, daemon state, and the TUI
+into the owned runtime path. For direct Wrangler `dev` or `--local` commands,
+it appends Cloudflare's supported `--persist-to` path unless the caller already
+provided one. Package scripts and the Cloudflare Vite plugin still need the
+project wrapper to pass the same owned path; Worktree Zero does not rewrite a
+project's source configuration.
+
 The shipped portable skill and JSON CLI are the current stable agent
 interfaces. The same versioned result will also be available through the
 planned Worktree Zero MCP server.
