@@ -3,11 +3,11 @@
 All notable changes to Worktree Zero. Versions follow semantic versioning;
 pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
-## Unreleased
+## 0.1.12 — 2026-09-01
 
 ### Added
 
-## Unreleased
+## 0.1.12 — 2026-09-01
 
 ### Added
 
