@@ -162,6 +162,30 @@ optimization is the "nearest snapshot" strategy prepared environments
 already use: build a new baseline as a copy-on-write clone of the nearest
 existing baseline plus the commit diff. Tracked as wt0 gap #6.
 
+### Phase 2 — the adapter, proven end to end (2026-09-01, late)
+
+The FLAM adapter is a draft PR, [FLAM-Fashion/flam#283](https://github.com/FLAM-Fashion/flam/pull/283)
+(`wt0/adapter`, based on the committed storage-contract branch): `.wt0/hooks/post-create`,
+`.wt0/hooks/pre-remove`, `.wt0-generated`, `ops/dev/wt0-worktree.sh`, and the
+`scripts/check-wt0-worktrees.ts` gate. `worktree.sh` stays the fallback. Both
+gates pass. Two contract rulings from the Team session are built in: the
+runtime-id mapping (`FLAM_RUNTIME_ID = sha256(canonical UUID)[0:16]`, both ids
+persisted, immutable) and `.immorterm` never moved by wt0 — un-archived session
+data refuses removal until ImmorTerm ships its archive command.
+
+| Step | Wall clock | Physical (`df` delta) | Result |
+| --- | ---: | ---: | --- |
+| `wt0 create --base wt0/adapter` with FLAM's `post-create` (new base commit → new baseline, Bun install, link-tree check, idle assertion) | 22.4 s | 402 MiB (≈ the per-commit baseline) | `.flam-worktree` with both ids, `FLAM_NS` from the slug, Tilt UI on window port 20199, storage under the owned generated root, owner recorded; 1,940 global-store links |
+| `bun install --linker isolated --frozen-lockfile` alone (global store warm) | 1.8 s | 3 MiB | 57 MB logical `node_modules` |
+| `wt0 remove` with FLAM's `pre-remove` (`.immorterm` check, live-process check, port check, `k3s-runtime.sh delete`, `k3s-dev-db.sh retire`) | 5.8 s | — | worktree gone, generated root retired, fleet consistent; `--delete-branch` correctly refused an unmerged branch |
+
+One defect found and fixed during the proof: the first `pre-remove` vetoed
+every removal because wt0 runs hooks inside the worktree and the hook's
+`lsof` live-process check matched its own shell. The hook now moves to `/`
+first. Still to prove, by the FLAM Team session: a booted stack round trip
+(`tilt_up.sh` → hook-driven `tilt_down.sh` + k3s retirement with ImmorTerm
+annotations), then M1–M6.
+
 ## After
 
 _To be filled by the same instruments once the migration lands._
