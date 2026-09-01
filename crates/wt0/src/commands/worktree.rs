@@ -396,7 +396,7 @@ fn reuse_existing_runtime(
             args.branch
         )
     })?;
-    if existing != *target {
+    if !same_path(&existing, target) {
         bail!(
             "branch '{}' already exists in a different worktree: {} (this request resolves to {})",
             args.branch,
@@ -601,6 +601,15 @@ fn branch_exists(repo: &RepoContext, branch: &str) -> Result<bool> {
         Some(0) => Ok(true),
         _ => Err(git_failure("git show-ref --verify", &exists)),
     }
+}
+
+/// Whether two paths name the same location once symlinks and platform
+/// prefixes are resolved (macOS /var -> /private/var, Windows verbatim
+/// paths). Falls back to the literal path when canonicalization fails.
+fn same_path(left: &Path, right: &Path) -> bool {
+    let left = dunce::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = dunce::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    left == right
 }
 
 /// Deterministic per-runtime port range: forty concurrent agents get disjoint
