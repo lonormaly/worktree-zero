@@ -468,6 +468,7 @@ fn migrate_one(
         }
         if adopt && !worktree::is_managed(root) {
             let branch = worktree_branch_label(root)?;
+            let _slot_lock = worktree::StateLock::slots(&repo.common_git_dir);
             let slot = worktree::allocate_slot(&repo)?;
             let lease = worktree::mark_managed(
                 root,

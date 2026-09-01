@@ -327,7 +327,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
     }
 
     let lease = {
-        let _slot_lock = SlotLock::acquire(&repo.common_git_dir);
+        let _slot_lock = StateLock::slots(&repo.common_git_dir);
         let slot = allocate_slot(&repo)?;
         match mark_managed(
             &target,
@@ -650,8 +650,8 @@ pub(crate) fn port_base(slot: u64) -> u64 {
 }
 
 /// Smallest slot index not held by any live managed worktree. Callers hold
-/// [`SlotLock`] across allocation and marker write so two concurrent creates
-/// cannot claim the same slot.
+/// [`StateLock::slots`] across allocation and marker write so two concurrent
+/// creates cannot claim the same slot.
 pub(crate) fn allocate_slot(repo: &RepoContext) -> Result<u64> {
     let mut used = HashSet::new();
     for entry in list_worktrees(repo)? {
@@ -664,19 +664,51 @@ pub(crate) fn allocate_slot(repo: &RepoContext) -> Result<u64> {
     Ok((0..).find(|slot| !used.contains(slot)).unwrap_or(0))
 }
 
-/// A best-effort cross-process mutex for slot allocation: an exclusive lock
-/// file in the state directory, stolen only when older than 30 seconds so a
-/// crashed holder cannot wedge every future create.
-pub(crate) struct SlotLock {
+/// A best-effort cross-process mutex: an exclusive lock file in the state
+/// directory, stolen only when older than its staleness bound so a crashed
+/// holder cannot wedge every future operation. After the bounded wait the
+/// caller proceeds unlocked — a collision is a lesser failure than a wedged
+/// fleet.
+pub(crate) struct StateLock {
     path: PathBuf,
     held: bool,
 }
 
-impl SlotLock {
-    pub(crate) fn acquire(common_git_dir: &Path) -> Self {
-        let path = state_dir(common_git_dir).join("slot.lock");
+impl StateLock {
+    /// Serializes slot allocation with the ownership-marker write. The wait
+    /// is sized for a large fleet arriving at once: each holder's registry
+    /// read can itself queue behind every in-flight create, so giving up
+    /// early and proceeding unlocked is what would hand two runtimes one
+    /// slot. Crashed holders are covered by the staleness bound, not the
+    /// wait.
+    pub(crate) fn slots(common_git_dir: &Path) -> Self {
+        Self::acquire(
+            common_git_dir,
+            "slot.lock",
+            Duration::from_secs(120),
+            Duration::from_secs(60),
+        )
+    }
+
+    /// Serializes every git invocation that iterates or rewrites the shared
+    /// worktree registry (`.git/worktrees`) or branch refs. Git walks the
+    /// registry non-atomically, so two concurrent `worktree remove` calls can
+    /// each observe the other's half-deleted administrative directory and
+    /// fail. Only the registry operations serialize; populate work — CoW
+    /// clones and checkouts inside one worktree — stays fully parallel.
+    fn registry(common_git_dir: &Path) -> Self {
+        Self::acquire(
+            common_git_dir,
+            "registry.lock",
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        )
+    }
+
+    fn acquire(common_git_dir: &Path, name: &str, wait: Duration, stale_after: Duration) -> Self {
+        let path = state_dir(common_git_dir).join(name);
         let _ = fs::create_dir_all(state_dir(common_git_dir));
-        let deadline = SystemTime::now() + Duration::from_secs(5);
+        let deadline = SystemTime::now() + wait;
         loop {
             match fs::OpenOptions::new()
                 .write(true)
@@ -689,7 +721,7 @@ impl SlotLock {
                         .and_then(|meta| meta.modified())
                         .ok()
                         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                        .is_some_and(|age| age > Duration::from_secs(30));
+                        .is_some_and(|age| age > stale_after);
                     if stale || SystemTime::now() > deadline {
                         // Steal a stale lock, or proceed unlocked after the
                         // bounded wait — slot collision is a lesser failure
@@ -711,7 +743,7 @@ impl SlotLock {
     }
 }
 
-impl Drop for SlotLock {
+impl Drop for StateLock {
     fn drop(&mut self) {
         if self.held {
             let _ = fs::remove_file(&self.path);
@@ -757,11 +789,14 @@ fn add_cow_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str)
 }
 
 fn add_git_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str) -> Result<()> {
+    // `--no-checkout` keeps the registry-locked section down to git's own
+    // bookkeeping; the full checkout runs worktree-local and parallel.
     run_git_common(
         repo,
         [
             OsStr::new("worktree"),
             OsStr::new("add"),
+            OsStr::new("--no-checkout"),
             OsStr::new("-b"),
             OsStr::new(branch),
             target.as_os_str(),
@@ -769,7 +804,16 @@ fn add_git_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str)
         ],
     )
     .context("create linked worktree with normal Git checkout")?;
-    ensure_clean(target)
+    let populate = (|| -> Result<()> {
+        run_git_at(target, ["reset", "--hard", "--quiet"])
+            .context("populate linked worktree with normal Git checkout")?;
+        ensure_clean(target)
+    })();
+    if let Err(error) = populate {
+        rollback_created_worktree(repo, target, branch);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Create a linked worktree whose files are served by a fuse-overlayfs mount:
@@ -829,10 +873,7 @@ fn add_overlay_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &
         let _ = fs::remove_dir_all(target);
         let _ = fs::remove_dir_all(&overlay_dir);
         let _ = run_git_common(repo, [OsStr::new("worktree"), OsStr::new("prune")]);
-        let _ = Command::new("git")
-            .arg(format!("--git-dir={}", repo.common_git_dir.display()))
-            .args(["branch", "-D", branch])
-            .status();
+        let _ = delete_local_branch(repo, branch, true);
         return Err(error);
     }
     Ok(())
@@ -927,6 +968,7 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         let _ = fs::remove_dir_all(&state.overlay_dir);
         run_git_common(&repo, [OsStr::new("worktree"), OsStr::new("prune")])?;
     } else {
+        let _registry = StateLock::registry(&repo.common_git_dir);
         let mut command = Command::new("git");
         command
             .arg(format!("--git-dir={}", repo.common_git_dir.display()))
@@ -1002,7 +1044,10 @@ fn worktree_path_for_branch(repo: &RepoContext, branch: &str) -> Result<Option<P
 fn list(json_output: bool) -> Result<()> {
     let repo = discover_repo(&std::env::current_dir()?)?;
     if !json_output {
-        let output = git_output_common(&repo, ["worktree", "list"])?;
+        let output = {
+            let _registry = StateLock::registry(&repo.common_git_dir);
+            git_output_common(&repo, ["worktree", "list"])?
+        };
         if !output.status.success() {
             return Err(git_failure("git worktree list", &output));
         }
@@ -1010,7 +1055,10 @@ fn list(json_output: bool) -> Result<()> {
         return Ok(());
     }
 
-    let output = git_output_common(&repo, ["worktree", "list", "--porcelain"])?;
+    let output = {
+        let _registry = StateLock::registry(&repo.common_git_dir);
+        git_output_common(&repo, ["worktree", "list", "--porcelain"])?
+    };
     if !output.status.success() {
         return Err(git_failure("git worktree list --porcelain", &output));
     }
@@ -1417,6 +1465,10 @@ fn delete_local_branch(repo: &RepoContext, branch_ref: &str, force: bool) -> Res
     if branch == "main" || branch == "master" {
         bail!("refusing to delete primary branch '{branch}'");
     }
+    // `git branch -d/-D` walks the worktree registry to prove the branch is
+    // not checked out anywhere, so it needs the same serialization as the
+    // registry mutations it races against.
+    let _registry = StateLock::registry(&repo.common_git_dir);
     let mut command = Command::new("git");
     command
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))
@@ -1432,7 +1484,10 @@ struct WorktreeEntry {
 }
 
 fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
-    let output = git_output_common(repo, ["worktree", "list", "--porcelain"])?;
+    let output = {
+        let _registry = StateLock::registry(&repo.common_git_dir);
+        git_output_common(repo, ["worktree", "list", "--porcelain"])?
+    };
     if !output.status.success() {
         return Err(git_failure("git worktree list --porcelain", &output));
     }
@@ -2351,13 +2406,11 @@ fn ensure_clean(worktree: &Path) -> Result<()> {
 
 fn rollback_created_worktree(repo: &RepoContext, target: &Path, branch: &str) {
     let _ = remove_worktree_force(repo, target);
-    let _ = Command::new("git")
-        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
-        .args(["branch", "-D", branch])
-        .status();
+    let _ = delete_local_branch(repo, branch, true);
 }
 
 fn remove_worktree_force(repo: &RepoContext, target: &Path) -> Result<()> {
+    let _registry = StateLock::registry(&repo.common_git_dir);
     let mut command = Command::new("git");
     command
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))
@@ -2366,11 +2419,15 @@ fn remove_worktree_force(repo: &RepoContext, target: &Path) -> Result<()> {
     run_command(&mut command, "git worktree remove --force")
 }
 
+/// Every caller mutates the shared worktree registry or refs (worktree add,
+/// worktree prune), so the registry lock is taken here — callers must not
+/// already hold it.
 fn run_git_common<I, S>(repo: &RepoContext, args: I) -> Result<()>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let _registry = StateLock::registry(&repo.common_git_dir);
     let mut command = Command::new("git");
     command
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))
