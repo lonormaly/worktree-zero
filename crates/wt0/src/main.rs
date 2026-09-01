@@ -33,6 +33,7 @@
 //! wt0 remove --commit   # commit and remove
 //! ```
 
+mod capabilities;
 mod commands;
 mod runtime;
 
@@ -57,6 +58,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Discover storage, package-manager, build-tool, and agent-host adapters.
+    Capabilities(capabilities::Capabilities),
     /// Create a thin linked checkout.
     Create(commands::worktree::WorktreeAdd),
     /// Create a thin runtime and run a command inside it.
@@ -87,6 +90,7 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Commands::Capabilities(args) => capabilities::run(args, cli.json),
         Commands::Create(args) => {
             commands::worktree::run(commands::worktree::Worktree::Add(args), cli.json)
         }

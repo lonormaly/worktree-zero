@@ -20,7 +20,8 @@ Before creating a checkout:
 1. Confirm the user authorized a separate worktree.
 2. Preserve all existing changes and read the repository's agent instructions.
 3. Verify `wt0 --version` and use the project's pinned version when present.
-4. Require copy-on-write instead of accepting a silent full-copy fallback.
+4. Run `wt0 capabilities --json` and refuse ambiguous package-manager locks.
+5. Require copy-on-write instead of accepting a silent full-copy fallback.
 
 ## Create a ready worktree
 
@@ -31,10 +32,11 @@ wt0 create codex/my-task --base origin/main --require-cow --json
 wt0 prepare /absolute/path/from-create --apply --json
 ```
 
-Use the returned absolute path for every later command. `prepare` uses the
-package manager's native store first and attaches a private verified prepared
-environment when supported. Do not symlink one worktree's complete dependency
-directory into another.
+Use the returned absolute path for every later command. `prepare` supports Bun,
+npm, pnpm, and Yarn's `node_modules` linker. It preserves the manager's native
+store first and attaches a private verified prepared environment for remaining
+installed files. Yarn PnP and zero-install stay native. Do not symlink one
+worktree's complete dependency directory into another.
 
 If an external agent manager owns the process, refresh the lease while it runs:
 

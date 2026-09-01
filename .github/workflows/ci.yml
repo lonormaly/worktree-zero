@@ -27,6 +27,15 @@ jobs:
       - name: Prepared Bun environment integration
         if: runner.os == 'macOS'
         run: WT0="$PWD/target/debug/wt0" bash tests/prepared_bun_integration.sh
+      - name: Install node_modules adapter fixtures
+        if: runner.os == 'macOS'
+        run: npm install --global pnpm@10.34.5 yarn@1.22.22
+      - name: Prepared npm, pnpm, and Yarn environment integration
+        if: runner.os == 'macOS'
+        run: |
+          WT0_BIN="$PWD/target/debug/wt0" bash tests/prepared_node_integration.sh npm
+          WT0_BIN="$PWD/target/debug/wt0" bash tests/prepared_node_integration.sh pnpm
+          WT0_BIN="$PWD/target/debug/wt0" bash tests/prepared_node_integration.sh yarn
 
   overlay-linux:
     # Validates the fuse-overlayfs populate mode, which cannot run on macOS.

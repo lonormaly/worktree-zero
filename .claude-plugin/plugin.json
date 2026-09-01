@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "worktree-zero",
+  "version": "0.1.8",
+  "description": "Create, prepare, measure, migrate, and safely remove thin coding-agent worktrees.",
+  "author": {
+    "name": "Worktree Zero contributors",
+    "url": "https://github.com/lonormaly/worktree-zero"
+  },
+  "homepage": "https://github.com/lonormaly/worktree-zero",
+  "repository": "https://github.com/lonormaly/worktree-zero",
+  "license": "MIT",
+  "keywords": ["git", "worktree", "agents", "copy-on-write", "storage"],
+  "skills": ["./.agents/skills/"]
+}

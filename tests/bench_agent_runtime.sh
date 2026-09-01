@@ -19,7 +19,10 @@ N="${N:-4}"
 WORK="${WORK:?set WORK to an empty benchmark directory on the measured filesystem}"
 SETTLE_SECONDS="${SETTLE_SECONDS:-1}"
 
-[[ "$MODE" == npm || "$MODE" == bun ]] || { echo "MODE must be npm or bun" >&2; exit 2; }
+[[ "$MODE" == npm || "$MODE" == bun || "$MODE" == pnpm || "$MODE" == yarn ]] || {
+  echo "MODE must be bun, npm, pnpm, or yarn" >&2
+  exit 2
+}
 [[ "$ENGINE" == git || "$ENGINE" == wt0 ]] || { echo "ENGINE must be git or wt0" >&2; exit 2; }
 [[ "$N" =~ ^[1-9][0-9]*$ ]] || { echo "N must be a positive integer" >&2; exit 2; }
 [[ -x "$WT0" ]] || { echo "missing wt0 binary: $WT0" >&2; exit 2; }
@@ -29,9 +32,11 @@ SETTLE_SECONDS="${SETTLE_SECONDS:-1}"
   exit 2
 }
 
-mkdir -p "$WORK/.package-cache/npm" "$WORK/.package-cache/bun"
+mkdir -p "$WORK/.package-cache/npm" "$WORK/.package-cache/bun" "$WORK/.package-cache/pnpm" "$WORK/.package-cache/yarn"
 export npm_config_cache="$WORK/.package-cache/npm"
 export BUN_INSTALL_CACHE_DIR="$WORK/.package-cache/bun"
+export PNPM_HOME="$WORK/.package-cache/pnpm"
+export YARN_CACHE_FOLDER="$WORK/.package-cache/yarn"
 
 case "$WORK" in
   /|/Users|/Users/*/Development|/Volumes) echo "refusing broad WORK path: $WORK" >&2; exit 2 ;;
@@ -89,27 +94,55 @@ git -C "$repo" config user.name "Worktree Zero Benchmark"
 
 install_environment() {
   local path="$1"
-  if [[ "$MODE" == bun ]]; then
-    (cd "$path" && BUN_INSTALL_GLOBAL_STORE=1 "$BUN_BIN" install --linker isolated --frozen-lockfile >/dev/null)
-  else
-    (cd "$path" && npm ci --no-audit --no-fund >/dev/null)
+  if [[ "$ENGINE" == wt0 ]]; then
+    "$WT0" prepare "$path" --apply --json >/dev/null
+    return
   fi
+  case "$MODE" in
+    bun) (cd "$path" && BUN_INSTALL_GLOBAL_STORE=1 "$BUN_BIN" install --linker isolated --frozen-lockfile >/dev/null) ;;
+    npm) (cd "$path" && npm ci --no-audit --no-fund >/dev/null) ;;
+    pnpm) (cd "$path" && pnpm install --frozen-lockfile >/dev/null) ;;
+    yarn) (cd "$path" && yarn install --frozen-lockfile >/dev/null) ;;
+  esac
+}
+
+install_initial_environment() {
+  case "$MODE" in
+    bun) (cd "$repo" && BUN_INSTALL_GLOBAL_STORE=1 "$BUN_BIN" install --linker isolated >/dev/null) ;;
+    npm) (cd "$repo" && npm install --no-audit --no-fund >/dev/null) ;;
+    pnpm) (cd "$repo" && pnpm install >/dev/null) ;;
+    yarn) (cd "$repo" && yarn install >/dev/null) ;;
+  esac
+}
+
+add_drift_dependency() {
+  local path="$1"
+  case "$MODE" in
+    bun) (cd "$path" && BUN_INSTALL_GLOBAL_STORE=1 "$BUN_BIN" add --exact three@0.180.0 >/dev/null) ;;
+    npm) (cd "$path" && npm install --save-exact --no-audit --no-fund three@0.180.0 >/dev/null) ;;
+    pnpm) (cd "$path" && pnpm add --save-exact three@0.180.0 >/dev/null) ;;
+    yarn) (cd "$path" && yarn add --exact three@0.180.0 >/dev/null) ;;
+  esac
+}
+
+tracked_lockfile() {
+  case "$MODE" in
+    bun) printf '%s\n' bun.lock ;;
+    npm) printf '%s\n' package-lock.json ;;
+    pnpm) printf '%s\n' pnpm-lock.yaml ;;
+    yarn) printf '%s\n' yarn.lock ;;
+  esac
 }
 
 create_lock_and_warm_cache() {
-  if [[ "$MODE" == bun ]]; then
-    (cd "$repo" && BUN_INSTALL_GLOBAL_STORE=1 "$BUN_BIN" install --linker isolated >/dev/null)
-  else
-    (cd "$repo" && npm install --no-audit --no-fund >/dev/null)
-  fi
+  install_initial_environment
   (cd "$repo" && node --test >/dev/null)
   find "$repo/node_modules" -depth -delete
 }
 
 create_lock_and_warm_cache
-git -C "$repo" add -f .gitignore package.json src test
-[[ "$MODE" != bun ]] || git -C "$repo" add -f bun.lock bunfig.toml
-[[ "$MODE" != npm ]] || git -C "$repo" add -f package-lock.json
+git -C "$repo" add -f .gitignore package.json src test "$(tracked_lockfile)"
+[[ "$MODE" != bun ]] || git -C "$repo" add -f bunfig.toml
 git -C "$repo" commit -qm fixture
 
 sync
@@ -161,11 +194,7 @@ done
 record source_changed_and_tested
 
 drift_path="${paths[0]}"
-if [[ "$MODE" == bun ]]; then
-  (cd "$drift_path" && BUN_INSTALL_GLOBAL_STORE=1 "$BUN_BIN" add --exact three@0.180.0 >/dev/null)
-else
-  (cd "$drift_path" && npm install --save-exact --no-audit --no-fund three@0.180.0 >/dev/null)
-fi
+add_drift_dependency "$drift_path"
 cat >"$drift_path/test/dependency-drift.test.mjs" <<'JS'
 import test from "node:test";
 import assert from "node:assert/strict";

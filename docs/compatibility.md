@@ -18,20 +18,19 @@ Every fallback keeps branch/worktree isolation and the lifecycle contract. A fal
 
 The CLI and MCP server are the stable interfaces. Vendor integrations package the same skill and commands.
 
-| Surface | Integration target |
+| Surface | Current integration |
 | --- | --- |
-| Claude Code | plugin plus shared `SKILL.md` |
-| OpenAI Codex | plugin/skill plus MCP server |
-| Grok and Grok Bot | skill/instructions plus CLI or MCP tool binding |
-| Gemini CLI | extension/skill plus MCP binding |
-| Cursor | project rule/command plus MCP binding |
-| GitHub Copilot | repository skill/instructions plus CLI invocation |
-| OpenCode | plugin/skill plus MCP binding |
-| NanoClaw | installable skill plus a small runtime adapter calling JSON CLI or MCP |
-| OpenClaw | installable skill plus a small runtime adapter calling JSON CLI or MCP |
-| Hermes | installable skill plus a small runtime adapter calling JSON CLI or MCP |
-| Grok Bot | installable instruction bundle plus JSON CLI or MCP tool binding |
-| Slack/queue/autonomous agents | headless JSON CLI or MCP; no TTY dependency |
+| Claude Code | portable skill + JSON CLI shipped; plugin packaging planned |
+| OpenAI Codex | portable skill + JSON CLI shipped; native plugin and MCP packaging planned |
+| Grok and Grok Bot | portable instructions + JSON CLI shipped; packaged binding planned |
+| Gemini CLI | portable instructions + JSON CLI shipped; extension packaging planned |
+| Cursor | repository instruction + JSON CLI shipped; packaged binding planned |
+| GitHub Copilot | repository instruction + JSON CLI shipped; packaged binding planned |
+| OpenCode | portable skill + JSON CLI shipped; plugin packaging planned |
+| NanoClaw | headless JSON CLI contract shipped; installable adapter package planned |
+| OpenClaw | headless JSON CLI contract shipped; installable adapter package planned |
+| Hermes | headless JSON CLI contract shipped; installable adapter package planned |
+| Slack/queue/autonomous agents | headless JSON CLI shipped; no TTY dependency |
 
 The [OpenAI developer platform](https://developers.openai.com/) explicitly supports plugins composed from skills and MCP servers, and its [Skills API](https://developers.openai.com/api/reference/go/resources/skills) supports versioned skill bundles. Worktree Zero should keep its skill portable while publishing a native Codex package.
 
