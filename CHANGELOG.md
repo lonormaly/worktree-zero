@@ -3,6 +3,18 @@
 All notable changes to Worktree Zero. Versions follow semantic versioning;
 pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
+## Unreleased
+
+### Added
+
+- **Tilt boot/stop scripts and the `wt0-tilt` agent skill**: checked-in
+  `tilt_up.sh`/`tilt_down.sh` examples distilled from a measured design
+  partner's production scripts — the UI port pinned to the runtime's port
+  window, held ports refused loudly with the owning pid, and a teardown that
+  kills the actual session and proves the port is free instead of printing
+  "stopped" over a live server. The `wt0-tilt` skill teaches coding agents
+  the same discipline.
+
 ## 0.1.13 — 2026-09-01
 
 ### Added

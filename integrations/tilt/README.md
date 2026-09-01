@@ -45,6 +45,28 @@ wt0 run agent/checkout-fix -- tilt up --port "$WT0_PORT_BASE"
 Each agent's Tilt UI, port forwards, and namespace land in its own window;
 `wt0 run` refreshes the ownership heartbeat while Tilt runs.
 
+### Boot and stop scripts (recommended)
+
+Check [examples/tilt_up.sh](examples/tilt_up.sh) and
+[examples/tilt_down.sh](examples/tilt_down.sh) into the project root and make
+them the only way the stack starts and stops. Distilled from a measured
+design partner's production scripts, they carry two lessons the raw commands
+miss:
+
+- **`tilt_up.sh`** pins the Tilt UI to the runtime's port window (last port,
+  `WT0_PORT_BASE + 99`), refuses a held port loudly — naming the pid — and
+  detaches the server from the launching terminal so a SIGHUP cannot take the
+  stack down.
+- **`tilt_down.sh`** stops the actual session and proves it. A naive
+  `tilt down` only deletes cluster resources; with `local_resource` roles it
+  stops nothing while printing "stopped". The script kills the server holding
+  the UI port, waits for the port to actually free, and exits non-zero
+  otherwise — so a "restart" can never silently leave old code running.
+
+The [wt0-tilt agent skill](../../.agents/skills/wt0-tilt/SKILL.md) teaches
+coding agents the same discipline: only the scripts, verify the port between
+down and up, restart after Tiltfile changes.
+
 ## Per-worktree test environment
 
 `tilt ci` builds, deploys, waits for readiness, and exits non-zero on

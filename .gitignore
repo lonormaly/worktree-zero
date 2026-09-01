@@ -11,3 +11,8 @@ coverage/
 __pycache__/
 *.pyc
 plan
+
+# ImmorTerm runtime state (keep project.json so teammates/clones
+# share one memory partition; ignore churny logs + claude-ctx)
+.immorterm/*
+!.immorterm/project.json
