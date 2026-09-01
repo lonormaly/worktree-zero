@@ -27,6 +27,78 @@ pub(crate) fn clone_supported(common_git_dir: &Path, destination_dir: &Path) -> 
     Ok(supported)
 }
 
+pub(crate) const STORE_VERSION: &str = "1";
+
+/// One level of the layered baseline store: the shared `WT0_STORE` (possibly
+/// read-only) first, the repo-local state directory as writable overflow.
+pub(crate) struct StoreLevel {
+    pub(crate) root: PathBuf,
+    pub(crate) writable: bool,
+    pub(crate) shared: bool,
+}
+
+/// Resolve the store levels from the environment. `WT0_STORE` must be an
+/// absolute path; a store whose `store-version` names a different layout is
+/// an error, never a guess. A missing version file is treated as the current
+/// layout (stores written before versioning) and stamped when writable.
+pub(crate) fn store_levels(common_git_dir: &Path) -> Result<Vec<StoreLevel>> {
+    let mut levels = Vec::new();
+    if let Some(configured) = std::env::var_os("WT0_STORE") {
+        let root = PathBuf::from(configured);
+        if !root.is_absolute() {
+            bail!("WT0_STORE must be absolute: {}", root.display());
+        }
+        let writable = prepare_store_root(&root)?;
+        levels.push(StoreLevel {
+            root,
+            writable,
+            shared: true,
+        });
+    }
+    let local = state_dir(common_git_dir);
+    let _ = prepare_store_root(&local);
+    levels.push(StoreLevel {
+        root: local,
+        writable: true,
+        shared: false,
+    });
+    Ok(levels)
+}
+
+/// Validate a store root's layout version and report whether it is writable.
+fn prepare_store_root(root: &Path) -> Result<bool> {
+    let version_path = root.join("store-version");
+    match fs::read_to_string(&version_path) {
+        Ok(version) if version.trim() != STORE_VERSION => bail!(
+            "store {} uses layout version {}, this wt0 expects {STORE_VERSION}",
+            root.display(),
+            version.trim()
+        ),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Pre-versioning store or fresh directory; stamp when writable.
+            let _ = fs::create_dir_all(root);
+            let _ = fs::write(&version_path, STORE_VERSION);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", version_path.display()))
+        }
+    }
+    let probe = root.join(format!(".wt0-write-probe-{}", Uuid::new_v4()));
+    let writable = fs::write(&probe, b"probe").is_ok();
+    let _ = fs::remove_file(&probe);
+    Ok(writable)
+}
+
+/// Whether an existing file clones with CoW into `destination_dir` — used to
+/// test a read-only shared level without writing into it.
+fn clones_into(existing_file: &Path, destination_dir: &Path) -> bool {
+    let probe = destination_dir.join(format!(".wt0-clone-probe-{}", Uuid::new_v4()));
+    let supported = reflink_copy::reflink(existing_file, &probe).is_ok();
+    let _ = fs::remove_file(&probe);
+    supported
+}
+
 /// Clone one file with copy-on-write extents, preserving the source's
 /// permission bits. Fails — never silently degrades to a byte copy — when the
 /// filesystem cannot clone.
@@ -109,20 +181,74 @@ fn create_symlink(target: &Path, source: &Path, destination: &Path) -> Result<()
     })
 }
 
-/// Return an immutable checkout cache for `commit`.
-///
-/// Every creator materializes into a unique temporary directory and publishes
-/// with one atomic rename. Concurrent losers discard their temporary tree and
-/// use the winner; no process removes or mutates a published baseline.
-pub(crate) fn ensure_baseline(repo: &RepoContext, commit: &str) -> Result<PathBuf> {
-    let root = state_dir(&repo.common_git_dir).join("baselines");
+/// Return an immutable checkout cache for `commit`, searching the layered
+/// store: a shared-level hit is used in place (skipped when it cannot CoW
+/// into `clone_hint`'s volume), a miss materializes into the first writable
+/// level that can. Every creator materializes into a unique temporary
+/// directory and publishes with one atomic rename; no process removes or
+/// mutates a published baseline, and shared levels are never pruned from
+/// here.
+pub(crate) fn ensure_baseline(
+    repo: &RepoContext,
+    commit: &str,
+    clone_hint: Option<&Path>,
+) -> Result<PathBuf> {
+    let levels = store_levels(&repo.common_git_dir)?;
+    ensure_baseline_in(&levels, repo, commit, clone_hint)
+}
+
+pub(crate) fn ensure_baseline_in(
+    levels: &[StoreLevel],
+    repo: &RepoContext,
+    commit: &str,
+    clone_hint: Option<&Path>,
+) -> Result<PathBuf> {
+    for level in levels {
+        let final_dir = level.root.join("baselines").join(commit);
+        let final_tree = final_dir.join("tree");
+        let ready = final_dir.join("ready");
+        if ready.is_file() && final_tree.is_dir() {
+            if let Some(hint) = clone_hint {
+                if !clones_into(&ready, hint) {
+                    // A shared level on another volume cannot serve CoW
+                    // clones here; fall through to a closer level instead of
+                    // silently degrading to full copies.
+                    continue;
+                }
+            }
+            if level.writable {
+                let _ = touch(&ready);
+            }
+            return Ok(final_tree);
+        }
+    }
+    for level in levels.iter().filter(|level| level.writable) {
+        if let Some(hint) = clone_hint {
+            let probe_source = level.root.join(format!(".wt0-probe-{}", Uuid::new_v4()));
+            if fs::write(&probe_source, b"wt0-cow-probe").is_err() {
+                continue;
+            }
+            let usable = clones_into(&probe_source, hint);
+            let _ = fs::remove_file(&probe_source);
+            if !usable {
+                continue;
+            }
+        }
+        return materialize_baseline_at(&level.root, repo, commit);
+    }
+    bail!(
+        "no writable store level can serve copy-on-write baselines for {}",
+        clone_hint
+            .map(|hint| hint.display().to_string())
+            .unwrap_or_else(|| "this repository".to_owned())
+    )
+}
+
+fn materialize_baseline_at(store_root: &Path, repo: &RepoContext, commit: &str) -> Result<PathBuf> {
+    let root = store_root.join("baselines");
     let final_dir = root.join(commit);
     let final_tree = final_dir.join("tree");
     let ready = final_dir.join("ready");
-    if ready.is_file() && final_tree.is_dir() {
-        touch(&ready)?;
-        return Ok(final_tree);
-    }
 
     fs::create_dir_all(&root)?;
     if final_dir.exists() {

@@ -44,6 +44,14 @@ pub fn run(args: Capabilities, json_output: bool) -> Result<()> {
             "backend": source_backend(),
             "strict_create_supported": cow_supported,
         },
+        "store_levels": worktree::cow::store_levels(&repo.common_git_dir)?
+            .iter()
+            .map(|level| json!({
+                "root": level.root,
+                "writable": level.writable,
+                "shared": level.shared,
+            }))
+            .collect::<Vec<Value>>(),
         "package_managers": adapters_json(&package),
         "selected_javascript_package_manager": selected_package,
         "javascript_package_manager_conflict": package_conflict,

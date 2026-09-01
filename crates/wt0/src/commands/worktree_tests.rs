@@ -444,7 +444,7 @@ fn concurrent_baseline_creation_publishes_one_complete_tree() -> Result<()> {
         handles.push(std::thread::spawn(move || -> Result<PathBuf> {
             let repo = discover_repo(&repo_path)?;
             barrier.wait();
-            cow::ensure_baseline(&repo, &commit)
+            cow::ensure_baseline(&repo, &commit, None)
         }));
     }
     let paths = handles
@@ -466,7 +466,7 @@ fn incomplete_published_baseline_is_not_deleted_implicitly() -> Result<()> {
         .join(&commit);
     fs::create_dir_all(&incomplete)?;
     fs::write(incomplete.join("sentinel"), "do not delete")?;
-    assert!(cow::ensure_baseline(&repo, &commit).is_err());
+    assert!(cow::ensure_baseline(&repo, &commit, None).is_err());
     assert!(incomplete.join("sentinel").is_file());
     Ok(())
 }
@@ -476,7 +476,7 @@ fn pruning_preserves_baselines_used_by_active_overlays() -> Result<()> {
     let fixture = Fixture::new()?;
     let repo = discover_repo(&fixture.repo)?;
     let commit = resolve_commit(&repo, "HEAD")?;
-    let baseline = cow::ensure_baseline(&repo, &commit)?;
+    let baseline = cow::ensure_baseline(&repo, &commit, None)?;
     let protected = HashSet::from([baseline.clone()]);
     assert_eq!(
         cow::prune_baselines(&repo.common_git_dir, true, &protected)?,
@@ -690,5 +690,71 @@ fn gc_runs_pre_remove_hooks_and_skips_worktrees_whose_hook_fails() -> Result<()>
         fs::read_to_string(fixture.repo.join("reaped-branch"))?,
         "agent/reapable"
     );
+    Ok(())
+}
+
+#[test]
+fn baselines_layer_across_shared_and_local_stores() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let commit = resolve_commit(&repo, "HEAD")?;
+    let shared_root = fixture.root.join("shared-store");
+    fs::create_dir_all(&shared_root)?;
+
+    // A writable shared level is preferred for publishing.
+    let levels = vec![
+        cow::StoreLevel {
+            root: shared_root.clone(),
+            writable: true,
+            shared: true,
+        },
+        cow::StoreLevel {
+            root: state_dir(&repo.common_git_dir),
+            writable: true,
+            shared: false,
+        },
+    ];
+    let published = cow::ensure_baseline_in(&levels, &repo, &commit, None)?;
+    assert!(published.starts_with(&shared_root));
+    assert_eq!(fs::read_to_string(published.join("file.txt"))?, "content\n");
+
+    // A read-only shared hit is used in place without touching it.
+    let read_only = vec![
+        cow::StoreLevel {
+            root: shared_root.clone(),
+            writable: false,
+            shared: true,
+        },
+        cow::StoreLevel {
+            root: state_dir(&repo.common_git_dir),
+            writable: true,
+            shared: false,
+        },
+    ];
+    let reused = cow::ensure_baseline_in(&read_only, &repo, &commit, None)?;
+    assert_eq!(reused, published);
+    assert!(!state_dir(&repo.common_git_dir)
+        .join("baselines")
+        .join(&commit)
+        .exists());
+
+    // A miss with a read-only shared level overflows into the local level.
+    let missing_shared = fixture.root.join("empty-shared");
+    fs::create_dir_all(&missing_shared)?;
+    let overflow = vec![
+        cow::StoreLevel {
+            root: missing_shared,
+            writable: false,
+            shared: true,
+        },
+        cow::StoreLevel {
+            root: state_dir(&repo.common_git_dir),
+            writable: true,
+            shared: false,
+        },
+    ];
+    let local = cow::ensure_baseline_in(&overflow, &repo, &commit, None)?;
+    assert!(local.starts_with(state_dir(&repo.common_git_dir)));
+    assert_eq!(fs::read_to_string(local.join("file.txt"))?, "content\n");
     Ok(())
 }
