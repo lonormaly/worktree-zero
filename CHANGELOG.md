@@ -24,10 +24,6 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Added
 
-## 0.1.12 — 2026-09-01
-
-### Added
-
 - **Project lifecycle hooks**: checked-in `.wt0/hooks/post-create` and
   `.wt0/hooks/pre-remove` run automatically with a `WT0_*` environment
   contract and a `WT0_HOOK_TIMEOUT` bound (default 5m). Failure semantics
