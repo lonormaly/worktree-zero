@@ -66,6 +66,16 @@ pub struct WorktreeAdd {
     #[arg(long)]
     pub idempotency_key: Option<String>,
 
+    /// Agent or session that owns this runtime (recorded in the lease,
+    /// receipts, fleet, and `WT0_OWNER`). Defaults to `$WT0_OWNER`.
+    #[arg(long)]
+    pub owner: Option<String>,
+
+    /// Refuse to create when the destination volume has less free space than
+    /// this (e.g. 20G, 512M). Defaults to `$WT0_REQUIRE_FREE`; unset = no floor.
+    #[arg(long, value_name = "SIZE")]
+    pub require_free: Option<String>,
+
     /// JSON output.
     #[arg(long)]
     pub json: bool,
@@ -179,6 +189,15 @@ pub struct WorktreeRun {
     #[arg(long)]
     pub idempotency_key: Option<String>,
 
+    /// Agent or session that owns this runtime. Defaults to `$WT0_OWNER`.
+    #[arg(long)]
+    pub owner: Option<String>,
+
+    /// Refuse to create when the destination volume has less free space than
+    /// this (e.g. 20G). Defaults to `$WT0_REQUIRE_FREE`; unset = no floor.
+    #[arg(long, value_name = "SIZE")]
+    pub require_free: Option<String>,
+
     /// Command and arguments to execute in the new worktree.
     #[arg(required = true)]
     pub command: Vec<OsString>,
@@ -275,6 +294,8 @@ fn add(args: WorktreeAdd, json: bool) -> Result<()> {
             "heartbeat_at_unix": created.lease.heartbeat_at_unix,
             "slot": created.lease.slot,
             "port_base": created.lease.port_base,
+            "owner": created.lease.owner,
+            "slug": branch_slug(&args.branch),
             "reused": created.reused,
         }));
     } else {
@@ -320,6 +341,12 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
     }
 
     let target_parent = target.parent().context("worktree path has no parent")?;
+    enforce_free_disk_floor(target_parent, args.require_free.as_deref())?;
+    let owner = args
+        .owner
+        .clone()
+        .or_else(|| std::env::var("WT0_OWNER").ok())
+        .filter(|owner| !owner.is_empty());
     let mode = select_populate_mode(&repo, target_parent, args.require_cow)?;
 
     match mode {
@@ -342,6 +369,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
                 idempotency_key: args.idempotency_key.as_deref(),
                 slot,
                 port_base,
+                owner: owner.as_deref(),
             },
         ) {
             Ok(lease) => lease,
@@ -361,9 +389,21 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         }
     }
 
-    let hook_env = [
+    // The owned generated-runtime root exists from the first moment a hook
+    // can run, so post-create can place mutable project state (emulator
+    // persistence, local databases) where remove and prune will retire it.
+    let generated = match prepare_generated_runtime(&target) {
+        Ok(generated) => generated,
+        Err(error) => {
+            let _ = force_teardown(&repo, &target);
+            let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
+            return Err(error).context("prepare owned generated runtime");
+        }
+    };
+    let mut hook_env = vec![
         ("WT0_WORKTREE", target.display().to_string()),
         ("WT0_BRANCH", args.branch.clone()),
+        ("WT0_SLUG", branch_slug(&args.branch)),
         ("WT0_BASE", base.clone()),
         ("WT0_MODE", mode.label().to_owned()),
         ("WT0_RUNTIME_ID", lease.runtime_id.clone()),
@@ -371,7 +411,11 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         ("WT0_REPO_ROOT", repo.top_level.display().to_string()),
         ("WT0_SLOT", lease.slot.to_string()),
         ("WT0_PORT_BASE", lease.port_base.to_string()),
+        ("WT0_GENERATED_ROOT", generated.root.display().to_string()),
     ];
+    if let Some(owner) = &lease.owner {
+        hook_env.push(("WT0_OWNER", owner.clone()));
+    }
     if let Err(error) =
         crate::hooks::run_hook(&target, crate::hooks::HookEvent::PostCreate, &hook_env)
     {
@@ -389,6 +433,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
             "runtime_id": lease.runtime_id,
             "slot": lease.slot,
             "port_base": lease.port_base,
+            "owner": lease.owner,
             "mode": mode.label(),
         }),
     );
@@ -489,6 +534,7 @@ fn reuse_existing_runtime(
             port_base: lease
                 .port_base
                 .unwrap_or_else(|| port_base(lease.slot.unwrap_or(0))),
+            owner: lease.owner.clone(),
         },
         reused: true,
     })
@@ -505,6 +551,8 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
         require_cow: args.require_cow,
         ephemeral: !args.persistent,
         idempotency_key: args.idempotency_key,
+        owner: args.owner,
+        require_free: args.require_free,
         json: false,
     })?;
     eprintln!(
@@ -531,6 +579,10 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
     // on ports or Compose projects; explicit caller values always win.
     command.env("WT0_SLOT", created.lease.slot.to_string());
     command.env("WT0_PORT_BASE", created.lease.port_base.to_string());
+    command.env("WT0_SLUG", branch_slug(&args.branch));
+    if let Some(owner) = &created.lease.owner {
+        command.env("WT0_OWNER", owner);
+    }
     if std::env::var_os("COMPOSE_PROJECT_NAME").is_none() {
         let short_id: String = created.lease.runtime_id.chars().take(8).collect();
         command.env("COMPOSE_PROJECT_NAME", format!("wt0-{short_id}"));
@@ -973,10 +1025,9 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     if let Some(branch) = &branch {
         let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
         hook_env.push(("WT0_BRANCH", short.to_owned()));
+        hook_env.push(("WT0_SLUG", branch_slug(short)));
     }
-    if let Some(runtime_id) = &removed_runtime_id {
-        hook_env.push(("WT0_RUNTIME_ID", runtime_id.clone()));
-    }
+    hook_env.extend(lease_hook_env(&repo, &target));
     crate::hooks::run_hook(&target, crate::hooks::HookEvent::PreRemove, &hook_env)
         .context("pre-remove hook failed; removal aborted")?;
 
@@ -1170,6 +1221,8 @@ pub fn fleet(json_output: bool) -> Result<()> {
             "runtime_id": lease.runtime_id,
             "slot": lease.slot,
             "port_base": lease.port_base.or(lease.slot.map(port_base)),
+            "owner": lease.owner,
+            "slug": branch.as_deref().map(branch_slug),
             "mode": lease.mode,
             "ephemeral": lease.ephemeral,
             "created_at_unix": lease.created_at_unix,
@@ -1212,6 +1265,7 @@ pub fn fleet(json_output: bool) -> Result<()> {
 
 fn prune(args: WorktreePrune, json: bool) -> Result<()> {
     let repo = discover_repo(&std::env::current_dir()?)?;
+    let orphaned = orphaned_registrations(&repo)?;
     run_git_common(&repo, [OsStr::new("worktree"), OsStr::new("prune")])?;
     let (generated_removed, generated_preserved) = retire_orphan_generated_runtimes(&repo)?;
     let protected: HashSet<PathBuf> = list_worktrees(&repo)?
@@ -1225,13 +1279,67 @@ fn prune(args: WorktreePrune, json: bool) -> Result<()> {
             "pruned_baselines": removed,
             "retired_generated_runtimes": generated_removed,
             "preserved_generated_paths": generated_preserved,
+            "orphaned_runtimes": orphaned,
         }));
     } else {
         println!(
-            "pruned {removed} cached baseline(s), retired {generated_removed} owned generated runtime(s), preserved {generated_preserved} ambiguous generated path(s)"
+            "pruned {removed} cached baseline(s), retired {generated_removed} owned generated runtime(s), preserved {generated_preserved} ambiguous generated path(s), reported {} orphaned runtime(s)",
+            orphaned.len()
         );
     }
     Ok(())
+}
+
+/// Registrations whose checkout disappeared outside wt0 — an `rm -rf`, a
+/// wiped temp volume, a crashed machine. The ownership marker survives in
+/// Git's administrative directory until `git worktree prune`, so this is the
+/// last moment the runtime's identity can be recovered. Each one is reported
+/// in the receipt and recorded as an `orphaned` event carrying runtime id,
+/// owner, slot, and port window, so a project can retire the external
+/// resources (databases, namespaces) that only its hooks know about; the
+/// port window is released here because no pre-remove hook will run.
+fn orphaned_registrations(repo: &RepoContext) -> Result<Vec<serde_json::Value>> {
+    let registry = repo.common_git_dir.join("worktrees");
+    let entries = match fs::read_dir(&registry) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("read worktree registry"),
+    };
+    let mut orphaned = Vec::new();
+    for entry in entries {
+        let admin = entry?.path();
+        let Ok(gitdir) = fs::read_to_string(admin.join("gitdir")) else {
+            continue;
+        };
+        let worktree = PathBuf::from(gitdir.trim())
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        if worktree.as_os_str().is_empty() || worktree.exists() {
+            continue;
+        }
+        let Ok(raw) = fs::read(admin.join("wt0-runtime.json")) else {
+            continue;
+        };
+        let Ok(marker) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let record = json!({
+            "worktree": worktree,
+            "branch": marker["branch"],
+            "runtime_id": marker["runtime_id"],
+            "owner": marker["owner"],
+            "slot": marker["slot"],
+            "port_base": marker["port_base"],
+            "generated_root": marker["runtime_id"]
+                .as_str()
+                .map(|id| generated_root_for(repo, id)),
+        });
+        crate::events::record(&repo.common_git_dir, "orphaned", record.clone());
+        ports::release(&worktree);
+        orphaned.push(record);
+    }
+    Ok(orphaned)
 }
 
 fn retire_orphan_generated_runtimes(repo: &RepoContext) -> Result<(usize, usize)> {
@@ -1455,11 +1563,10 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
         let mut hook_env = vec![
             ("WT0_WORKTREE", entry.path.display().to_string()),
             ("WT0_BRANCH", short.to_owned()),
+            ("WT0_SLUG", branch_slug(short)),
             ("WT0_REPO_ROOT", repo.top_level.display().to_string()),
         ];
-        if let Some(runtime_id) = &reaped_runtime_id {
-            hook_env.push(("WT0_RUNTIME_ID", runtime_id.clone()));
-        }
+        hook_env.extend(lease_hook_env(repo, &entry.path));
         if let Err(error) =
             crate::hooks::run_hook(&entry.path, crate::hooks::HookEvent::PreRemove, &hook_env)
         {
@@ -1588,6 +1695,129 @@ struct GeneratedRuntime {
     runtime_id: String,
     worktree: PathBuf,
     environment: Vec<(OsString, OsString)>,
+}
+
+/// Lease-derived environment for pre-remove hooks: everything a project's
+/// teardown needs to retire external state by exact identity. Empty for an
+/// unmanaged worktree.
+fn lease_hook_env(repo: &RepoContext, worktree: &Path) -> Vec<(&'static str, String)> {
+    let Ok(lease) = stored_lease(worktree) else {
+        return Vec::new();
+    };
+    let mut env = vec![("WT0_RUNTIME_ID", lease.runtime_id.clone())];
+    if let Some(slot) = lease.slot {
+        env.push(("WT0_SLOT", slot.to_string()));
+        env.push((
+            "WT0_PORT_BASE",
+            lease
+                .port_base
+                .unwrap_or_else(|| port_base(slot))
+                .to_string(),
+        ));
+    }
+    if let Some(owner) = lease.owner {
+        env.push(("WT0_OWNER", owner));
+    }
+    env.push((
+        "WT0_GENERATED_ROOT",
+        generated_root_for(repo, &lease.runtime_id)
+            .display()
+            .to_string(),
+    ));
+    env
+}
+
+/// The owned generated-runtime root is a pure function of the runtime id, so
+/// hooks can name it before `run` populates it and after the checkout is gone.
+fn generated_root_for(repo: &RepoContext, runtime_id: &str) -> PathBuf {
+    state_dir(&repo.common_git_dir)
+        .join("generated")
+        .join(runtime_id)
+}
+
+/// A URL- and label-safe form of a branch name: lowercase, runs of anything
+/// but `[a-z0-9]` collapsed to one `-`, trimmed, at most 40 characters — the
+/// shape hostnames, namespaces, and database names accept.
+pub(crate) fn branch_slug(branch: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for ch in branch.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(ch.to_ascii_lowercase());
+        } else {
+            pending_dash = true;
+        }
+        if slug.len() >= 40 {
+            break;
+        }
+    }
+    let trimmed = slug.trim_end_matches('-').to_owned();
+    if trimmed.is_empty() {
+        "branch".to_owned()
+    } else {
+        trimmed
+    }
+}
+
+/// Parse a size like `20G`, `512M`, `1T`, or a plain byte count (binary units).
+pub(crate) fn parse_bytes(raw: &str) -> Result<u64> {
+    let raw = raw.trim();
+    let (digits, unit) = raw
+        .find(|ch: char| !ch.is_ascii_digit() && ch != '.')
+        .map(|index| raw.split_at(index))
+        .unwrap_or((raw, ""));
+    let value: f64 = digits
+        .parse()
+        .with_context(|| format!("invalid size '{raw}'"))?;
+    let multiplier: f64 = match unit.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 1.0,
+        "K" | "KB" | "KIB" => 1024.0,
+        "M" | "MB" | "MIB" => 1024.0_f64.powi(2),
+        "G" | "GB" | "GIB" => 1024.0_f64.powi(3),
+        "T" | "TB" | "TIB" => 1024.0_f64.powi(4),
+        other => bail!("unknown size unit '{other}' in '{raw}'"),
+    };
+    Ok((value * multiplier) as u64)
+}
+
+/// Refuse to create below a configured free-space floor, so a fleet never
+/// pushes a machine into emergency capacity. The floor is per machine and
+/// per policy, never a literal in the tool: `--require-free` or
+/// `WT0_REQUIRE_FREE`, unset means no floor.
+fn enforce_free_disk_floor(destination_parent: &Path, requested: Option<&str>) -> Result<()> {
+    let configured = requested
+        .map(str::to_owned)
+        .or_else(|| std::env::var("WT0_REQUIRE_FREE").ok())
+        .filter(|value| !value.trim().is_empty());
+    let Some(configured) = configured else {
+        return Ok(());
+    };
+    let floor = parse_bytes(&configured)?;
+    let free = crate::runtime::filesystem_free_bytes(destination_parent)?;
+    if free < floor {
+        bail!(
+            "refusing to create: {} has {} free, below the required floor of {} ({configured})",
+            destination_parent.display(),
+            format_bytes(free),
+            format_bytes(floor)
+        );
+    }
+    Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 fn runtime_identity(worktree: &Path) -> Result<String> {
@@ -1818,6 +2048,7 @@ pub(crate) struct RuntimeLease {
     pub(crate) heartbeat_at_unix: u64,
     pub(crate) slot: u64,
     pub(crate) port_base: u64,
+    pub(crate) owner: Option<String>,
 }
 
 /// Everything a new ownership marker records about a runtime.
@@ -1829,6 +2060,7 @@ pub(crate) struct RuntimeSpec<'a> {
     pub(crate) idempotency_key: Option<&'a str>,
     pub(crate) slot: u64,
     pub(crate) port_base: u64,
+    pub(crate) owner: Option<&'a str>,
 }
 
 pub(crate) fn mark_managed(worktree: &Path, spec: &RuntimeSpec) -> Result<RuntimeLease> {
@@ -1853,6 +2085,7 @@ pub(crate) fn mark_managed(worktree: &Path, spec: &RuntimeSpec) -> Result<Runtim
             "idempotency_key": spec.idempotency_key,
             "slot": spec.slot,
             "port_base": spec.port_base,
+            "owner": spec.owner,
             "created_at_unix": now,
             "heartbeat_at_unix": now,
         }))?,
@@ -1864,6 +2097,7 @@ pub(crate) fn mark_managed(worktree: &Path, spec: &RuntimeSpec) -> Result<Runtim
         heartbeat_at_unix: now,
         slot: spec.slot,
         port_base: spec.port_base,
+        owner: spec.owner.map(str::to_owned),
     })
 }
 
@@ -1880,6 +2114,7 @@ pub(crate) struct StoredLease {
     pub(crate) idempotency_key: Option<String>,
     pub(crate) slot: Option<u64>,
     pub(crate) port_base: Option<u64>,
+    pub(crate) owner: Option<String>,
 }
 
 pub(crate) fn stored_lease(worktree: &Path) -> Result<StoredLease> {
@@ -1905,6 +2140,7 @@ pub(crate) fn stored_lease(worktree: &Path) -> Result<StoredLease> {
         idempotency_key: value["idempotency_key"].as_str().map(str::to_owned),
         slot: value["slot"].as_u64(),
         port_base: value["port_base"].as_u64(),
+        owner: value["owner"].as_str().map(str::to_owned),
     })
 }
 
