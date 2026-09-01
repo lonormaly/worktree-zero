@@ -115,6 +115,29 @@ Run in this order; each step records its instrument output verbatim.
 
 A migration that improves M1/M2 but regresses M4 or M5 is not a success.
 
+
+## Phase 0 decisions — the 25 refused worktrees
+
+Decided on 2026-09-01 by the FLAM Team session (the session that originated
+Worktree Zero), recorded in FLAM's `scratchpad/wt0-worktree-decisions.json`,
+with nothing deleted: **12 discard, 12 keep, 1 commit, 0 stash.** The zero
+stash is deliberate — FLAM's `AGENTS.md` forbids `git stash` because it hides
+shared work from its owner. wt0 must never propose automatic stash as a safe
+default.
+
+"Discard" is not raw deletion: it means the evidence (branch fully merged or
+patch-equivalent to main; dirt is dependency/`next-env` drift matching main)
+supports retiring the checkout through wt0's guarded path, with a per-worktree
+receipt, and every refusal along the way stays a refusal. The 12 keeps carry
+unmerged commits, meaningful uncommitted work, a parked multi-session
+snapshot, a live process, or are the shared main checkout. Row 22 (detached,
+dirty) gets a rescue branch before any later cleanup; row 23 (the detached
+seed snapshot in `$TMPDIR`) needs a unique-content audit first.
+
+The full handover — origin, decisions not to re-litigate, the FLAM constraints
+wt0 must not break, and the acceptance criteria — is in
+[flam-handover.md](flam-handover.md).
+
 ## After
 
 _To be filled by the same instruments once the migration lands._
