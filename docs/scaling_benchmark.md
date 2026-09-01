@@ -110,6 +110,47 @@ commit machinery from the agent hot path. VFS is not the general winner; it is
 only justified when rejecting conflicting writes synchronously is worth its
 platform and latency costs.
 
+## Complete npm agent runtime
+
+Tracked source is only one part of an agent runtime. On September 1, 2026,
+`tests/bench_agent_runtime.sh` measured four worktrees on a disposable 6 GiB
+APFS volume. Both arms warmed npm's download cache before the baseline. Each
+worktree then installed Next.js, React, TypeScript, and Zod; ran tests; changed
+source and ran tests again. Finally, one worktree installed one additional
+dependency and executed it.
+
+| Stage | Native Git + npm | Worktree Zero + npm | Physical saving |
+| --- | ---: | ---: | ---: |
+| Created | 0.36 MiB | 0.24 MiB | noise-floor result |
+| Installed and tested | 1,472.46 MiB | 370.01 MiB | 1,102.45 MiB (74.9%) |
+| Source changed and tested | 1,472.46 MiB | 370.05 MiB | 1,102.41 MiB (74.9%) |
+| One dependency changed and tested | 1,513.74 MiB | 407.07 MiB | 1,106.67 MiB (73.1%) |
+| Worktrees removed | 9.02 MiB | 358.42 MiB | see retention note |
+
+Installed-and-tested elapsed time was 25.2 seconds for native npm and 25.5
+seconds for Worktree Zero. Worktree Zero reduced physical storage without
+slowing this four-agent flow. Creation alone was 2.0 seconds native and 3.5
+seconds through Worktree Zero because strict copy-on-write performs capability,
+ownership, and source-population work before the agent starts.
+
+The final Worktree Zero figure is not an abandoned worktree. It is the single
+prepared environment retained under the repository's Worktree Zero store for
+future fleets. Native npm's download cache was already present before the
+baseline, while the prepared installed tree was deliberately cold. This is the
+conservative first-fleet result: later identical worktrees reuse those retained
+blocks. A store-retention command still needs to make expiry and reclaimed
+bytes explicit before 1.0.
+
+The same integration suite proved npm 10.9.2, pnpm 10.34.5, and Yarn 1.22.22:
+
+- the first clean worktree publishes a keyed installed environment;
+- another native worktree can be migrated and attached;
+- installed packages execute in both worktrees;
+- changing a package file in one worktree does not change another view;
+- changing one dependency derives a new key from the nearest compatible
+  environment; and
+- `wt0 doctor` accepts both the unchanged and drifted prepared environments.
+
 ## Platform behavior
 
 | OS/filesystem | `wt0 worktree` population | Result |
@@ -138,6 +179,11 @@ overheads and duplicate commit-capture costs do not apply to `wt0 worktree` now.
 ```bash
 cargo build -p worktree-zero
 bash tests/bench_scaling.sh
+
+# Complete package install + tests + source edit + dependency drift.
+# WORK must be a new empty directory on the filesystem being measured.
+WORK=/path/to/native MODE=npm ENGINE=git N=4 bash tests/bench_agent_runtime.sh
+WORK=/path/to/wt0 MODE=npm ENGINE=wt0 N=4 bash tests/bench_agent_runtime.sh
 
 # For the I/O comparison, create equivalent untouched Git and wt0 worktrees:
 python3 tests/bench_worktree_io.py /path/to/git-wt /path/to/wt0-wt

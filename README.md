@@ -8,9 +8,8 @@ changes. Git already shares repository objects and history. Worktree Zero owns
 the remaining checked-out files, dependency layouts, generated caches,
 runtime-owned storage, storage leases, measurements, and cleanup.
 
-> Status: design-partner phase. The repository now contains the proven
-> copy-on-write engine previously published as `simgit`; it is being integrated
-> into the single `wt0` lifecycle. There is no stable Worktree Zero release yet.
+> Status: design-partner phase with signed, checksummed macOS and Linux
+> releases. FLAM and Builders Stack are the first measured design partners.
 
 ## One product
 
@@ -37,8 +36,48 @@ Worktree Zero will:
 8. remove only generated state carrying Worktree Zero ownership evidence; and
 9. recover marked orphan storage after an agent or machine crash.
 
-The same versioned result is available through the CLI's JSON output and the
-Worktree Zero MCP server.
+The shipped portable skill and JSON CLI are the current stable agent
+interfaces. The same versioned result will also be available through the
+planned Worktree Zero MCP server.
+
+Before creating a runtime, an agent can discover exactly what this installation
+can do:
+
+```bash
+wt0 capabilities --json
+```
+
+The result names the selected source backend, the detected package manager,
+generated-state tools such as Nx or Next.js, and the common agent hosts that
+can call the same non-interactive protocol. A planned adapter is reported as
+planned; it never silently becomes a successful readiness check.
+
+### Install for an agent
+
+The skill follows the open Agent Skills layout. Hosts that discover
+`.agents/skills` can use it directly:
+
+```bash
+npx skills add lonormaly/worktree-zero --skill worktree-zero
+```
+
+Codex and Claude Code also receive native, versioned plugin manifests from this
+same repository:
+
+```bash
+# Codex
+codex plugin marketplace add lonormaly/worktree-zero --ref main
+codex plugin add worktree-zero@worktree-zero
+
+# Claude Code
+claude plugin marketplace add lonormaly/worktree-zero
+claude plugin install worktree-zero@worktree-zero
+```
+
+Gemini CLI, GitHub Copilot, Cursor, OpenCode, Grok, NanoClaw, OpenClaw,
+Hermes, Slack agents, and other headless workers use the same portable skill
+and `wt0 ... --json` commands. Their wrappers may translate transport and
+installation, but must not reimplement cleanup or weaken a refusal.
 
 ## What was already solved
 
@@ -55,6 +94,26 @@ publishes only the `wt0` interface.
 The source engine began in [simgit](https://github.com/abendrothj/simgit) by
 Jake Abendroth and is included under the MIT license with its Git history and
 copyright preserved.
+
+### Package managers are adapters, not prerequisites
+
+Worktree Zero does not require Bun:
+
+| Project evidence | Native feature retained | What Worktree Zero adds |
+| --- | --- | --- |
+| `bun.lock` + `bunfig.toml` | Bun isolated global store | verifies Bun 1.3.14+, then attaches a private CoW post-install environment |
+| `pnpm-lock.yaml` | pnpm content-addressable store | keeps the store and shares the remaining installed-tree view |
+| `package-lock.json` | npm download cache | supplies the missing global prepared `node_modules` environment |
+| `yarn.lock` + node-modules linker | Yarn cache | shares the installed-tree view |
+| Yarn PnP or zero-install | repository-native dependency map/archive | leaves it native; no redundant `node_modules` layer |
+
+The environment key includes the manager and version, operating-system and ABI
+identity, tracked lockfile, every tracked package manifest, manager settings,
+and patches. If one agent changes one dependency, the old environment remains
+useful to every unchanged branch. Worktree Zero clones the nearest compatible
+snapshot, lets the package manager reconcile the changed lockfile, verifies
+that the lockfile did not move, and publishes a new immutable key. It does not
+duplicate the entire history of every lockfile into every worktree.
 
 ## The actual disk problem
 

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "worktree-zero",
+  "description": "Official Worktree Zero agent integration.",
+  "owner": {
+    "name": "Worktree Zero contributors"
+  },
+  "plugins": [
+    {
+      "name": "worktree-zero",
+      "displayName": "Worktree Zero",
+      "description": "Thin, safe worktrees for coding agents.",
+      "source": "./",
+      "category": "Developer Tools",
+      "tags": ["git", "worktrees", "agents", "storage"]
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "name": "worktree-zero",
+  "version": "0.1.8",
+  "description": "Create, prepare, measure, migrate, and safely remove thin coding-agent worktrees.",
+  "author": {
+    "name": "Worktree Zero contributors",
+    "url": "https://github.com/lonormaly/worktree-zero"
+  },
+  "homepage": "https://github.com/lonormaly/worktree-zero",
+  "repository": "https://github.com/lonormaly/worktree-zero",
+  "license": "MIT",
+  "keywords": ["git", "worktree", "agents", "copy-on-write", "storage"],
+  "skills": "./.agents/skills/",
+  "interface": {
+    "displayName": "Worktree Zero",
+    "shortDescription": "Thin, safe worktrees for coding agents",
+    "longDescription": "Use one guarded lifecycle for copy-on-write source, prepared dependencies, leases, measurement, migration, and cleanup.",
+    "developerName": "Worktree Zero contributors",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://github.com/lonormaly/worktree-zero",
+    "defaultPrompt": [
+      "Create a thin worktree for this task.",
+      "Audit and safely migrate this repository's existing worktrees."
+    ],
+    "brandColor": "#111111"
+  }
+}

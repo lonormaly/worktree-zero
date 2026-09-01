@@ -74,11 +74,22 @@ struct GeneratedStorage {
     wrangler: u64,
     runtime: u64,
     build: u64,
+    cargo: u64,
+    python: u64,
+    java: u64,
 }
 
 impl GeneratedStorage {
     fn total(&self) -> u64 {
-        self.next + self.nx + self.turbo + self.wrangler + self.runtime + self.build
+        self.next
+            + self.nx
+            + self.turbo
+            + self.wrangler
+            + self.runtime
+            + self.build
+            + self.cargo
+            + self.python
+            + self.java
     }
 }
 
@@ -88,20 +99,39 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let dependencies = dependency_storage(&root)?;
     let generated = generated_storage(&root)?;
     let bun = bun_report(&root);
-    let stale = dependencies.bun_backups + dependencies.materialized_root_entries;
-    let prepared_key = bun
-        .as_ref()
-        .and_then(|report| report.version.as_deref())
-        .and_then(|version| bun_environment_key(&root, version).ok());
+    let javascript_manager = javascript_package_manager(&root)?;
+    let stale = if javascript_manager.as_deref() == Some("bun") {
+        dependencies.bun_backups + dependencies.materialized_root_entries
+    } else {
+        0
+    };
+    let manager_version = javascript_manager
+        .as_deref()
+        .and_then(|manager| package_manager_version(manager).ok());
+    let prepared_key = javascript_manager
+        .as_deref()
+        .zip(manager_version.as_deref())
+        .and_then(|(manager, version)| package_environment_key(&root, manager, version).ok());
     let prepared_attached = prepared_key
         .as_deref()
         .is_some_and(|key| prepared_marker_key(&root).ok().flatten().as_deref() == Some(key));
     let bun_links_ready = has_global_links(&root).unwrap_or(false);
-    let dependency_ready = bun.as_ref().is_none_or(|report| {
-        report.configured
-            && report.version.as_deref().is_some_and(bun_version_supported)
-            && bun_links_ready
-    }) && stale == 0
+    let dependency_adapter_shipped = javascript_manager
+        .as_deref()
+        .is_none_or(|manager| matches!(manager, "bun" | "npm" | "pnpm" | "yarn"));
+    let manager_ready = match javascript_manager.as_deref() {
+        None => true,
+        Some("bun") => bun.as_ref().is_some_and(|report| {
+            report.configured
+                && report.version.as_deref().is_some_and(bun_version_supported)
+                && bun_links_ready
+        }),
+        Some("yarn") if yarn_uses_pnp(&root) => true,
+        Some(_) => root.join("node_modules").is_dir() && prepared_attached,
+    };
+    let dependency_ready = dependency_adapter_shipped
+        && manager_ready
+        && stale == 0
         && (dependencies.materialized_store_entries == 0 || prepared_attached);
     let generated_ready = generated.total() <= DEFAULT_GENERATED_BUDGET_BYTES;
     let ready = dependency_ready && generated_ready;
@@ -117,6 +147,9 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
             "logical_measurement": "recursive-file-bytes"
         },
         "dependencies": {
+            "javascript_package_manager": javascript_manager,
+            "package_manager_version": manager_version,
+            "adapter_shipped": dependency_adapter_shipped,
             "bun": bun.map(|report| json!({
                 "configured": report.configured,
                 "supported_version": report.version.as_deref().is_some_and(bun_version_supported),
@@ -141,6 +174,9 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
             "wrangler_bytes": generated.wrangler,
             "runtime_bytes": generated.runtime,
             "build_bytes": generated.build,
+            "cargo_target_bytes": generated.cargo,
+            "python_environment_bytes": generated.python,
+            "java_build_bytes": generated.java,
         }
     });
 
@@ -160,6 +196,12 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
         println!("  ready:             {}", if ready { "yes" } else { "no" });
         if stale > 0 {
             println!("  action: run a reviewed Worktree Zero dependency repair before agent work");
+        }
+        if !dependency_adapter_shipped {
+            println!(
+                "  action: {} adapter is detected but not shipped yet; refusing a false ready result",
+                javascript_manager.as_deref().unwrap_or("package-manager")
+            );
         }
         if dependencies.materialized_store_entries > 0 && !prepared_attached {
             println!(
@@ -304,21 +346,31 @@ fn migrate_one(
         .and_then(|paths| paths.iter().find(|path| path.starts_with(root)))
         .map(|path| path.display().to_string());
     let dependencies_before = dependency_storage(root)?;
-    let stale_before =
-        dependencies_before.bun_backups + dependencies_before.materialized_root_entries;
     let generated = generated_storage(root)?;
     let bun = bun_report(root);
-    let prepared_key = match bun.as_ref().and_then(|report| report.version.as_deref()) {
-        Some(version) if root.join("package.json").is_file() => {
-            Some(bun_environment_key(root, version)?)
-        }
-        _ => None,
+    let manager = javascript_package_manager(root)?;
+    let stale_before = if manager.as_deref() == Some("bun") {
+        dependencies_before.bun_backups + dependencies_before.materialized_root_entries
+    } else {
+        0
     };
+    let manager_version = manager
+        .as_deref()
+        .and_then(|manager| package_manager_version(manager).ok());
+    let prepared_key = manager
+        .as_deref()
+        .zip(manager_version.as_deref())
+        .map(|(manager, version)| package_environment_key(root, manager, version))
+        .transpose()?;
     let prepared_attached = prepared_key
         .as_deref()
         .is_some_and(|key| prepared_marker_key(root).ok().flatten().as_deref() == Some(key));
-    let needs_prepared_environment =
-        dependencies_before.materialized_store_entries > 0 && !prepared_attached;
+    let needs_prepared_environment = match manager.as_deref() {
+        None => false,
+        Some("yarn") if yarn_uses_pnp(root) => false,
+        Some("bun") => dependencies_before.materialized_store_entries > 0 && !prepared_attached,
+        Some(_) => !prepared_attached,
+    };
     let source_before = worktree::migrate_identical_source(root, baseline_ref, false)?;
     let repo = worktree::discover_repo(root)?;
     let cow_supported = worktree::cow::clone_supported(&repo.common_git_dir, root)?;
@@ -331,7 +383,7 @@ fn migrate_one(
         actions.push("repair_bun_dependency_layout");
     }
     if !source_only && needs_prepared_environment {
-        actions.push("attach_prepared_bun_environment");
+        actions.push("attach_prepared_package_environment");
     }
     if adopt && !worktree::is_managed(root) {
         actions.push("adopt_worktree_ownership");
@@ -351,13 +403,16 @@ fn migrate_one(
         blockers.push("copy-on-write source cloning unsupported".to_string());
     }
     if !source_only && (stale_before > 0 || needs_prepared_environment) {
-        match &bun {
-            Some(report)
-                if report.configured
-                    && report.version.as_deref().is_some_and(bun_version_supported) => {}
-            Some(_) => blockers.push("Bun isolated global store is not ready".to_string()),
-            None => blockers
-                .push("stale dependency layout has no supported manager adapter".to_string()),
+        match manager.as_deref() {
+            Some("bun")
+                if bun.as_ref().is_some_and(|report| {
+                    report.configured
+                        && report.version.as_deref().is_some_and(bun_version_supported)
+                }) => {}
+            Some("bun") => blockers.push("Bun isolated global store is not ready".to_string()),
+            Some("npm" | "pnpm" | "yarn") if manager_version.is_some() => {}
+            Some(manager) => blockers.push(format!("{manager} executable is unavailable")),
+            None => blockers.push("no supported package-manager adapter was detected".to_string()),
         }
         if !node_modules_ignored(root)? {
             blockers.push("node_modules is not ignored".to_string());
@@ -396,10 +451,17 @@ fn migrate_one(
             let key = prepared_key
                 .as_deref()
                 .context("prepared environment has no complete identity")?;
-            let report = bun
-                .as_ref()
-                .context("prepared environment has no Bun adapter")?;
-            prepare_bun_environment(root, key, report.version.as_deref().unwrap_or_default())?;
+            let selected = manager
+                .as_deref()
+                .context("prepared environment has no package-manager adapter")?;
+            let version = manager_version
+                .as_deref()
+                .context("prepared environment has no package-manager version")?;
+            if selected == "bun" {
+                prepare_bun_environment(root, key, version)?;
+            } else {
+                prepare_portable_node_environment(root, selected, key, version)?;
+            }
         }
         if adopt && !worktree::is_managed(root) {
             let branch = worktree_branch_label(root)?;
@@ -426,7 +488,8 @@ fn migrate_one(
             "applied_files": source_after.as_ref().map(|report| report.applied_files).unwrap_or(0),
         },
         "dependencies": {
-            "adapter": bun.as_ref().map(|_| "bun"),
+            "adapter": manager,
+            "manager_version": manager_version,
             "stale_logical_bytes": stale_before,
             "remaining_stale_logical_bytes": stale_after,
             "bun_backup_bytes": dependencies_before.bun_backups,
@@ -446,8 +509,29 @@ fn migrate_one(
 pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
     let requested = args.path.unwrap_or(std::env::current_dir()?);
     let root = git_root(&requested)?;
-    assert_node_modules_ignored(&root)?;
-    let bun = bun_report(&root).context("Bun project configuration was not found")?;
+    let manager = javascript_package_manager(&root)?
+        .context("no JavaScript package-manager lockfile was found")?;
+    if manager == "yarn" && yarn_uses_pnp(&root) {
+        emit_prepare(
+            json_output,
+            &root,
+            false,
+            0,
+            None,
+            None,
+            "Yarn Plug'n'Play or zero-install is already repository-native; no node_modules environment is needed",
+        )?;
+        return Ok(());
+    }
+    if manager != "bun" {
+        return prepare_node_environment(&root, &manager, args.apply, json_output);
+    }
+    prepare_bun(&root, args.apply, json_output)
+}
+
+fn prepare_bun(root: &Path, apply: bool, json_output: bool) -> Result<()> {
+    assert_node_modules_ignored(root)?;
+    let bun = bun_report(root).context("Bun project configuration was not found")?;
     if !bun.configured {
         bail!("Bun must use linker=isolated and globalStore=true before repair");
     }
@@ -457,11 +541,11 @@ pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
         bail!("Bun 1.3.14 or newer is required for the isolated global store");
     }
 
-    let before = dependency_storage(&root)?;
+    let before = dependency_storage(root)?;
     let stale = before.bun_backups + before.materialized_root_entries;
     let environment_key = if root.join("package.json").is_file() {
         Some(bun_environment_key(
-            &root,
+            root,
             bun.version
                 .as_deref()
                 .context("Bun executable was not found")?,
@@ -469,10 +553,10 @@ pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
     } else {
         None
     };
-    if !args.apply {
+    if !apply {
         emit_prepare(
             json_output,
-            &root,
+            root,
             false,
             stale,
             environment_key.as_deref(),
@@ -481,7 +565,7 @@ pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
         )?;
         return Ok(());
     }
-    let dirty_entries = git_dirty_count(&root)?;
+    let dirty_entries = git_dirty_count(root)?;
     if dirty_entries > 0 {
         bail!("refusing dependency repair in dirty worktree ({dirty_entries} entries)");
     }
@@ -492,24 +576,24 @@ pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
         }
     }
     if stale > 0 {
-        repair_dependency_layout(&root, &before)?;
+        repair_dependency_layout(root, &before)?;
     }
 
-    let physical_before = filesystem_free_bytes(&root)?;
+    let physical_before = filesystem_free_bytes(root)?;
     let prepared = environment_key
         .as_deref()
-        .map(|key| prepare_bun_environment(&root, key, bun.version.as_deref().unwrap_or_default()))
+        .map(|key| prepare_bun_environment(root, key, bun.version.as_deref().unwrap_or_default()))
         .transpose()?;
-    let physical_after = filesystem_free_bytes(&root)?;
+    let physical_after = filesystem_free_bytes(root)?;
 
-    let after = dependency_storage(&root)?;
+    let after = dependency_storage(root)?;
     let remaining = after.bun_backups + after.materialized_root_entries;
     if remaining > 0 {
         bail!("dependency repair left {remaining} stale logical bytes");
     }
     emit_prepare(
         json_output,
-        &root,
+        root,
         true,
         stale,
         prepared
@@ -521,6 +605,199 @@ pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
             .map(|environment| environment.action)
             .unwrap_or("stale dependency layout retired after verification"),
     )
+}
+
+fn prepare_node_environment(
+    root: &Path,
+    manager: &str,
+    apply: bool,
+    json_output: bool,
+) -> Result<()> {
+    assert_node_modules_ignored(root)?;
+    let version = package_manager_version(manager)?;
+    let key = package_environment_key(root, manager, &version)?;
+    if !apply {
+        emit_prepare(
+            json_output,
+            root,
+            false,
+            logical_bytes(&root.join("node_modules"))?,
+            Some(&key),
+            None,
+            "dry run; repeat with --apply after reviewing the exact target",
+        )?;
+        return Ok(());
+    }
+    let dirty_entries = git_dirty_count(root)?;
+    if dirty_entries > 0 {
+        bail!("refusing dependency preparation in dirty worktree ({dirty_entries} entries)");
+    }
+    let modules = root.join("node_modules");
+    if modules.exists() {
+        if let Some(path) = live_open_path(&modules)? {
+            bail!("refusing dependency preparation while a process uses {path}");
+        }
+    }
+
+    let physical_before = filesystem_free_bytes(root)?;
+    let prepared = prepare_portable_node_environment(root, manager, &key, &version)?;
+    let physical_after = filesystem_free_bytes(root)?;
+    emit_prepare(
+        json_output,
+        root,
+        true,
+        logical_bytes(&root.join("node_modules"))?,
+        Some(&prepared.key),
+        Some(i128::from(physical_after) - i128::from(physical_before)),
+        prepared.action,
+    )
+}
+
+fn prepare_portable_node_environment(
+    root: &Path,
+    manager: &str,
+    key: &str,
+    version: &str,
+) -> Result<PreparedEnvironment> {
+    let store = prepared_environment_store(root)?;
+    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let family = store.join(manager).join(&platform);
+    let exact = family.join(key);
+    let exact_modules = exact.join("node_modules");
+    if exact.join("ready").is_file() && exact_modules.is_dir() {
+        if prepared_marker_key(root)?.as_deref() == Some(key) {
+            return Ok(PreparedEnvironment {
+                key: key.to_owned(),
+                action: "prepared environment already attached",
+            });
+        }
+        attach_portable_node_environment(root, &exact_modules, manager, key, version, false)?;
+        return Ok(PreparedEnvironment {
+            key: key.to_owned(),
+            action: "attached exact prepared environment",
+        });
+    }
+    if exact.exists() {
+        bail!(
+            "prepared environment is incomplete: {}; remove it only after inspection",
+            exact.display()
+        );
+    }
+
+    let platform_identity = platform_identity()?;
+    let parent = newest_manager_environment(&family, manager, version, &platform_identity)?;
+    if let Some(parent) = &parent {
+        attach_portable_node_environment(
+            root,
+            &parent.join("node_modules"),
+            manager,
+            key,
+            version,
+            true,
+        )?;
+    } else {
+        run_package_manager_install(root, manager, version)?;
+        write_prepared_marker_for(root, manager, key, version)?;
+    }
+    validate_environment_links(root, &root.join("node_modules"))?;
+    publish_manager_environment(root, &family, manager, key, version, &platform_identity)?;
+    Ok(PreparedEnvironment {
+        key: key.to_owned(),
+        action: if parent.is_some() {
+            "derived and sealed a prepared environment from the nearest compatible snapshot"
+        } else {
+            "sealed the first prepared environment for this platform"
+        },
+    })
+}
+
+fn attach_portable_node_environment(
+    root: &Path,
+    source_modules: &Path,
+    manager: &str,
+    key: &str,
+    version: &str,
+    reconcile: bool,
+) -> Result<()> {
+    let modules = root.join("node_modules");
+    let parent = root.parent().context("worktree root has no parent")?;
+    let rollback = parent.join(format!(".wt0-environment-rollback-{}", Uuid::now_v7()));
+    let had_modules = modules.exists();
+    if had_modules {
+        fs::rename(&modules, &rollback).context("move dependency tree into exact rollback")?;
+    }
+    let attempt = (|| -> Result<()> {
+        fs::create_dir(&modules).context("create private prepared-environment view")?;
+        worktree::cow::clone_tree(source_modules, &modules)
+            .context("attach copy-on-write prepared environment")?;
+        if reconcile {
+            run_package_manager_install(root, manager, version)?;
+        }
+        write_prepared_marker_for(root, manager, key, version)?;
+        validate_environment_links(root, &modules)
+    })();
+    if let Err(error) = attempt {
+        if modules.exists() {
+            fs::remove_dir_all(&modules).context("remove failed prepared-environment view")?;
+        }
+        if had_modules {
+            fs::rename(&rollback, &modules).context("restore dependency rollback")?;
+        }
+        return Err(error.context("prepared-environment attach failed; original tree restored"));
+    }
+    if had_modules {
+        fs::remove_dir_all(&rollback).context("retire verified dependency rollback")?;
+    }
+    Ok(())
+}
+
+fn run_package_manager_install(root: &Path, manager: &str, version: &str) -> Result<()> {
+    let (program, args): (&str, Vec<&str>) = match manager {
+        "npm" => ("npm", vec!["install", "--no-audit", "--no-fund"]),
+        "pnpm" => ("pnpm", vec!["install", "--frozen-lockfile"]),
+        "yarn" if version.starts_with("1.") => ("yarn", vec!["install", "--frozen-lockfile"]),
+        "yarn" => ("yarn", vec!["install", "--immutable"]),
+        _ => bail!("no portable node_modules adapter exists for {manager}"),
+    };
+    let lock = manager_lockfile(root, manager)?;
+    let lock_before = fs::read(&lock).with_context(|| format!("read {}", lock.display()))?;
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("run {manager} prepared-environment install"))?;
+    let lock_after = fs::read(&lock).with_context(|| format!("read {}", lock.display()))?;
+    if lock_after != lock_before {
+        fs::write(&lock, lock_before).context("restore lockfile changed by preparation")?;
+        bail!("{manager} changed the tracked lockfile; preparation requires a current immutable lockfile");
+    }
+    if !output.status.success() {
+        bail!(
+            "{manager} install exited with {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if !root.join("node_modules").is_dir() {
+        bail!("{manager} did not create node_modules; use its native PnP/zero-install adapter instead");
+    }
+    Ok(())
+}
+
+fn manager_lockfile(root: &Path, manager: &str) -> Result<PathBuf> {
+    let candidates: &[&str] = match manager {
+        "npm" => &["package-lock.json", "npm-shrinkwrap.json"],
+        "pnpm" => &["pnpm-lock.yaml"],
+        "yarn" => &["yarn.lock"],
+        "bun" => &["bun.lock", "bun.lockb"],
+        _ => bail!("no lockfile contract exists for {manager}"),
+    };
+    candidates
+        .iter()
+        .map(|name| root.join(name))
+        .find(|path| path.is_file())
+        .with_context(|| format!("{manager} lockfile was not found"))
 }
 
 fn repair_dependency_layout(root: &Path, before: &DependencyStorage) -> Result<()> {
@@ -767,6 +1044,214 @@ fn bun_environment_key(root: &Path, bun_version: &str) -> Result<String> {
     Ok(key)
 }
 
+fn package_environment_key(root: &Path, manager: &str, version: &str) -> Result<String> {
+    if manager == "bun" {
+        return bun_environment_key(root, version);
+    }
+    let lock = manager_lockfile(root, manager)?;
+    let output = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(root)
+        .output()
+        .context("list tracked prepared-environment inputs")?;
+    if !output.status.success() {
+        bail!("git ls-files failed while computing the prepared-environment identity");
+    }
+    let mut inputs = Vec::new();
+    for raw in output.stdout.split(|byte| *byte == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let relative = PathBuf::from(
+            std::str::from_utf8(raw).context("non-UTF-8 package input path is unsupported")?,
+        );
+        let name = relative.file_name().and_then(|name| name.to_str());
+        let relevant = matches!(
+            name,
+            Some(
+                "package.json"
+                    | "package-lock.json"
+                    | "npm-shrinkwrap.json"
+                    | "pnpm-lock.yaml"
+                    | "pnpm-workspace.yaml"
+                    | "yarn.lock"
+                    | ".npmrc"
+                    | ".yarnrc"
+                    | ".yarnrc.yml"
+            )
+        ) || relative.starts_with("patches")
+            || relative.starts_with(".yarn/patches")
+            || relative.starts_with(".yarn/plugins");
+        if relevant {
+            inputs.push(relative);
+        }
+    }
+    inputs.sort();
+    let relative_lock = lock
+        .strip_prefix(root)
+        .context("package lockfile is outside the worktree")?;
+    if !inputs.iter().any(|path| path == relative_lock) {
+        bail!(
+            "{} must be tracked before preparing an environment",
+            relative_lock.display()
+        );
+    }
+
+    let mut child = Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("start prepared-environment identity hash")?;
+    {
+        let mut input = child.stdin.take().context("open identity hash input")?;
+        writeln!(input, "wt0-node-environment-v1")?;
+        writeln!(input, "manager={manager}")?;
+        writeln!(input, "version={version}")?;
+        writeln!(input, "os={}", std::env::consts::OS)?;
+        writeln!(input, "arch={}", std::env::consts::ARCH)?;
+        writeln!(input, "platform={}", platform_identity()?)?;
+        writeln!(input, "flags=immutable-lockfile,private-cow-view")?;
+        for relative in inputs {
+            let contents = fs::read(root.join(&relative))
+                .with_context(|| format!("read identity input {}", relative.display()))?;
+            writeln!(
+                input,
+                "path={} bytes={}",
+                relative.display(),
+                contents.len()
+            )?;
+            input.write_all(&contents)?;
+            input.write_all(b"\n")?;
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .context("finish environment identity hash")?;
+    if !output.status.success() {
+        bail!("git hash-object failed while computing the environment identity");
+    }
+    let key = String::from_utf8(output.stdout)?.trim().to_owned();
+    if key.is_empty() || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("Git returned an invalid prepared-environment identity");
+    }
+    Ok(key)
+}
+
+fn package_manager_version(manager: &str) -> Result<String> {
+    let output = Command::new(manager)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("{manager} executable was not found"))?;
+    if !output.status.success() {
+        bail!("{manager} --version failed");
+    }
+    let version = String::from_utf8(output.stdout)?.trim().to_owned();
+    if version.is_empty() {
+        bail!("{manager} returned an empty version");
+    }
+    Ok(version)
+}
+
+fn yarn_uses_pnp(root: &Path) -> bool {
+    root.join(".pnp.cjs").is_file()
+        || root.join(".pnp.js").is_file()
+        || fs::read_to_string(root.join(".yarnrc.yml"))
+            .ok()
+            .is_some_and(|config| config.lines().any(|line| line.trim() == "nodeLinker: pnp"))
+}
+
+fn newest_manager_environment(
+    family: &Path,
+    manager: &str,
+    version: &str,
+    platform_identity: &str,
+) -> Result<Option<PathBuf>> {
+    let entries = match fs::read_dir(family) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read prepared-environment family"),
+    };
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries {
+        let path = entry?.path();
+        let ready = path.join("ready");
+        let manifest = path.join("manifest.json");
+        if !ready.is_file() || !path.join("node_modules").is_dir() || !manifest.is_file() {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(&fs::read(&manifest)?)
+            .with_context(|| format!("read prepared manifest {}", manifest.display()))?;
+        if value["adapter"].as_str() != Some(manager)
+            || value["manager_version"].as_str() != Some(version)
+            || value["platform_identity"].as_str() != Some(platform_identity)
+        {
+            continue;
+        }
+        let modified = ready
+            .metadata()?
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if newest
+            .as_ref()
+            .is_none_or(|(current, _)| modified > *current)
+        {
+            newest = Some((modified, path));
+        }
+    }
+    Ok(newest.map(|(_, path)| path))
+}
+
+fn publish_manager_environment(
+    root: &Path,
+    family: &Path,
+    manager: &str,
+    key: &str,
+    version: &str,
+    platform_identity: &str,
+) -> Result<()> {
+    fs::create_dir_all(family)?;
+    let final_dir = family.join(key);
+    if final_dir.join("ready").is_file() && final_dir.join("node_modules").is_dir() {
+        return Ok(());
+    }
+    if final_dir.exists() {
+        bail!(
+            "refusing incomplete prepared environment: {}",
+            final_dir.display()
+        );
+    }
+    let temporary = family.join(format!(".{key}.{}", Uuid::now_v7()));
+    let payload = temporary.join("payload");
+    fs::create_dir_all(&payload)?;
+    let result = (|| -> Result<()> {
+        let payload_modules = payload.join("node_modules");
+        fs::create_dir(&payload_modules)?;
+        worktree::cow::clone_tree(&root.join("node_modules"), &payload_modules)?;
+        fs::write(
+            payload.join("manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "adapter": manager,
+                "key": key,
+                "manager_version": version,
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "platform_identity": platform_identity,
+            }))?,
+        )?;
+        fs::write(payload.join("ready"), format!("{key}\n"))?;
+        match fs::rename(&payload, &final_dir) {
+            Ok(()) => Ok(()),
+            Err(_) if final_dir.join("ready").is_file() => Ok(()),
+            Err(error) => Err(error).context("publish prepared environment"),
+        }
+    })();
+    let _ = fs::remove_dir_all(&temporary);
+    result
+}
+
 fn newest_prepared_environment(
     family: &Path,
     bun_version: &str,
@@ -925,13 +1410,22 @@ fn prepared_marker_key(root: &Path) -> Result<Option<String>> {
 }
 
 fn write_prepared_marker(root: &Path, key: &str, bun_version: &str) -> Result<()> {
+    write_prepared_marker_for(root, "bun", key, bun_version)
+}
+
+fn write_prepared_marker_for(
+    root: &Path,
+    manager: &str,
+    key: &str,
+    manager_version: &str,
+) -> Result<()> {
     fs::write(
         root.join("node_modules/.wt0-environment.json"),
         serde_json::to_vec_pretty(&json!({
             "schema_version": 1,
-            "adapter": "bun",
+            "adapter": manager,
             "key": key,
-            "bun_version": bun_version,
+            "manager_version": manager_version,
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
         }))?,
@@ -1151,6 +1645,33 @@ fn bun_report(root: &Path) -> Option<BunReport> {
     })
 }
 
+fn javascript_package_manager(root: &Path) -> Result<Option<String>> {
+    let candidates = [
+        ("bun", ["bun.lock", "bun.lockb"].as_slice()),
+        ("pnpm", ["pnpm-lock.yaml"].as_slice()),
+        ("yarn", ["yarn.lock"].as_slice()),
+        (
+            "npm",
+            ["package-lock.json", "npm-shrinkwrap.json"].as_slice(),
+        ),
+    ];
+    let detected = candidates
+        .iter()
+        .filter(|(_, files)| files.iter().any(|file| root.join(file).is_file()))
+        .map(|(manager, _)| *manager)
+        .collect::<Vec<_>>();
+    if detected.len() > 1 {
+        bail!(
+            "multiple JavaScript package-manager lockfiles detected ({}); remove stale lockfiles or configure an explicit adapter",
+            detected.join(", ")
+        );
+    }
+    if detected.is_empty() && root.join("package.json").is_file() {
+        bail!("package.json exists without a supported lockfile; a reproducible prepared environment cannot be proven");
+    }
+    Ok(detected.first().map(|manager| (*manager).to_owned()))
+}
+
 fn git_root(requested: &Path) -> Result<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -1314,6 +1835,28 @@ fn generated_storage(root: &Path) -> Result<GeneratedStorage> {
         nx: logical_bytes(&root.join(".nx"))?,
         turbo: logical_bytes(&root.join(".turbo"))?,
         runtime: logical_bytes(&root.join(".immorterm"))?,
+        cargo: if root.join("Cargo.toml").is_file() {
+            logical_bytes(&root.join("target"))?
+        } else {
+            0
+        },
+        python: [".venv", "venv"]
+            .iter()
+            .map(|path| logical_bytes(&root.join(path)))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .sum(),
+        java: logical_bytes(&root.join(".gradle"))?
+            + if root.join("build.gradle").is_file() || root.join("build.gradle.kts").is_file() {
+                logical_bytes(&root.join("build"))?
+            } else {
+                0
+            }
+            + if root.join("pom.xml").is_file() {
+                logical_bytes(&root.join("target"))?
+            } else {
+                0
+            },
         ..GeneratedStorage::default()
     };
     for parent in ["apps", "services", "libs", "packages"] {

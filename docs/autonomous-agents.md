@@ -58,12 +58,13 @@ Every supported autonomous integration must prove this flow end to end:
 
 The test must run without a person pressing a button after setup.
 
-## Planned command surface
+## Command surface
 
-The v0.1.6 lifecycle ships path/branch-based ownership records, automatic
-30-second heartbeats for `wt0 run`, explicit `wt0 heartbeat`, and GC refusal for
-unowned, dirty, active, unknown-state, or detached worktrees. Runtime-ID lookup,
-idempotent create, MCP transport, and vendor packages remain planned.
+The current lifecycle ships capability discovery, path/branch-based ownership
+records, automatic 30-second heartbeats for `wt0 run`, explicit
+`wt0 heartbeat`, and GC refusal for unowned, dirty, active, unknown-state, or
+detached worktrees. Runtime-ID lookup, idempotent create, MCP transport, and
+vendor packages remain planned.
 
 ```text
 wt0 capabilities --json
@@ -78,4 +79,7 @@ wt0 gc --apply --json
 wt0 mcp serve
 ```
 
-This is a contract, not a shipped-command claim. The design-partner phase will turn each operation into tested behavior before the first stable release.
+Only `capabilities`, path-based create/run/remove/list, heartbeat, doctor,
+prepare, migrate, and guarded GC are shipped today. The remaining lines are the
+contract that vendor adapters must target; documentation must not present them
+as available commands before their tests pass.

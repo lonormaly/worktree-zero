@@ -53,3 +53,20 @@ python3 tests/bench_worktree_io.py   # hot-cache stat/read/write cost
 ```
 
 Run benchmarks against disposable repositories only.
+
+## Package-manager adapters
+
+The npm, pnpm, and Yarn integration test creates clean disposable repositories,
+publishes one prepared environment, migrates another worktree, checks private
+mutation, changes one dependency, executes both environments, and runs
+`wt0 doctor`:
+
+```bash
+cargo build
+tests/prepared_node_integration.sh npm
+tests/prepared_node_integration.sh pnpm
+tests/prepared_node_integration.sh yarn
+```
+
+`tests/prepared_bun_integration.sh` covers Bun separately because Bun's
+isolated global store has its own version and link verification rules.
