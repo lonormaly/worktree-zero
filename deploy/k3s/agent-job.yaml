@@ -1,0 +1,45 @@
+# One agent sandbox: the shared store mounted read-only, a node-local
+# workspace, and the complete guarded lifecycle through `wt0 run`. The
+# idempotency key ties the runtime to this Job, so a retried pod resumes
+# instead of creating a second runtime.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wt0-agent-example
+  labels:
+    app.kubernetes.io/part-of: worktree-zero
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: agent
+          image: ghcr.io/example/wt0-agent:latest
+          env:
+            - name: REPO_URL
+              value: "https://github.com/example/project.git"
+            - name: TASK_BRANCH
+              value: "agent/example-task"
+            - name: WT0_STORE
+              value: /store
+            - name: JOB_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              git clone "$REPO_URL" /work/repo
+              cd /work/repo
+              wt0 run "$TASK_BRANCH" --idempotency-key "$JOB_UID" -- \
+                sh -c 'echo replace this with the agent command'
+          volumeMounts:
+            - { name: store, mountPath: /store, readOnly: true }
+            - { name: work, mountPath: /work }
+      volumes:
+        - name: store
+          persistentVolumeClaim:
+            claimName: wt0-store
+        - name: work
+          emptyDir: {}

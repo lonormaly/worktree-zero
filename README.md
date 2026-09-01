@@ -447,6 +447,18 @@ a 60.4% total reduction. Each additional Btrfs reflink environment cost about
 reduction. Linux overlay-backed prepared environments remain an optimization
 target because they can avoid much of that repeated directory metadata.
 
+## Cloud fleets and per-worktree test environments
+
+Multi-agent fleets increasingly run in the cloud. The
+[cloud architecture RFC](docs/cloud-architecture.md) defines how the same
+immutable stores serve Kubernetes/k3s sandboxes — shared read-only stores,
+node-local writes, and a staged path from a relocatable `WT0_STORE` to a
+reference k3s deployment ([deploy/k3s](deploy/k3s/README.md)) and a CSI
+driver. For runnable per-worktree environments, the
+[Tilt extension](integrations/tilt/README.md) maps each runtime's slot,
+port window, and identity into isolated Tilt namespaces and one-shot
+`tilt ci` test environments.
+
 ## The Zero contract
 
 “Zero” is a measured direction, not a claim that bytes do not exist.

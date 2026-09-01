@@ -1,0 +1,31 @@
+# Scheduled guarded cleanup of a persistent node workspace cache (only
+# needed when agent Jobs share a longer-lived workspace volume instead of
+# per-pod emptyDirs). Dry-run guards stay intact: unowned, dirty, active,
+# or unknown-state worktrees are preserved and reported, never deleted.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: wt0-gc
+  labels:
+    app.kubernetes.io/part-of: worktree-zero
+spec:
+  schedule: "0 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: gc
+              image: ghcr.io/example/wt0-agent:latest
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  cd /work/repo
+                  wt0 --json gc --ephemeral --older-than 2h --apply
+              volumeMounts:
+                - { name: work, mountPath: /work }
+          volumes:
+            - name: work
+              persistentVolumeClaim:
+                claimName: wt0-workspace
