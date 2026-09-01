@@ -7,6 +7,10 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Added
 
+- **Homebrew tap**: `brew install lonormaly/wt0/wt0` installs the
+  prebuilt, checksummed release binary on macOS (arm64/x86_64) and Linux
+  (x86_64/arm64).
+
 - **Tilt boot/stop scripts and the `wt0-tilt` agent skill**: checked-in
   `tilt_up.sh`/`tilt_down.sh` examples distilled from a measured design
   partner's production scripts — the UI port pinned to the runtime's port

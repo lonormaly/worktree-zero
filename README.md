@@ -139,6 +139,12 @@ and portable skill are the same implementation:
   paths are exercised — asserting disjoint slots, disjoint port windows,
   single-owner contended creates, and a corruption-free registry.
 
+### Install
+
+```bash
+brew install lonormaly/wt0/wt0     # macOS and Linux, prebuilt + checksummed
+```
+
 ### Install for an agent
 
 ```bash
