@@ -72,11 +72,11 @@ struct GeneratedStorage {
     nx: u64,
     turbo: u64,
     wrangler: u64,
-    runtime: u64,
     build: u64,
     cargo: u64,
     python: u64,
     java: u64,
+    policy: u64,
     owned_external: u64,
 }
 
@@ -86,11 +86,11 @@ impl GeneratedStorage {
             + self.nx
             + self.turbo
             + self.wrangler
-            + self.runtime
             + self.build
             + self.cargo
             + self.python
             + self.java
+            + self.policy
             + self.owned_external
     }
 }
@@ -174,7 +174,7 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
             "nx_bytes": generated.nx,
             "turbo_bytes": generated.turbo,
             "wrangler_bytes": generated.wrangler,
-            "runtime_bytes": generated.runtime,
+            "policy_bytes": generated.policy,
             "build_bytes": generated.build,
             "cargo_target_bytes": generated.cargo,
             "python_environment_bytes": generated.python,
@@ -1848,10 +1848,13 @@ fn dependency_storage(root: &Path) -> Result<DependencyStorage> {
 }
 
 fn generated_storage(root: &Path) -> Result<GeneratedStorage> {
+    let gradle_project =
+        root.join("build.gradle").is_file() || root.join("build.gradle.kts").is_file();
     let mut result = GeneratedStorage {
         nx: logical_bytes(&root.join(".nx"))?,
         turbo: logical_bytes(&root.join(".turbo"))?,
-        runtime: logical_bytes(&root.join(".immorterm"))?,
+        next: logical_bytes(&root.join(".next"))?,
+        wrangler: logical_bytes(&root.join(".wrangler"))?,
         cargo: if root.join("Cargo.toml").is_file() {
             logical_bytes(&root.join("target"))?
         } else {
@@ -1864,7 +1867,7 @@ fn generated_storage(root: &Path) -> Result<GeneratedStorage> {
             .into_iter()
             .sum(),
         java: logical_bytes(&root.join(".gradle"))?
-            + if root.join("build.gradle").is_file() || root.join("build.gradle.kts").is_file() {
+            + if gradle_project {
                 logical_bytes(&root.join("build"))?
             } else {
                 0
@@ -1877,6 +1880,20 @@ fn generated_storage(root: &Path) -> Result<GeneratedStorage> {
         owned_external: worktree::owned_generated_bytes(root)?,
         ..GeneratedStorage::default()
     };
+    // A single-package repository keeps its build output at the root, so the
+    // root gets the same scan as each workspace. `build` at the root already
+    // belongs to the Gradle bucket when this is a Gradle project.
+    for name in ["dist", "out", ".output", "storybook-static"] {
+        result.build += logical_bytes(&root.join(name))?;
+    }
+    if !gradle_project {
+        result.build += logical_bytes(&root.join("build"))?;
+    }
+    // Project-specific generated paths come from the checked-in policy file,
+    // never from names hard-coded into this generic adapter.
+    for relative in worktree::project_generated_policy(root)? {
+        result.policy += logical_bytes(&root.join(relative))?;
+    }
     for parent in ["apps", "services", "libs", "packages"] {
         let path = root.join(parent);
         if !path.exists() {
@@ -1891,9 +1908,6 @@ fn generated_storage(root: &Path) -> Result<GeneratedStorage> {
             result.wrangler += logical_bytes(&workspace.join(".wrangler"))?;
             for name in ["dist", "out", "build", ".output", "storybook-static"] {
                 result.build += logical_bytes(&workspace.join(name))?;
-            }
-            for name in [".eve", ".flam-dev"] {
-                result.runtime += logical_bytes(&workspace.join(name))?;
             }
         }
     }
@@ -1966,13 +1980,23 @@ mod tests {
         .expect("write materialized Bun fixture");
         fs::create_dir_all(root.join("apps/web/.next")).expect("create Next fixture");
         fs::write(root.join("apps/web/.next/cache"), vec![0; 2048]).expect("write Next fixture");
+        fs::create_dir_all(root.join(".next")).expect("create root Next fixture");
+        fs::write(root.join(".next/cache"), vec![0; 512]).expect("write root Next fixture");
+        fs::create_dir_all(root.join(".project-cache")).expect("create policy fixture");
+        fs::write(root.join(".project-cache/data"), vec![0; 128]).expect("write policy fixture");
+        fs::write(
+            root.join(worktree::GENERATED_POLICY_FILE),
+            "# reviewed\n.project-cache\n",
+        )
+        .expect("write generated policy");
 
         let dependencies = dependency_storage(&root).expect("inspect dependencies");
         let generated = generated_storage(&root).expect("inspect generated state");
         assert_eq!(dependencies.bun_backups, 4096);
         assert_eq!(dependencies.materialized_root_entries, 0);
         assert_eq!(dependencies.materialized_store_entries, 1024);
-        assert_eq!(generated.next, 2048);
+        assert_eq!(generated.next, 2048 + 512);
+        assert_eq!(generated.policy, 128);
 
         fs::remove_dir_all(root).expect("remove test fixture");
     }

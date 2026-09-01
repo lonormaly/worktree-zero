@@ -108,7 +108,7 @@ fn gc_skips_dirty_worktrees_without_force() -> Result<()> {
         },
     )?;
     assert!(outcome.reaped.is_empty());
-    assert_eq!(outcome.skipped, vec![(dirty.clone(), "dirty")]);
+    assert_eq!(outcome.skipped, vec![(dirty.clone(), "dirty".to_owned())]);
 
     let forced = run_gc(
         &repo,
@@ -220,11 +220,15 @@ fn gc_preserves_unowned_and_unknown_ignored_state() -> Result<()> {
         },
     )?;
     assert_eq!(outcome.reaped, vec![custom]);
-    assert!(outcome.skipped.contains(&(unowned.clone(), "unowned")));
     assert!(outcome
         .skipped
-        .contains(&(secret.clone(), "unowned-local-state")));
-    assert!(outcome.skipped.contains(&(detached.clone(), "detached")));
+        .contains(&(unowned.clone(), "unowned".to_owned())));
+    assert!(outcome
+        .skipped
+        .contains(&(secret.clone(), "unowned-local-state".to_owned())));
+    assert!(outcome
+        .skipped
+        .contains(&(detached.clone(), "detached".to_owned())));
     assert_eq!(
         fs::read_to_string(secret.join(".env.local"))?,
         "must survive\n"
@@ -260,8 +264,58 @@ fn gc_refuses_a_live_working_directory() -> Result<()> {
     let _ = process.wait();
     let outcome = result?;
     assert!(outcome.reaped.is_empty());
-    assert_eq!(outcome.skipped, vec![(target.clone(), "active-cwd")]);
+    assert_eq!(
+        outcome.skipped,
+        vec![(target.clone(), "active-cwd".to_owned())]
+    );
     assert!(target.exists());
+    Ok(())
+}
+
+#[test]
+fn gc_honors_the_checked_in_generated_policy_and_blocks_sensitive_policies() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fs::write(fixture.repo.join(".gitignore"), ".project-cache/\n")?;
+    fs::write(
+        fixture.repo.join(GENERATED_POLICY_FILE),
+        "# reviewed generated outputs\n.project-cache\n",
+    )?;
+    run_git_at(
+        &fixture.repo,
+        ["add", "-f", ".gitignore", GENERATED_POLICY_FILE],
+    )?;
+    run_git_at(&fixture.repo, ["commit", "-q", "-m", "generated policy"])?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+
+    let governed = fixture.root.join("governed");
+    add_git_worktree(&repo, "agent/governed", &governed, &base)?;
+    mark_managed(&governed, "agent/governed", false)?;
+    fs::create_dir(governed.join(".project-cache"))?;
+    fs::write(governed.join(".project-cache/data"), "generated\n")?;
+
+    let sensitive = fixture.root.join("sensitive");
+    add_git_worktree(&repo, "agent/sensitive", &sensitive, &base)?;
+    mark_managed(&sensitive, "agent/sensitive", false)?;
+    fs::write(sensitive.join(GENERATED_POLICY_FILE), ".env.local\n")?;
+    run_git_at(&sensitive, ["commit", "-aqm", "sensitive policy"])?;
+
+    let outcome = run_gc(
+        &repo,
+        &WorktreeGc {
+            older_than: "0s".to_owned(),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(outcome.reaped, vec![governed]);
+    assert!(
+        outcome
+            .skipped
+            .iter()
+            .any(|(path, reason)| path == &sensitive
+                && reason.starts_with("invalid-generated-policy"))
+    );
+    assert!(sensitive.exists());
     Ok(())
 }
 

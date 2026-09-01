@@ -854,7 +854,7 @@ fn repair(json_output: bool) -> Result<()> {
 
 struct GcOutcome {
     reaped: Vec<PathBuf>,
-    skipped: Vec<(PathBuf, &'static str)>,
+    skipped: Vec<(PathBuf, String)>,
     retained_branches: Vec<String>,
     deleted_branches: Vec<String>,
 }
@@ -869,7 +869,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
     let older_than = parse_duration(&args.older_than)?;
     let live_cwds = live_working_directories()?;
     let mut reaped: Vec<PathBuf> = Vec::new();
-    let mut skipped: Vec<(PathBuf, &'static str)> = Vec::new();
+    let mut skipped: Vec<(PathBuf, String)> = Vec::new();
     let mut retained_branches = Vec::new();
     let mut deleted_branches = Vec::new();
 
@@ -878,12 +878,12 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
             continue;
         }
         if !is_managed(&entry.path) {
-            skipped.push((entry.path, "unowned"));
+            skipped.push((entry.path, "unowned".to_owned()));
             continue;
         }
         let branch = entry.branch.as_deref().unwrap_or("");
         if branch.is_empty() {
-            skipped.push((entry.path, "detached"));
+            skipped.push((entry.path, "detached".to_owned()));
             continue;
         }
         let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
@@ -899,26 +899,37 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
             continue;
         }
         if live_cwds.iter().any(|path| path.starts_with(&entry.path)) {
-            skipped.push((entry.path, "active-cwd"));
+            skipped.push((entry.path, "active-cwd".to_owned()));
             continue;
         }
         match worktree_dirty(&entry.path) {
             Ok(true) => {
-                skipped.push((entry.path.clone(), "dirty"));
+                skipped.push((entry.path.clone(), "dirty".to_owned()));
                 continue;
             }
             Err(_) => {
-                skipped.push((entry.path.clone(), "status-failed"));
+                skipped.push((entry.path.clone(), "status-failed".to_owned()));
                 continue;
             }
             Ok(false) => {}
         }
-        if has_unknown_local_state(&entry.path, &allowed_generated)? {
-            skipped.push((entry.path, "unowned-local-state"));
+        // The worktree's checked-in policy may name additional reviewed
+        // generated paths; a policy that fails validation blocks removal
+        // instead of silently widening or narrowing it.
+        let mut allowed = allowed_generated.clone();
+        match project_generated_policy(&entry.path) {
+            Ok(mut policy) => allowed.append(&mut policy),
+            Err(error) => {
+                skipped.push((entry.path, format!("invalid-generated-policy: {error:#}")));
+                continue;
+            }
+        }
+        if has_unknown_local_state(&entry.path, &allowed)? {
+            skipped.push((entry.path, "unowned-local-state".to_owned()));
             continue;
         }
         if live_open_path(&entry.path)?.is_some() {
-            skipped.push((entry.path, "active-open-path"));
+            skipped.push((entry.path, "active-open-path".to_owned()));
             continue;
         }
         if !args.apply {
@@ -938,7 +949,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
                 }
                 reaped.push(entry.path)
             }
-            Err(_) => skipped.push((entry.path, "remove-failed")),
+            Err(error) => skipped.push((entry.path, format!("remove-failed: {error:#}"))),
         }
     }
 
@@ -1436,6 +1447,31 @@ fn has_unknown_local_state(worktree: &Path, allowed_generated: &[PathBuf]) -> Re
         }
     }
     Ok(false)
+}
+
+/// The checked-in project policy naming additional reviewed generated paths,
+/// one relative path per line (`#` comments allowed). This keeps
+/// project-specific vocabulary in the project instead of the generic adapter.
+pub(crate) const GENERATED_POLICY_FILE: &str = ".wt0-generated";
+
+/// Read and validate a worktree's checked-in generated-path policy. A missing
+/// file is an empty policy; a policy naming sensitive or unsafe paths is an
+/// error so it can never widen what GC may remove.
+pub(crate) fn project_generated_policy(root: &Path) -> Result<Vec<PathBuf>> {
+    let path = root.join(GENERATED_POLICY_FILE);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let entries = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    validate_generated_policy(&entries)
+        .with_context(|| format!("invalid generated-path policy {}", path.display()))
 }
 
 fn validate_generated_policy(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
