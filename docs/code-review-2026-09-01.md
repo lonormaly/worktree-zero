@@ -334,3 +334,44 @@ would drop the external dependency for the common CI/container case where
    consistency check.
 6. Module split and typed markers (§3.2, §3.3) — mechanical, best done after
    item 2 so the split doesn't move duplicated code around.
+
+---
+
+## Appendix: competitive landscape (September 2026)
+
+Where `wt0` sits among the tools an agent team would evaluate:
+
+- **Plain `git worktree` + shell scripts** — the real incumbent. Every blog
+  post on parallel agents teaches this. `wt0` wins on storage, lifecycle, and
+  safety, but must stay as easy as `git worktree add` for the first five
+  minutes or people never reach the differentiators.
+- **Worktrunk (`wt`)** — the closest CLI competitor: branch-addressed
+  worktrees, lifecycle hooks (post-create/pre-merge/post-merge), an agent
+  skill, `wt merge`. It is an ergonomics product; it does not own storage
+  (no CoW baselines, no prepared environments), leases, or guarded GC.
+  Its hooks and merge flow are the features `wt0` users will miss most.
+- **Host-native worktrees** (Claude Code's `--worktree` flag and similar) —
+  the platform threat. Hosts will keep the checkout-creation UX; the durable
+  position for `wt0` is the substrate underneath: storage sharing, dependency
+  preparation, generated-state ownership, crash reconciliation — things a
+  host will not build per-repo.
+- **Desktop orchestrators** (Conductor, Crystal→Nimbalyst, vibe-kanban) —
+  UI layers that create one worktree per agent. They are prospective
+  *consumers* of `wt0`, not competitors, if the JSON/MCP contract is easy to
+  build on.
+- **Container/cloud sandboxes** (Dagger's container-use, cloud agent
+  sandboxes) — heavier isolation with different trade-offs. container-use
+  won mindshare partly by shipping as an MCP server from day one; `wt0`'s
+  MCP transport is still "planned".
+
+Strategic implications, in order:
+
+1. Ship the MCP server — it is how orchestrators and hosts will integrate.
+2. Finish the agent contract (idempotent create, runtime-id receipts,
+   uniform versioned JSON) so wrappers need zero glue code.
+3. Add project lifecycle hooks (post-create/pre-remove) in `wt0` itself so
+   the "prefer the repo's wrapper script" guidance can retire.
+4. Windows via ReFS/Dev Drive block cloning (the `reflink-copy` crate
+   supports it) — every ergonomics competitor is cross-platform.
+5. Publish a reproducible head-to-head benchmark versus plain worktrees and
+   worktrunk; storage receipts are the moat and deserve marketing weight.
