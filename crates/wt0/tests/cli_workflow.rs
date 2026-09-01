@@ -290,3 +290,87 @@ fn git(repo: &Path, args: &[&str]) {
         .expect("run git");
     assert!(status.success(), "git {args:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn create_runs_the_post_create_hook_and_rolls_back_when_it_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-hooks-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+    let hooks = repo.join(".wt0/hooks");
+    fs::create_dir_all(&hooks).expect("create hooks dir");
+    let hook = hooks.join("post-create");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nprintf '%s' \"$WT0_MODE\" > \"$WT0_REPO_ROOT/created-$WT0_BRANCH\"\n",
+    )
+    .expect("write hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("mark executable");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "initial with hook"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let worktree = root.join("hooked");
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["create", "hooked", "--path"])
+        .arg(&worktree)
+        .output()
+        .expect("create with hook");
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let receipt = fs::read_to_string(repo.join("created-hooked")).expect("hook side effect");
+    assert!(
+        ["cow-clone", "overlay", "git-checkout"].contains(&receipt.as_str()),
+        "unexpected mode {receipt}"
+    );
+
+    fs::write(&hook, "#!/bin/sh\necho hook-boom >&2\nexit 9\n").expect("write failing hook");
+    git(&repo, &["commit", "-aqm", "failing hook"]);
+    let failing = root.join("failing");
+    let failed = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["create", "failing-branch", "--path"])
+        .arg(&failing)
+        .output()
+        .expect("create with failing hook");
+    assert!(!failed.status.success(), "failing hook must fail create");
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("hook-boom"), "stderr: {stderr}");
+    assert!(
+        !failing.exists(),
+        "failed post-create must roll the worktree back"
+    );
+    let branch = Command::new("git")
+        .current_dir(&repo)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/failing-branch",
+        ])
+        .status()
+        .expect("inspect branch");
+    assert!(
+        !branch.success(),
+        "failed post-create must delete the branch"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

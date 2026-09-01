@@ -3,6 +3,20 @@
 All notable changes to Worktree Zero. Versions follow semantic versioning;
 pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
+## Unreleased
+
+### Added
+
+- **Project lifecycle hooks**: checked-in `.wt0/hooks/post-create` and
+  `.wt0/hooks/pre-remove` run automatically with a `WT0_*` environment
+  contract and a `WT0_HOOK_TIMEOUT` bound (default 5m). Failure semantics
+  are safety-first: a failing post-create rolls the new worktree and branch
+  back, and a failing pre-remove aborts `wt0 remove` or skips the `gc`
+  candidate — a hook can veto cleanup but never be bypassed into a
+  deletion. `capabilities` reports the hooks a repository ships
+  (`project_hooks`), and Windows resolves the same events to
+  `.cmd`/`.bat`/`.ps1` files.
+
 ## 0.1.11 — 2026-09-01
 
 ### Added

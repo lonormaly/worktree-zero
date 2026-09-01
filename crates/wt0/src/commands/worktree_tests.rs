@@ -619,3 +619,53 @@ fn git<const N: usize>(path: &Path, args: [&str; N]) -> Result<()> {
     command.arg("-C").arg(path).args(args);
     run_command(&mut command, "test git")
 }
+
+#[cfg(unix)]
+#[test]
+fn gc_runs_pre_remove_hooks_and_skips_worktrees_whose_hook_fails() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new()?;
+    let hooks = fixture.repo.join(crate::hooks::HOOKS_DIR);
+    fs::create_dir_all(&hooks)?;
+    let hook = hooks.join("pre-remove");
+    fs::write(&hook, "#!/bin/sh\nexit 7\n")?;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
+    run_git_at(&fixture.repo, ["add", ".wt0"])?;
+    run_git_at(&fixture.repo, ["commit", "-q", "-m", "vetoing hook"])?;
+    let repo = discover_repo(&fixture.repo)?;
+    let vetoed_base = resolve_commit(&repo, "HEAD")?;
+    let vetoed = fixture.root.join("vetoed");
+    add_git_worktree(&repo, "agent/vetoed", &vetoed, &vetoed_base)?;
+    mark_managed(&vetoed, "agent/vetoed", false)?;
+
+    fs::write(
+        &hook,
+        "#!/bin/sh\nprintf '%s' \"$WT0_BRANCH\" > \"$WT0_REPO_ROOT/reaped-branch\"\n",
+    )?;
+    run_git_at(&fixture.repo, ["commit", "-aqm", "recording hook"])?;
+    let recording_base = resolve_commit(&repo, "HEAD")?;
+    let reapable = fixture.root.join("reapable");
+    add_git_worktree(&repo, "agent/reapable", &reapable, &recording_base)?;
+    mark_managed(&reapable, "agent/reapable", false)?;
+
+    let outcome = run_gc(
+        &repo,
+        &WorktreeGc {
+            older_than: "0s".to_owned(),
+            apply: true,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(outcome.reaped, vec![reapable]);
+    assert!(outcome
+        .skipped
+        .iter()
+        .any(|(path, reason)| path == &vetoed && reason.starts_with("pre-remove-hook-failed")));
+    assert!(vetoed.exists(), "a vetoing hook must preserve the worktree");
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("reaped-branch"))?,
+        "agent/reapable"
+    );
+    Ok(())
+}

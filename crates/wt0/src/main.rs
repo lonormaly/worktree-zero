@@ -35,6 +35,7 @@
 
 mod capabilities;
 mod commands;
+mod hooks;
 mod mcp;
 mod runtime;
 
