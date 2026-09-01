@@ -18,6 +18,20 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   environments keep their single-level `WT0_STORE` support; layering for
   them follows the environment-adapter deduplication.
 
+- **Registry serialization for N-agent fleets**: every git invocation that
+  iterates or rewrites the shared worktree registry or branch refs
+  (worktree add/remove/prune/list, branch deletion) now runs under a
+  cross-process `registry.lock`, because git walks `.git/worktrees`
+  non-atomically and concurrent removals could observe each other's
+  half-deleted administrative directories and fail. Populate work — CoW
+  clones and checkouts inside one worktree — stays fully parallel; the
+  plain git-checkout mode now populates worktree-locally (`--no-checkout`
+  plus reset) so large checkouts never serialize behind the lock. Adoption
+  via `migrate --adopt` now allocates its slot under the slot lock, and a
+  new N-agent concurrency stress suite (24 agents in CI on Linux, macOS,
+  and Windows; tunable via `WT0_STRESS_AGENTS`) proves disjoint slots,
+  single-owner contended creates, and corruption-free concurrent removes.
+
 - **Idempotent create and run**: `--idempotency-key` on `create`/`run` (and
   the MCP `create_worktree` tool). A retried request with the same key and
   branch returns the existing runtime with `reused: true` in the receipt; a

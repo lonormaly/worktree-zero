@@ -140,6 +140,25 @@ jobs:
           TEMP: R:\tmp
         run: cargo test --all
 
+  stress:
+    # N agents arriving at once is the product's core scenario: many
+    # simultaneous creates must yield disjoint slots, contended creates for
+    # one runtime must resolve to a single owner, and simultaneous removes
+    # must never corrupt the shared worktree registry.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 24-agent concurrency stress
+        env:
+          WT0_STRESS_AGENTS: "24"
+        run: cargo test --test concurrency_stress -- --nocapture
+
   linux-arm64:
     runs-on: ubuntu-latest
     steps:
