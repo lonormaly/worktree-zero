@@ -142,7 +142,8 @@ and portable skill are the same implementation:
 ### Install
 
 ```bash
-brew install lonormaly/wt0/wt0     # macOS and Linux, prebuilt + checksummed
+brew tap lonormaly/wt0
+brew install wt0                   # macOS and Linux, prebuilt + checksummed
 ```
 
 ### Install for an agent
