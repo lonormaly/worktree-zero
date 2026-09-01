@@ -128,8 +128,8 @@ fn package_adapters(root: &Path) -> Vec<Adapter> {
         Adapter {
             id: "cargo",
             detected: root.join("Cargo.lock").is_file() || root.join("Cargo.toml").is_file(),
-            support: "planned",
-            behavior: "reuse Cargo registry/git caches and keep target output bounded per runtime",
+            support: "shipped-through-wt0-run",
+            behavior: "reuse Cargo registry/git caches and move target output into owned per-runtime storage that teardown and crash recovery retire",
         },
         Adapter {
             id: "go",
@@ -169,8 +169,8 @@ fn generated_adapters(root: &Path) -> Vec<Adapter> {
         Adapter {
             id: "cargo-target",
             detected: root.join("Cargo.toml").is_file(),
-            support: "detected",
-            behavior: "audit target; do not share a writable target directory blindly",
+            support: "shipped-through-wt0-run",
+            behavior: "set a private owned CARGO_TARGET_DIR outside the checkout; do not share one writable target directory blindly",
         },
     ]
 }

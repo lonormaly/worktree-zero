@@ -42,6 +42,12 @@ binary="${WT0_BIN:-$(git rev-parse --show-toplevel)/target/debug/wt0}"
 "$binary" prepare "$repo" --apply --json >/dev/null
 node -e "if (!require('$repo/node_modules/is-even')(4)) process.exit(1)"
 
+(
+  cd "$repo"
+  "$binary" run "agent/auto-$manager" --require-cow -- node -e "if (!require('is-even')(4)) process.exit(1)"
+  "$binary" gc --ephemeral --older-than 0s --apply --json >/dev/null
+)
+
 second="$repo-second"
 git -C "$repo" worktree add -qb second "$second"
 "$binary" migrate "$second" --baseline HEAD --apply --json > "$repo/receipt.json"

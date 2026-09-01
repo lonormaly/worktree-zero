@@ -319,10 +319,16 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
         created.mode.label(),
         args.branch
     );
+    crate::runtime::prepare_for_agent_run(&created.target)
+        .context("prepare package-manager environment for agent command")?;
+    let generated = prepare_generated_runtime(&created.target)?;
     let (program, command_args) = args.command.split_first().context("command is required")?;
-    let mut child = Command::new(program)
-        .args(command_args)
-        .current_dir(&created.target)
+    let mut command = Command::new(program);
+    command.args(command_args).current_dir(&created.target);
+    for (name, value) in &generated.environment {
+        command.env(name, value);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("run command in {}", created.target.display()))?;
     let mut seconds_since_heartbeat = 0_u64;
@@ -528,14 +534,20 @@ fn add_overlay_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &
 /// remove mount dir + drop upper/work + prune the registry) or delegating to
 /// `git worktree remove --force` for plain worktrees.
 fn force_teardown(repo: &RepoContext, target: &Path) -> Result<()> {
-    if let Some(state) = overlay::state(repo, target) {
+    let generated = generated_runtime(repo, target)?;
+    let result = if let Some(state) = overlay::state(repo, target) {
         overlay::unmount(target);
         let _ = fs::remove_dir_all(target);
         let _ = fs::remove_dir_all(&state.overlay_dir);
         run_git_common(repo, [OsStr::new("worktree"), OsStr::new("prune")])
     } else {
         remove_worktree_force(repo, target)
+    };
+    result?;
+    if let Some(generated) = generated {
+        retire_generated_runtime(&generated)?;
     }
+    Ok(())
 }
 
 fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
@@ -555,6 +567,7 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         .unwrap_or(cwd);
     let repo = discover_repo(&repo_hint)?;
     let target = resolve_worktree_target(&repo, args.target.as_deref())?;
+    let generated = generated_runtime(&repo, &target)?;
     let branch = list_worktrees(&repo)?
         .into_iter()
         .find(|entry| entry.path == target)
@@ -602,13 +615,15 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         run_command(&mut command, "git worktree remove")?;
     }
 
+    if let Some(generated) = generated {
+        retire_generated_runtime(&generated)?;
+    }
     let mut branch_deleted = false;
     if args.delete_branch {
         let branch = branch.context("cannot delete branch for a detached worktree")?;
         delete_local_branch(&repo, &branch, args.force)?;
         branch_deleted = true;
     }
-
     if json {
         emit(&json!({
             "removed": target.display().to_string(),
@@ -692,13 +707,70 @@ fn list(json_output: bool) -> Result<()> {
 fn prune(args: WorktreePrune) -> Result<()> {
     let repo = discover_repo(&std::env::current_dir()?)?;
     run_git_common(&repo, [OsStr::new("worktree"), OsStr::new("prune")])?;
+    let (generated_removed, generated_preserved) = retire_orphan_generated_runtimes(&repo)?;
     let protected: HashSet<PathBuf> = list_worktrees(&repo)?
         .into_iter()
         .filter_map(|entry| overlay::state(&repo, &entry.path).and_then(|state| state.lower))
         .collect();
     let removed = cow::prune_baselines(&repo.common_git_dir, args.all, &protected)?;
-    println!("pruned {removed} cached baseline(s)");
+    println!(
+        "pruned {removed} cached baseline(s), retired {generated_removed} owned generated runtime(s), preserved {generated_preserved} ambiguous generated path(s)"
+    );
     Ok(())
+}
+
+fn retire_orphan_generated_runtimes(repo: &RepoContext) -> Result<(usize, usize)> {
+    let active = list_worktrees(repo)?
+        .into_iter()
+        .filter_map(|entry| runtime_identity(&entry.path).ok())
+        .collect::<HashSet<_>>();
+    let generated_root = state_dir(&repo.common_git_dir).join("generated");
+    let entries = match fs::read_dir(&generated_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => return Err(error).context("read generated-runtime store"),
+    };
+    let mut removed = 0;
+    let mut preserved = 0;
+    for entry in entries {
+        let entry = entry?;
+        let root = entry.path();
+        let runtime_id = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type()?.is_dir()
+            || Uuid::parse_str(&runtime_id).is_err()
+            || active.contains(&runtime_id)
+        {
+            preserved += 1;
+            continue;
+        }
+        let owner_path = root.join("owner.json");
+        let owner: serde_json::Value = match fs::read(&owner_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        {
+            Some(owner) => owner,
+            None => {
+                preserved += 1;
+                continue;
+            }
+        };
+        let Some(worktree) = owner["worktree"].as_str().map(PathBuf::from) else {
+            preserved += 1;
+            continue;
+        };
+        if owner["runtime_id"].as_str() != Some(runtime_id.as_str()) || worktree.exists() {
+            preserved += 1;
+            continue;
+        }
+        retire_generated_runtime(&GeneratedRuntime {
+            root,
+            runtime_id,
+            worktree,
+            environment: Vec::new(),
+        })?;
+        removed += 1;
+    }
+    Ok((removed, preserved))
 }
 
 fn gc(args: WorktreeGc, json: bool) -> Result<()> {
@@ -950,6 +1022,172 @@ fn mark_ephemeral(worktree: &Path) -> Result<()> {
 
 fn managed_marker(worktree: &Path) -> Result<PathBuf> {
     Ok(worktree_admin_dir(worktree)?.join("wt0-runtime.json"))
+}
+
+struct GeneratedRuntime {
+    root: PathBuf,
+    runtime_id: String,
+    worktree: PathBuf,
+    environment: Vec<(OsString, OsString)>,
+}
+
+fn runtime_identity(worktree: &Path) -> Result<String> {
+    let marker = managed_marker(worktree)?;
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(&marker)
+            .with_context(|| format!("read ownership marker {}", marker.display()))?,
+    )
+    .context("parse worktree ownership marker")?;
+    let runtime_id = value["runtime_id"]
+        .as_str()
+        .context("ownership marker has no runtime_id")?;
+    Uuid::parse_str(runtime_id).context("ownership marker has an invalid runtime_id")?;
+    Ok(runtime_id.to_owned())
+}
+
+fn generated_runtime(repo: &RepoContext, worktree: &Path) -> Result<Option<GeneratedRuntime>> {
+    if !is_managed(worktree) {
+        return Ok(None);
+    }
+    let runtime_id = runtime_identity(worktree)?;
+    let root = state_dir(&repo.common_git_dir)
+        .join("generated")
+        .join(&runtime_id);
+    if !root.exists() {
+        return Ok(None);
+    }
+    let owner_path = root.join("owner.json");
+    let owner: serde_json::Value =
+        serde_json::from_slice(&fs::read(&owner_path).with_context(|| {
+            format!("generated runtime has no owner: {}", owner_path.display())
+        })?)
+        .context("parse generated-runtime owner")?;
+    let expected_worktree = worktree
+        .canonicalize()
+        .unwrap_or_else(|_| worktree.to_path_buf());
+    if owner["runtime_id"].as_str() != Some(runtime_id.as_str())
+        || owner["worktree"].as_str() != Some(expected_worktree.to_string_lossy().as_ref())
+    {
+        bail!(
+            "refusing generated runtime with mismatched ownership: {}",
+            root.display()
+        );
+    }
+    Ok(Some(GeneratedRuntime {
+        root,
+        runtime_id,
+        worktree: expected_worktree,
+        environment: Vec::new(),
+    }))
+}
+
+fn prepare_generated_runtime(worktree: &Path) -> Result<GeneratedRuntime> {
+    let repo = discover_repo(worktree)?;
+    let runtime_id = runtime_identity(worktree)?;
+    let worktree = worktree
+        .canonicalize()
+        .with_context(|| format!("resolve worktree path {}", worktree.display()))?;
+    let root = state_dir(&repo.common_git_dir)
+        .join("generated")
+        .join(&runtime_id);
+    fs::create_dir_all(&root)
+        .with_context(|| format!("create generated runtime {}", root.display()))?;
+    let owner_path = root.join("owner.json");
+    if owner_path.is_file() {
+        let existing = generated_runtime(&repo, &worktree)?
+            .context("generated runtime disappeared during ownership validation")?;
+        if existing.runtime_id != runtime_id {
+            bail!("generated runtime changed identity during preparation");
+        }
+    } else {
+        fs::write(
+            &owner_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "runtime_id": runtime_id,
+                "worktree": worktree,
+                "created_at_unix": now_unix_seconds()?,
+            }))?,
+        )
+        .context("write generated-runtime ownership marker")?;
+    }
+
+    let mut environment = vec![
+        (
+            OsString::from("WT0_RUNTIME_ID"),
+            OsString::from(&runtime_id),
+        ),
+        (
+            OsString::from("WT0_GENERATED_ROOT"),
+            root.as_os_str().to_owned(),
+        ),
+    ];
+    if worktree.join("Cargo.toml").is_file() && std::env::var_os("CARGO_TARGET_DIR").is_none() {
+        let cargo_target = root.join("cargo-target");
+        fs::create_dir_all(&cargo_target).context("create owned Cargo target directory")?;
+        environment.push((
+            OsString::from("CARGO_TARGET_DIR"),
+            cargo_target.into_os_string(),
+        ));
+    }
+    Ok(GeneratedRuntime {
+        root,
+        runtime_id,
+        worktree,
+        environment,
+    })
+}
+
+fn retire_generated_runtime(generated: &GeneratedRuntime) -> Result<()> {
+    let owner_path = generated.root.join("owner.json");
+    let owner: serde_json::Value = serde_json::from_slice(
+        &fs::read(&owner_path)
+            .with_context(|| format!("read generated owner {}", owner_path.display()))?,
+    )
+    .context("parse generated owner before retirement")?;
+    if owner["runtime_id"].as_str() != Some(generated.runtime_id.as_str())
+        || owner["worktree"].as_str() != Some(generated.worktree.to_string_lossy().as_ref())
+    {
+        bail!(
+            "refusing to retire generated state with mismatched ownership: {}",
+            generated.root.display()
+        );
+    }
+    fs::remove_dir_all(&generated.root).with_context(|| {
+        format!(
+            "retire owned generated runtime {}",
+            generated.root.display()
+        )
+    })
+}
+
+pub(crate) fn owned_generated_bytes(worktree: &Path) -> Result<u64> {
+    if !is_managed(worktree) {
+        return Ok(0);
+    }
+    let repo = discover_repo(worktree)?;
+    generated_runtime(&repo, worktree)?
+        .map(|runtime| generated_logical_bytes(&runtime.root))
+        .unwrap_or(Ok(0))
+}
+
+fn generated_logical_bytes(path: &Path) -> Result<u64> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(0);
+    }
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    let mut total = 0;
+    for entry in fs::read_dir(path)? {
+        total += generated_logical_bytes(&entry?.path())?;
+    }
+    Ok(total)
 }
 
 fn now_unix_seconds() -> Result<u64> {
