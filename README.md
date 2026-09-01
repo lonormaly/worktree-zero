@@ -16,7 +16,7 @@ runtime-owned storage, storage leases, measurements, and cleanup.
 Users and agents install one tool, use one configuration, and call one command:
 
 ```text
-wt0 run --agent codex --branch agent/fix -- "fix the checkout bug"
+wt0 run agent/fix --require-cow -- codex exec "fix the checkout bug"
 ```
 
 NanoClaw, OpenClaw, Hermes, Grok Bot, Codex, Claude Code, and other agents must
@@ -35,6 +35,15 @@ Worktree Zero will:
 7. preserve dirty or unmerged work instead of deleting it;
 8. remove only generated state carrying Worktree Zero ownership evidence; and
 9. recover marked orphan storage after an agent or machine crash.
+
+`wt0 run` is the complete headless path: it creates the CoW checkout, prepares
+supported dependencies, exports runtime-owned generated paths, starts the agent
+command, and refreshes the ownership heartbeat. For Cargo projects it keeps the
+native global registry/git caches and sets a private `CARGO_TARGET_DIR` outside
+the checkout. Normal remove/GC retires that directory. If the checkout is
+deleted outside Worktree Zero, `wt0 prune` verifies its ownership receipt and
+retires the orphan. One writable Cargo target directory is never shared blindly
+between live agents.
 
 The shipped portable skill and JSON CLI are the current stable agent
 interfaces. The same versioned result will also be available through the

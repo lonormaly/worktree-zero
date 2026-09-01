@@ -77,6 +77,7 @@ struct GeneratedStorage {
     cargo: u64,
     python: u64,
     java: u64,
+    owned_external: u64,
 }
 
 impl GeneratedStorage {
@@ -90,6 +91,7 @@ impl GeneratedStorage {
             + self.cargo
             + self.python
             + self.java
+            + self.owned_external
     }
 }
 
@@ -177,6 +179,7 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
             "cargo_target_bytes": generated.cargo,
             "python_environment_bytes": generated.python,
             "java_build_bytes": generated.java,
+            "owned_external_bytes": generated.owned_external,
         }
     });
 
@@ -527,6 +530,20 @@ pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
         return prepare_node_environment(&root, &manager, args.apply, json_output);
     }
     prepare_bun(&root, args.apply, json_output)
+}
+
+pub(crate) fn prepare_for_agent_run(root: &Path) -> Result<()> {
+    let Some(manager) = javascript_package_manager(root)? else {
+        return Ok(());
+    };
+    if manager == "yarn" && yarn_uses_pnp(root) {
+        return Ok(());
+    }
+    if manager == "bun" {
+        prepare_bun(root, true, false)
+    } else {
+        prepare_node_environment(root, &manager, true, false)
+    }
 }
 
 fn prepare_bun(root: &Path, apply: bool, json_output: bool) -> Result<()> {
@@ -1857,6 +1874,7 @@ fn generated_storage(root: &Path) -> Result<GeneratedStorage> {
             } else {
                 0
             },
+        owned_external: worktree::owned_generated_bytes(root)?,
         ..GeneratedStorage::default()
     };
     for parent in ["apps", "services", "libs", "packages"] {

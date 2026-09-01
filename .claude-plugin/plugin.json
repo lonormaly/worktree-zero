@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "worktree-zero",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Create, prepare, measure, migrate, and safely remove thin coding-agent worktrees.",
   "author": {
     "name": "Worktree Zero contributors",

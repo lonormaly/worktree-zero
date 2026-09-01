@@ -206,9 +206,12 @@ Initial adapters:
 - Yarn: preserve PnP when selected; verify pnpm or node-modules linker modes
   separately.
 
-Later adapters cover uv/Python, Cargo/Rust, Go modules, and mixed-language
-repositories. An unsupported manager receives source and lifecycle management
-but no invented dependency-saving claim.
+The Cargo runtime-output adapter now ships through `wt0 run`: it keeps Cargo's
+native global caches, assigns one owned external `CARGO_TARGET_DIR`, and retires
+that path during normal teardown or crash recovery. Later adapters cover
+uv/Python, Go modules, and mixed-language repositories. An unsupported manager
+receives source and lifecycle management but no invented dependency-saving
+claim.
 
 ## Private worktree views
 

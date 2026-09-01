@@ -44,8 +44,9 @@ If an external agent manager owns the process, refresh the lease while it runs:
 wt0 heartbeat /absolute/path/to/worktree --json
 ```
 
-`wt0 run` refreshes its own heartbeat every 30 seconds, but it does not yet
-prepare dependencies automatically.
+`wt0 run` prepares supported dependencies automatically, refreshes its own
+heartbeat every 30 seconds, and gives Cargo an owned `CARGO_TARGET_DIR` outside
+the checkout. Prefer it for headless agents that do not need a project wrapper.
 
 ## Finish safely
 

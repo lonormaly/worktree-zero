@@ -70,3 +70,13 @@ tests/prepared_node_integration.sh yarn
 
 `tests/prepared_bun_integration.sh` covers Bun separately because Bun's
 isolated global store has its own version and link verification rules.
+
+## Generated Cargo state
+
+```bash
+tests/generated_cargo_integration.sh
+```
+
+This creates a Rust project, runs it through `wt0 run`, proves Cargo writes to
+an owned path outside the worktree, and verifies both normal GC and raw-removal
+crash recovery retire that exact path.

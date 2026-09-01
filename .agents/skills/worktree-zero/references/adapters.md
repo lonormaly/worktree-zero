@@ -11,7 +11,7 @@ this table. Do not turn planned support into a shipped claim.
 | pnpm | Shipped: preserves pnpm's content-addressable store plus a private CoW installed-tree view |
 | Yarn | Shipped for the `node_modules` linker; PnP and zero-install stay native and do not receive a redundant installed-tree layer |
 | uv/Python | Native cache and private virtual-environment adapter planned |
-| Cargo/Rust | Registry/cache reuse and bounded `target` adapter planned; do not share a writable target blindly |
+| Cargo/Rust | Shipped through `wt0 run`: native registry/git caches stay global; each runtime receives an owned external `CARGO_TARGET_DIR`; remove, GC and prune retire it. Shared sccache policy remains opt-in pending project benchmarks |
 | Go | Native module/build caches should be preserved; verification adapter planned |
 | Nx | Nx already shares task cache across Git worktrees; daemon/workspace-data policy is project integration work |
 | Next/Turbopack | Cache is measurable, but one live writable `.next` must never be shared between agents |
