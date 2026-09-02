@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# A new push to a PR supersedes the run in flight; main runs are never cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -162,17 +167,13 @@ jobs:
           WT0_STRESS_AGENTS: "24"
         run: cargo test --test concurrency_stress -- --nocapture
 
+  # Native ARM64 runner: no cross-linker to apt-install (that step alone took
+  # 26 s on a good day and 577 s on a bad one — the whole run's critical path)
+  # and the tests actually execute on the architecture.
   linux-arm64:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
-      - name: Install Linux ARM64 linker
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Cross-build
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --locked --target aarch64-unknown-linux-gnu -p worktree-zero
+      - run: cargo test --all --locked
