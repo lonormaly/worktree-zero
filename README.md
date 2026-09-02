@@ -226,7 +226,7 @@ and portable skill are the same implementation:
 ```bash
 brew tap lonormaly/wt0
 brew install wt0                   # macOS and Linux, prebuilt + checksummed
-npm i -g wt0                       # or: npx wt0 doctor
+npm i -g worktree-zero             # installs the `wt0` command; or: npx worktree-zero doctor
 ```
 
 ### Install for an agent

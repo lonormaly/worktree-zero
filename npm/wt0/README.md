@@ -12,13 +12,13 @@ as an optional dependency for your platform. No postinstall network download.
 ## Use
 
 ```bash
-npx wt0 doctor
+npx worktree-zero doctor
 ```
 
 or install it globally:
 
 ```bash
-npm i -g wt0
+npm i -g worktree-zero
 wt0 doctor
 ```
 

@@ -7,6 +7,9 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Added
 
+- **On npm the package is `worktree-zero`** (`npm i -g worktree-zero`, `npx
+  worktree-zero doctor`; the command is still `wt0`): the registry refuses
+  the bare name `wt0` as too similar to existing short packages.
 - **npm publishing is a workflow, not a laptop.** `Publish npm`
   (`.github/workflows/npm.yml`) publishes `wt0` and its six platform packages
   from the GitHub release's assets when a release is published, or on

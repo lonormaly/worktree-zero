@@ -1,6 +1,8 @@
 # npm packaging
 
-Distributes `wt0` on npm as `npm i -g wt0` / `npx wt0`, following the
+Distributes `wt0` on npm as `npm i -g worktree-zero` / `npx worktree-zero`
+(the registry refuses the bare name `wt0` as too similar to existing short
+packages; the installed command is still `wt0`), following the
 esbuild/biome/turbo pattern: a thin main package that dispatches to one of
 six per-platform packages carrying the actual binary, installed automatically
 via `optionalDependencies`. No postinstall network download.

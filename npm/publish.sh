@@ -49,6 +49,6 @@ for pkg in $platform_packages; do
 done
 
 echo "==> Publishing wt0"
-publish_once wt0 "$dist_dir/wt0-${version}.tgz"
+publish_once worktree-zero "$dist_dir/worktree-zero-${version}.tgz"
 
-echo "==> Published wt0@${version} and its platform packages"
+echo "==> Published worktree-zero@${version} (command wt0) and its platform packages"

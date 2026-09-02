@@ -1,5 +1,5 @@
 {
-  "name": "wt0",
+  "name": "worktree-zero",
   "version": "0.0.0-dev",
   "description": "Thin, copy-on-write worktrees for coding agents -- create, prepare, measure, and safely remove them from the command line.",
   "bin": {
