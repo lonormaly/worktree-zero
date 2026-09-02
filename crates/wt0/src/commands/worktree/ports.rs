@@ -70,6 +70,13 @@ fn claim_path(machine_dir: &Path, base: u64) -> PathBuf {
 /// no live claim, and the window's base port accepts a bind (a foreign
 /// listener on the base port disqualifies the whole window).
 pub(crate) fn allocate(worktree: &Path) -> Result<u64> {
+    // Stored canonically so a later `release` — called with the path Git's
+    // own worktree registry reports, already resolved — matches even when
+    // the worktree's ancestry crosses a symlink (macOS's /var ->
+    // /private/var is the common case; a fresh worktree always exists here,
+    // so canonicalization cannot fail on a not-yet-created path).
+    let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+    let worktree = worktree.as_path();
     let machine_dir = machine_state_dir();
     fs::create_dir_all(claims_dir(&machine_dir)).with_context(|| {
         format!(
@@ -112,6 +119,12 @@ pub(crate) fn allocate(worktree: &Path) -> Result<u64> {
 /// Release every claim naming `worktree`. Best-effort by design: a missed
 /// release is reclaimed by the liveness check once the marker is gone.
 pub(crate) fn release(worktree: &Path) {
+    // Claims are stored canonically (see `allocate`); canonicalize the
+    // caller's path too so a still-existing worktree compares correctly
+    // even when it was named literally rather than via Git's own registry.
+    // A worktree already removed can no longer be canonicalized — the raw
+    // path is then already what the caller intended to compare against.
+    let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
     let dir = claims_dir(&machine_state_dir());
     let Ok(entries) = fs::read_dir(&dir) else {
         return;

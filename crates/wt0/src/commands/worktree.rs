@@ -1070,6 +1070,10 @@ fn add_overlay_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &
 /// `git worktree remove --force` for plain worktrees.
 fn force_teardown(repo: &RepoContext, target: &Path) -> Result<()> {
     let generated = generated_runtime(repo, target)?;
+    // Resolved before removal: a port claim is stored under `allocate`'s
+    // canonical form, and `target` no longer exists to canonicalize once
+    // it is gone.
+    let release_target = dunce::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
     let result = if let Some(state) = overlay::state(repo, target) {
         overlay::unmount(target);
         let _ = fs::remove_dir_all(target);
@@ -1079,7 +1083,7 @@ fn force_teardown(repo: &RepoContext, target: &Path) -> Result<()> {
         remove_worktree_force(repo, target)
     };
     result?;
-    ports::release(target);
+    ports::release(&release_target);
     if let Some(generated) = generated {
         retire_generated_runtime(&generated)?;
     }
@@ -1103,6 +1107,11 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         .unwrap_or(cwd);
     let repo = discover_repo(&repo_hint)?;
     let target = resolve_worktree_target(&repo, args.target.as_deref())?;
+    // Resolved before removal: a port claim is stored under `allocate`'s
+    // canonical form, and `target` no longer exists to canonicalize once
+    // it is gone. `target` itself stays literal — receipts and hooks below
+    // still echo back exactly what the caller passed.
+    let release_target = dunce::canonicalize(&target).unwrap_or_else(|_| target.clone());
     let generated = generated_runtime(&repo, &target)?;
     let branch = list_worktrees(&repo)?
         .into_iter()
@@ -1166,7 +1175,7 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         run_command(&mut command, "git worktree remove")?;
     }
 
-    ports::release(&target);
+    ports::release(&release_target);
     if let Some(generated) = generated {
         retire_generated_runtime(&generated)?;
     }

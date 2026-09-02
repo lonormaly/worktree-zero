@@ -240,7 +240,21 @@ create-plus-prepare is roughly a native install plus a fast clone. The
 storage promise is kept; a time promise is not made by these numbers.
 
 Not yet measured here: builds, tests, and dev servers inside the
-worktrees (gate 2), crash-recovery reaping (gate 5), Linux and Windows
-(gate 7). M3 (real-fleet reclaim, 12.2 GiB) and the booted-stack round trip
-are recorded above; M4/M5 are covered by the concurrency suite and the
-Team session's round trip; M6 waits on the adapter landing on FLAM `main`.
+worktrees (gate 2), Linux and Windows (gate 7). M3 (real-fleet reclaim,
+12.2 GiB) and the booted-stack round trip are recorded above; M4/M5 are
+covered by the concurrency suite and the Team session's round trip; M6
+waits on the adapter landing on FLAM `main`.
+
+### Gate 5 — crash recovery, proven (2026-09-02)
+
+`crashed_agent_runtime_is_reaped_and_its_resources_released`
+(`crates/wt0/tests/cli_workflow.rs`) SIGKILLs a whole `wt0 run` process
+tree mid-`sleep` — no exit hook, no graceful heartbeat stop — and checks
+recovery against `docs/lifecycle.md` exactly: the worktree, lease, and port
+claim survive untouched; `wt0 gc --ephemeral --apply` removes it, retires
+its generated root, retains its branch, and hands the freed slot and port
+window to the next runtime; and a second crash whose checkout is `rm -rf`'d
+is recovered by identity through `wt0 prune`'s `orphaned_runtimes` and an
+`orphaned` event. It also surfaced and fixed a real bug: `ports::allocate`/
+`release` compared paths without canonicalizing, so a symlinked temp root
+(macOS's `/var` -> `/private/var`) silently leaked the port claim past gc.
