@@ -132,7 +132,7 @@ fn package_adapters(root: &Path) -> Vec<Adapter> {
                 || root.join("bun.lockb").is_file()
                 || root.join("bunfig.toml").is_file(),
             support: "shipped",
-            behavior: "isolated global-store verification and private CoW prepared environments",
+            behavior: "use Bun's global virtual store when enabled (recommended, reported by doctor); otherwise seal the materialized tree once and attach private CoW prepared environments",
         },
         Adapter {
             id: "pnpm",

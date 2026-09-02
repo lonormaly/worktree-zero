@@ -102,7 +102,13 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let generated = generated_storage(&root)?;
     let bun = bun_report(&root);
     let javascript_manager = javascript_package_manager(&root)?;
-    let stale = if javascript_manager.as_deref() == Some("bun") {
+    // A materialized tree is only "stale" when Bun's global store should have
+    // linked it; under the prepared-environment fallback it is the layout.
+    let stale = if javascript_manager.as_deref() == Some("bun")
+        && bun
+            .as_ref()
+            .is_some_and(|report| bun_global_store_ready(report, &root))
+    {
         dependencies.bun_backups + dependencies.materialized_root_entries
     } else {
         0
@@ -123,13 +129,25 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
         .is_none_or(|manager| matches!(manager, "bun" | "npm" | "pnpm" | "yarn"));
     let manager_ready = match javascript_manager.as_deref() {
         None => true,
-        Some("bun") => bun.as_ref().is_some_and(|report| {
-            report.configured
-                && report.version.as_deref().is_some_and(bun_version_supported)
-                && bun_links_ready
-        }),
+        Some("bun")
+            if bun
+                .as_ref()
+                .is_some_and(|report| bun_global_store_ready(report, &root)) =>
+        {
+            bun_links_ready
+        }
         Some("yarn") if yarn_uses_pnp(&root) => true,
         Some(_) => root.join("node_modules").is_dir() && prepared_attached,
+    };
+    let recommendations: Vec<&str> = match javascript_manager.as_deref() {
+        Some("bun")
+            if !bun
+                .as_ref()
+                .is_some_and(|report| bun_global_store_ready(report, &root)) =>
+        {
+            vec![BUN_GLOBAL_STORE_ADVICE]
+        }
+        _ => Vec::new(),
     };
     let dependency_ready = dependency_adapter_shipped
         && manager_ready
@@ -165,6 +183,7 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
             "materialized_store_bytes": dependencies.materialized_store_entries,
             "prepared_environment_key": prepared_key,
             "prepared_environment_attached": prepared_attached,
+            "recommendations": recommendations,
         },
         "generated": {
             "logical_bytes": generated.total(),
@@ -197,6 +216,9 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
         );
         println!("  generated state:   {}", human_bytes(generated.total()));
         println!("  ready:             {}", if ready { "yes" } else { "no" });
+        for recommendation in &recommendations {
+            println!("  recommend: {recommendation}");
+        }
         if stale > 0 {
             println!("  action: run a reviewed Worktree Zero dependency repair before agent work");
         }
@@ -352,7 +374,11 @@ fn migrate_one(
     let generated = generated_storage(root)?;
     let bun = bun_report(root);
     let manager = javascript_package_manager(root)?;
-    let stale_before = if manager.as_deref() == Some("bun") {
+    let stale_before = if manager.as_deref() == Some("bun")
+        && bun
+            .as_ref()
+            .is_some_and(|report| bun_global_store_ready(report, root))
+    {
         dependencies_before.bun_backups + dependencies_before.materialized_root_entries
     } else {
         0
@@ -407,13 +433,7 @@ fn migrate_one(
     }
     if !source_only && (stale_before > 0 || needs_prepared_environment) {
         match manager.as_deref() {
-            Some("bun")
-                if bun.as_ref().is_some_and(|report| {
-                    report.configured
-                        && report.version.as_deref().is_some_and(bun_version_supported)
-                }) => {}
-            Some("bun") => blockers.push("Bun isolated global store is not ready".to_string()),
-            Some("npm" | "pnpm" | "yarn") if manager_version.is_some() => {}
+            Some("bun" | "npm" | "pnpm" | "yarn") if manager_version.is_some() => {}
             Some(manager) => blockers.push(format!("{manager} executable is unavailable")),
             None => blockers.push("no supported package-manager adapter was detected".to_string()),
         }
@@ -460,7 +480,11 @@ fn migrate_one(
             let version = manager_version
                 .as_deref()
                 .context("prepared environment has no package-manager version")?;
-            if selected == "bun" {
+            if selected == "bun"
+                && bun
+                    .as_ref()
+                    .is_some_and(|report| bun_global_store_ready(report, root))
+            {
                 prepare_bun_environment(root, key, version)?;
             } else {
                 prepare_portable_node_environment(root, selected, key, version)?;
@@ -572,16 +596,24 @@ pub(crate) fn prepare_for_agent_run(root: &Path) -> Result<()> {
     }
 }
 
+/// The configuration that lets Bun share package files through its own
+/// global virtual store. Recommended, never required: without it wt0 seals
+/// the materialized tree once and clones it per worktree, exactly as it does
+/// for npm, pnpm, and Yarn.
+pub(crate) const BUN_GLOBAL_STORE_ADVICE: &str = "enable Bun's global virtual store for the smallest footprint: bunfig.toml [install] linker = \"isolated\" and globalStore = true, with Bun 1.3.14 or newer";
+
+fn bun_global_store_ready(bun: &BunReport, root: &Path) -> bool {
+    bun.configured
+        && (!root.join("package.json").is_file()
+            || bun.version.as_deref().is_some_and(bun_version_supported))
+}
+
 fn prepare_bun(root: &Path, apply: bool, json_output: bool) -> Result<()> {
     assert_node_modules_ignored(root)?;
     let bun = bun_report(root).context("Bun project configuration was not found")?;
-    if !bun.configured {
-        bail!("Bun must use linker=isolated and globalStore=true before repair");
-    }
-    if root.join("package.json").is_file()
-        && !bun.version.as_deref().is_some_and(bun_version_supported)
-    {
-        bail!("Bun 1.3.14 or newer is required for the isolated global store");
+    if !bun_global_store_ready(&bun, root) {
+        eprintln!("wt0: Bun's global store is not enabled here; sealing a prepared environment instead ({BUN_GLOBAL_STORE_ADVICE})");
+        return prepare_node_environment(root, "bun", apply, json_output);
     }
 
     let before = dependency_storage(root)?;
@@ -800,6 +832,7 @@ fn run_package_manager_install(root: &Path, manager: &str, version: &str) -> Res
         "pnpm" => ("pnpm", vec!["install", "--frozen-lockfile"]),
         "yarn" if version.starts_with("1.") => ("yarn", vec!["install", "--frozen-lockfile"]),
         "yarn" => ("yarn", vec!["install", "--immutable"]),
+        "bun" => ("bun", vec!["install", "--frozen-lockfile"]),
         _ => bail!("no portable node_modules adapter exists for {manager}"),
     };
     let lock = manager_lockfile(root, manager)?;

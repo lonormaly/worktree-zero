@@ -5,6 +5,18 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ## Unreleased
 
+### Changed
+
+- **Every JavaScript package manager gets the same contract.** Bun without
+  its global virtual store no longer refuses `prepare`/`run`/`migrate`: wt0
+  recommends enabling the store (`doctor` reports the exact `bunfig.toml`
+  lines and version floor under `recommendations`), then seals the
+  materialized tree once and attaches private copy-on-write prepared
+  environments per worktree — exactly what npm, pnpm, and Yarn already got.
+  Yarn PnP stays native. The manager's own store is the smallest footprint;
+  the prepared environment is the floor, never a full copy and never a
+  refusal.
+
 ### Fixed
 
 - **Spotlight no longer blocks cleanup on macOS**: the open-path guard that
