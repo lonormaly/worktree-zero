@@ -56,6 +56,11 @@ pub fn run(args: Capabilities, json_output: bool) -> Result<()> {
         "selected_javascript_package_manager": selected_package,
         "javascript_package_manager_conflict": package_conflict,
         "generated_state": adapters_json(&generated),
+        "project_seed": worktree::project_seed_policy(&root)
+            .unwrap_or_default()
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<String>>(),
         "project_hooks": {
             "post_create": crate::hooks::hook_path(&root, crate::hooks::HookEvent::PostCreate)
                 .is_some(),
@@ -97,6 +102,11 @@ pub fn run(args: Capabilities, json_output: bool) -> Result<()> {
         .collect();
         if !hooks.is_empty() {
             println!("  project hooks:    {}", hooks.join(", "));
+        }
+        if let Ok(seeds) = worktree::project_seed_policy(&root) {
+            if !seeds.is_empty() {
+                println!("  seed from base:   {} path(s) in .wt0-seed", seeds.len());
+            }
         }
         println!("  agent protocol:   JSON CLI + portable skill + MCP");
         println!("  MCP transport:    wt0 mcp serve (stdio)");
