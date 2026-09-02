@@ -934,7 +934,9 @@ fn add_cow_worktree_traced(
         if cloned > 0 {
             trace.note(format!("({cloned} files)"));
         }
-        trace.time("status", || ensure_clean(target).context("verify cloned worktree"))?;
+        trace.time("status", || {
+            ensure_clean(target).context("verify cloned worktree")
+        })?;
         fs::write(
             source_migration_marker(target)?,
             format!("{base}\n{base}\n"),
