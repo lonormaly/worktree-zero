@@ -530,11 +530,10 @@ fn migrate_one(
     let generated = generated_storage(root)?;
     let bun = bun_report(root);
     let manager = javascript_package_manager(root)?;
-    let stale_before = if manager.as_deref() == Some("bun")
-        && bun
-            .as_ref()
-            .is_some_and(|report| bun_global_store_ready(report, root))
-    {
+    let store = manager
+        .as_deref()
+        .map(|manager| native_store(root, manager, bun.as_ref()));
+    let stale_before = if matches!(store, Some(NativeStore::BunGlobalStore)) {
         dependencies_before.bun_backups + dependencies_before.materialized_root_entries
     } else {
         0
@@ -550,11 +549,17 @@ fn migrate_one(
     let prepared_attached = prepared_key
         .as_deref()
         .is_some_and(|key| prepared_marker_key(root).ok().flatten().as_deref() == Some(key));
-    let needs_prepared_environment = match manager.as_deref() {
+    // pnpm and Yarn's pnpm linker need no wt0-sealed environment either: a
+    // native store is never sealed (`prepare_native_store`), so there is
+    // nothing here for migrate to attach — treat dependencies as already
+    // migrated, the same way Yarn PnP already was.
+    let needs_prepared_environment = match &store {
         None => false,
-        Some("yarn") if yarn_uses_pnp(root) => false,
-        Some("bun") => dependencies_before.materialized_store_entries > 0 && !prepared_attached,
-        Some(_) => !prepared_attached,
+        Some(NativeStore::YarnPnp | NativeStore::Pnpm | NativeStore::YarnPnpmLinker) => false,
+        Some(NativeStore::BunGlobalStore) => {
+            dependencies_before.materialized_store_entries > 0 && !prepared_attached
+        }
+        Some(NativeStore::None { .. }) => !prepared_attached,
     };
     let source_before = worktree::migrate_identical_source(root, baseline_ref, false)?;
     let repo = worktree::discover_repo(root)?;
@@ -636,11 +641,7 @@ fn migrate_one(
             let version = manager_version
                 .as_deref()
                 .context("prepared environment has no package-manager version")?;
-            if selected == "bun"
-                && bun
-                    .as_ref()
-                    .is_some_and(|report| bun_global_store_ready(report, root))
-            {
+            if matches!(store, Some(NativeStore::BunGlobalStore)) {
                 prepare_bun_environment(root, key, version)?;
             } else {
                 prepare_portable_node_environment(root, selected, key, version)?;
@@ -720,35 +721,46 @@ pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
     let root = git_root(&requested)?;
     let manager = javascript_package_manager(&root)?
         .context("no JavaScript package-manager lockfile was found")?;
-    if manager == "yarn" && yarn_uses_pnp(&root) {
-        emit_prepare(
-            json_output,
-            &root,
-            false,
-            0,
-            None,
-            None,
-            "Yarn Plug'n'Play or zero-install is already repository-native; no node_modules environment is needed",
-        )?;
-        return Ok(());
+    if manager == "bun" {
+        return prepare_bun(&root, args.apply, json_output);
     }
-    if manager != "bun" {
-        return prepare_node_environment(&root, &manager, args.apply, json_output);
+    match native_store(&root, &manager, None) {
+        NativeStore::YarnPnp => {
+            emit_prepare(
+                json_output,
+                &root,
+                false,
+                0,
+                None,
+                None,
+                "Yarn Plug'n'Play or zero-install is already repository-native; no node_modules environment is needed",
+            )?;
+            Ok(())
+        }
+        NativeStore::Pnpm | NativeStore::YarnPnpmLinker => {
+            prepare_native_store(&root, &manager, args.apply, json_output)
+        }
+        NativeStore::BunGlobalStore | NativeStore::None { .. } => {
+            prepare_node_environment(&root, &manager, args.apply, json_output)
+        }
     }
-    prepare_bun(&root, args.apply, json_output)
 }
 
 pub(crate) fn prepare_for_agent_run(root: &Path) -> Result<()> {
     let Some(manager) = javascript_package_manager(root)? else {
         return Ok(());
     };
-    if manager == "yarn" && yarn_uses_pnp(root) {
-        return Ok(());
-    }
     if manager == "bun" {
-        prepare_bun(root, true, false)
-    } else {
-        prepare_node_environment(root, &manager, true, false)
+        return prepare_bun(root, true, false);
+    }
+    match native_store(root, &manager, None) {
+        NativeStore::YarnPnp => Ok(()),
+        NativeStore::Pnpm | NativeStore::YarnPnpmLinker => {
+            prepare_native_store(root, &manager, true, false)
+        }
+        NativeStore::BunGlobalStore | NativeStore::None { .. } => {
+            prepare_node_environment(root, &manager, true, false)
+        }
     }
 }
 
@@ -889,6 +901,76 @@ fn prepare_node_environment(
         Some(&prepared.key),
         Some(i128::from(physical_after) - i128::from(physical_before)),
         prepared.action,
+    )
+}
+
+/// A repository whose manager already runs its own native link-tree store
+/// (pnpm, Yarn Berry's `nodeLinker: pnpm`) needs no wt0-sealed prepared
+/// environment: sealing one the way `prepare_portable_node_environment` does
+/// would clone the store's hardlinks into wt0 clones — the exact cost the
+/// seed gate now refuses to pay (`node_modules_seed_refusal`'s "native store
+/// is cheaper"). Instead this runs the manager's own frozen install directly
+/// against its shared store — the marginal cost per checkout is 6–7 MiB once
+/// the store is warm (docs/research/dependency-link-trees.md) — but only
+/// when `node_modules` is missing or the local marker shows its lockfile
+/// changed since the last install; otherwise there is nothing to do, and no
+/// `.wt0-environment.json` is written, because there is nothing sealed.
+fn prepare_native_store(root: &Path, manager: &str, apply: bool, json_output: bool) -> Result<()> {
+    assert_node_modules_ignored(root)?;
+    let lock = manager_lockfile(root, manager)?;
+    let lockfile_hash =
+        content_hash(&fs::read(&lock).with_context(|| format!("read {}", lock.display()))?)?;
+    let modules = root.join("node_modules");
+    let stale = !modules.is_dir()
+        || native_store_marker_key(root)?.as_deref() != Some(lockfile_hash.as_str());
+    if !stale {
+        emit_prepare(
+            json_output,
+            root,
+            false,
+            0,
+            None,
+            None,
+            &format!(
+                "native store ({manager}): already installed from the shared store; nothing to seal"
+            ),
+        )?;
+        return Ok(());
+    }
+    if !apply {
+        emit_prepare(
+            json_output,
+            root,
+            false,
+            0,
+            None,
+            None,
+            "dry run; repeat with --apply after reviewing the exact target",
+        )?;
+        return Ok(());
+    }
+    let dirty_entries = git_dirty_count(root)?;
+    if dirty_entries > 0 {
+        bail!("refusing dependency preparation in dirty worktree ({dirty_entries} entries)");
+    }
+    if modules.exists() {
+        if let Some(path) = crate::process::live_open_path(&modules)? {
+            bail!("refusing dependency preparation while a process uses {path}");
+        }
+    }
+    let version = package_manager_version(manager)?;
+    let physical_before = filesystem_free_bytes(root)?;
+    run_package_manager_install(root, manager, &version)?;
+    write_native_store_marker(root, manager, &lockfile_hash)?;
+    let physical_after = filesystem_free_bytes(root)?;
+    emit_prepare(
+        json_output,
+        root,
+        true,
+        0,
+        None,
+        Some(i128::from(physical_after) - i128::from(physical_before)),
+        &format!("native store ({manager}): installed from the shared store; nothing to seal"),
     )
 }
 
@@ -1704,6 +1786,57 @@ fn write_prepared_marker_for(
         }))?,
     )
     .context("write prepared-environment marker")
+}
+
+/// A stable content hash via `git hash-object` — the same identity
+/// technique `package_environment_key` uses, deterministic across process
+/// runs (unlike `std::hash`'s randomized default), with no extra hashing
+/// dependency.
+fn content_hash(bytes: &[u8]) -> Result<String> {
+    let mut child = Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("start content hash")?;
+    child
+        .stdin
+        .take()
+        .context("open content hash input")?
+        .write_all(bytes)
+        .context("write content hash input")?;
+    let output = child.wait_with_output().context("compute content hash")?;
+    if !output.status.success() {
+        bail!("git hash-object failed while hashing content");
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+/// The lockfile hash a native store's `node_modules` was last installed
+/// against, if `root` carries the marker. Separate from
+/// `.wt0-environment.json`, which names a wt0-sealed prepared environment —
+/// a native store is never sealed, so this only tracks local staleness.
+fn native_store_marker_key(root: &Path) -> Result<Option<String>> {
+    let marker = root.join("node_modules/.wt0-native-store.json");
+    let bytes = match fs::read(&marker) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read native-store marker"),
+    };
+    let value: Value = serde_json::from_slice(&bytes).context("parse native-store marker")?;
+    Ok(value["lockfile_hash"].as_str().map(str::to_owned))
+}
+
+fn write_native_store_marker(root: &Path, manager: &str, lockfile_hash: &str) -> Result<()> {
+    fs::write(
+        root.join("node_modules/.wt0-native-store.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "adapter": manager,
+            "lockfile_hash": lockfile_hash,
+        }))?,
+    )
+    .context("write native-store marker")
 }
 
 /// Walk the tree natively (no external `find`) and refuse symlinks whose

@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# Prove that the npm/pnpm/Yarn node_modules adapters attach private CoW views.
+# Prove that the npm/pnpm/Yarn node_modules adapters work end to end. npm and
+# Yarn classic get a wt0-sealed prepared environment attached as a private
+# CoW view; pnpm already has its own native content-addressable store, so it
+# takes a different path (`prepare_native_store` in runtime.rs) — `migrate`
+# treats its dependencies as already migrated, and `prepare` runs pnpm's own
+# frozen install directly against the shared store instead of sealing
+# anything. Yarn Berry's `nodeLinker: pnpm` shares that code path but is not
+# exercised here (no Yarn Berry in this CI image); see docs/research/dependency-link-trees.md.
 set -euo pipefail
 
 manager="${1:-npm}"
@@ -51,15 +58,34 @@ node -e "if (!require('$repo/node_modules/is-even')(4)) process.exit(1)"
 second="$repo-second"
 git -C "$repo" worktree add -qb second "$second"
 "$binary" migrate "$second" --baseline HEAD --apply --json > "$repo/receipt.json"
-"$binary" doctor "$second" --json >/dev/null
-node -e "if (!require('$second/node_modules/is-even')(4)) process.exit(1)"
+if [[ "$manager" == pnpm ]]; then
+  # A raw `git worktree add` carries no node_modules (it is untracked), and
+  # migrate no longer populates one for a native store — that is `prepare`'s
+  # job now, run directly against the shared store, not a sealed attach.
+  if grep -q 'attach_prepared_package_environment' "$repo/receipt.json"; then
+    echo "migrate should not attach a sealed environment for pnpm's native store" >&2
+    exit 1
+  fi
+  "$binary" prepare "$second" --apply --json > "$repo/second-prepare-receipt.json"
+  grep -q 'native store (pnpm): installed from the shared store; nothing to seal' \
+    "$repo/second-prepare-receipt.json"
+  "$binary" doctor "$second" --json >/dev/null
+  node -e "if (!require('$second/node_modules/is-even')(4)) process.exit(1)"
+  # Unlike a sealed environment's private CoW view, pnpm's top-level
+  # node_modules entries are symlinks into its own shared content-addressable
+  # store: mutating them in place is not wt0's guarantee to make, so this
+  # fixture does not attempt (and must not rely on) the privacy check below.
+else
+  "$binary" doctor "$second" --json >/dev/null
+  node -e "if (!require('$second/node_modules/is-even')(4)) process.exit(1)"
 
-probe="$second/node_modules/is-even/index.js"
-original="$(shasum -a 256 "$repo/node_modules/is-even/index.js" | awk '{print $1}')"
-printf '\n// private worktree mutation\n' >> "$probe"
-after="$(shasum -a 256 "$repo/node_modules/is-even/index.js" | awk '{print $1}')"
-[[ "$original" == "$after" ]]
-grep -q 'attach_prepared_package_environment' "$repo/receipt.json"
+  probe="$second/node_modules/is-even/index.js"
+  original="$(shasum -a 256 "$repo/node_modules/is-even/index.js" | awk '{print $1}')"
+  printf '\n// private worktree mutation\n' >> "$probe"
+  after="$(shasum -a 256 "$repo/node_modules/is-even/index.js" | awk '{print $1}')"
+  [[ "$original" == "$after" ]]
+  grep -q 'attach_prepared_package_environment' "$repo/receipt.json"
+fi
 
 git -C "$repo" worktree remove --force "$second"
 
@@ -83,7 +109,11 @@ fi
 "$binary" prepare "$drift" --apply --json > "$repo/drift-receipt.json"
 "$binary" doctor "$drift" --json >/dev/null
 node -e "if (!require('$drift/node_modules/is-odd')(3)) process.exit(1)"
-grep -q 'derived and sealed a prepared environment from the nearest compatible snapshot' "$repo/drift-receipt.json"
+if [[ "$manager" == pnpm ]]; then
+  grep -q 'native store (pnpm): installed from the shared store; nothing to seal' "$repo/drift-receipt.json"
+else
+  grep -q 'derived and sealed a prepared environment from the nearest compatible snapshot' "$repo/drift-receipt.json"
+fi
 git -C "$repo" worktree remove --force "$drift"
 
 echo "$manager prepared environment is executable, reusable, private, and incremental after one-package drift"

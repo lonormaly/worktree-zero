@@ -24,7 +24,15 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   turn its hardlinks into wt0 clones paying the full ~2 KB/file metadata
   cost, and the native install measured cheaper than that clone (Bun: 3 MiB
   native vs. 9 MiB wt0-seeded, `docs/design-partners/flam-migration.md` gap
-  #7) — with reason `native store is cheaper: <store>`.
+  #7) — with reason `native store is cheaper: <store>`. `wt0 migrate` and
+  `wt0 prepare` now agree with `doctor`: a pnpm or Yarn-pnpm-linker
+  `node_modules` is never sealed into a wt0-owned prepared environment —
+  `migrate` treats its dependencies as already migrated, and `prepare
+  --apply` instead runs the manager's own frozen install directly against
+  its shared store (only when `node_modules` is missing or a small local
+  marker shows the lockfile changed), reporting
+  `native store (pnpm): installed from the shared store; nothing to seal`
+  and writing no `.wt0-environment.json`.
 
 ## 0.1.16 — 2026-09-02
 
