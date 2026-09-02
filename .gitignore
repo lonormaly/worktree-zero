@@ -16,3 +16,6 @@ plan
 # share one memory partition; ignore churny logs + claude-ctx)
 .immorterm/*
 !.immorterm/project.json
+
+# Claude Code agent isolation worktrees
+.claude/worktrees/
