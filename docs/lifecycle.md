@@ -35,6 +35,25 @@ window released. A project reconciles its own external resources — a
 per-runtime database, a namespace — from those events; wt0 never deletes
 what only the project's hooks know about.
 
+### The baseline: deriving from the checkout
+
+`wt0 create` populates a new worktree from an immutable cached baseline —
+the commit's tracked tree, cloned copy-on-write. The first time a commit is
+requested, that baseline is derived from the cheapest sound source
+available, in order: the repository's own main working tree, if it is
+clean enough to trust; otherwise the nearest existing baseline already in
+the store (unchanged paths shared, the diff re-materialized); otherwise a
+full materialization from Git objects. Deriving from the checkout means
+clean tracked content clones straight from it — untracked, ignored, and
+locally modified paths are excluded and re-materialized from the commit
+instead, so a dirty checkout never leaks into a baseline. Any doubt about
+the result falls back to the next source rather than risk a wrong tree; the
+baseline's `derived-from` marker records which source won (`checkout`, a
+parent commit, or absent for a full materialization). This is what keeps
+the first worktree of a base commit from paying a second physical copy of
+content the checkout already holds — measured on FLAM,
+`docs/design-partners/flam-migration.md` ("After — D13").
+
 ### Seeding: the base checkout as the store
 
 A checked-in `.wt0-seed` lists ignored, self-validating caches to
@@ -98,7 +117,16 @@ materialized copies, so their entry count does not predict physical cost.
 
 A worktree whose lockfile changed gets its dependencies from a sealed
 prepared environment (`wt0 prepare`), the base's install made consistent and
-keyed to the lockfile, attached automatically.
+keyed to the lockfile, attached automatically. The same "base checkout as
+the store" idea applies to the very first seal of a new environment key too:
+when no compatible environment is cached yet and the base checkout's own
+`node_modules` passes the same trust conditions above (matching lockfile,
+matching manager, matching Bun linker layout, not mid-install), `wt0
+prepare` clones it as the starting point and lets the manager's ordinary
+install reconcile on top, instead of installing into empty air — measured
+to fall from 391.6 MiB to 8.9 MiB on an npm/Next fixture
+(`docs/design-partners/drift.md`, Scenario 2). Native-store managers (pnpm,
+Yarn's `nodeLinker: pnpm`) never reach this — they seal nothing, by design.
 
 The same rules as `.wt0-generated` apply: relative paths only; `.env*`,
 `.dev.vars`, and `secrets` are rejected by the policy. Per entry the create

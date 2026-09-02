@@ -20,6 +20,24 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Changed
 
+- **The first worktree of a base commit now costs about what the second
+  does.** `wt0 create` derives the baseline from the repository's own main
+  working tree (when it is clean enough to trust — dirty, untracked, and
+  ignored paths are excluded and re-materialized from the commit) instead
+  of a second physical copy from Git objects, and `wt0 prepare`'s first
+  seal for a new environment key clones the base checkout's `node_modules`
+  and lets the package manager's ordinary install reconcile on top of it,
+  instead of installing into empty air. Measured on FLAM (isolated APFS
+  sparse image, `docs/design-partners/flam-migration.md` "After — D13"):
+  the first worktree of a base commit fell from 517 MiB to **15.7 MiB**
+  (97.0% less), the ten-worktree total from 595 MiB to **84.9 MiB**
+  (85.7% less); the npm/Next fixture's first prepared-environment seal
+  (`docs/design-partners/drift.md` Scenario 2) fell from 391.6 MiB to
+  **8.9 MiB** (97.7% less). Marginal cost per worktree beyond the first is
+  unchanged. Any doubt about the derived baseline or seal falls back to the
+  previous behavior (a cached baseline, or a fresh install) — correctness
+  never depends on the shortcut.
+
 - **`wt0 doctor` names every manager's native link-tree store, and seeding
   defers to one that is active.** pnpm's content-addressable store and
   Yarn Berry's `nodeLinker: pnpm` are now reported alongside Bun's global

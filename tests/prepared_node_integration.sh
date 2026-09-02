@@ -116,4 +116,35 @@ else
 fi
 git -C "$repo" worktree remove --force "$drift"
 
+# D13: the very first prepare for a repository (no compatible environment
+# cached in the store yet) seals its payload by cloning the base checkout's
+# own node_modules and reconciling on top of it, instead of installing into
+# empty air. Only npm is covered here — the fresh-store precondition needs a
+# repository the earlier cases in this script never touched, and pnpm/Yarn's
+# pnpm linker never reach this code path at all (they seal nothing).
+if [[ "$manager" == npm ]]; then
+  base_repo="$(mktemp -d "${TMPDIR:-/tmp}/wt0-npm-frombase.XXXXXX")"
+  trap 'rm -rf "$repo" "$base_repo"' EXIT
+  git -C "$base_repo" init -q
+  git -C "$base_repo" config user.email wt0@example.invalid
+  git -C "$base_repo" config user.name "Worktree Zero Test"
+  printf 'node_modules/\n' > "$base_repo/.gitignore"
+  printf '{"name":"wt0-node-frombase-test","private":true,"dependencies":{"is-even":"1.0.0"}}\n' \
+    > "$base_repo/package.json"
+  (cd "$base_repo" && npm install --no-audit --no-fund >/dev/null)
+  git -C "$base_repo" add package.json
+  git -C "$base_repo" add -f .gitignore package-lock.json
+  git -C "$base_repo" commit -qm fixture
+
+  frombase="$base_repo-frombase"
+  git -C "$base_repo" worktree add -qb frombase "$frombase"
+  "$binary" prepare "$frombase" --apply --json > "$base_repo/frombase-receipt.json"
+  grep -q "derived from the base checkout's node_modules" "$base_repo/frombase-receipt.json"
+  "$binary" doctor "$frombase" --json >/dev/null
+  node -e "if (!require('$frombase/node_modules/is-even')(4)) process.exit(1)"
+  git -C "$base_repo" worktree remove --force "$frombase"
+
+  echo "npm prepared environment derives its first seal from the base checkout's node_modules"
+fi
+
 echo "$manager prepared environment is executable, reusable, private, and incremental after one-package drift"
