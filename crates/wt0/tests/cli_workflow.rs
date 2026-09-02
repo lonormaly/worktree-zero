@@ -1115,6 +1115,9 @@ fn seeding_clones_node_modules_only_when_the_bun_layout_matches() {
 /// byte-identical to the base's — measured: npm's reconcile then rewrites
 /// nothing — and never without a lockfile to prove it. `doctor` states what
 /// a materialized tree costs per worktree once that cost passes the bar.
+/// Unix only: the 10,500-file fixture that trips the bar costs a minute of
+/// per-file ReFS clones on the Windows job, and the gate logic is shared.
+#[cfg(unix)]
 #[test]
 fn seeding_clones_any_node_modules_behind_an_identical_lockfile() {
     let root = std::env::temp_dir().join(format!(
