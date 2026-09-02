@@ -1551,6 +1551,9 @@ fn create_derives_the_baseline_from_the_base_checkout() {
     git(&repo, &["init", "-q"]);
     git(&repo, &["config", "user.email", "test@example.com"]);
     git(&repo, &["config", "user.name", "Test User"]);
+    // Runner images set core.autocrlf=true globally on Windows; the content
+    // assertions below target exact bytes, so pin checkout to raw LF.
+    git(&repo, &["config", "core.autocrlf", "false"]);
     fs::write(repo.join("src/a.txt"), "committed a\n").expect("write fixture");
     fs::write(repo.join("README.md"), "base\n").expect("write fixture");
     fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
