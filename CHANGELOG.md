@@ -7,6 +7,12 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Added
 
+- **`npm i -g wt0` / `npx wt0`.** The `wt0` npm package dispatches to one of
+  six platform packages (`wt0-darwin-arm64`, `wt0-darwin-x64`,
+  `wt0-linux-x64`, `wt0-linux-arm64`, `wt0-win32-x64`, `wt0-win32-arm64`)
+  installed automatically as an optional dependency, each carrying the
+  prebuilt release binary — no postinstall network download. See `npm/` for
+  the packages and `npm/build.sh` / `npm/publish.sh`.
 - **Drift benchmark: does an install after `wt0 create` stay a delta, or
   rewrite the tree?** `docs/design-partners/drift.md` measures npm, Bun
   (hoisted and isolated+globalStore), and pnpm adding/removing a package,

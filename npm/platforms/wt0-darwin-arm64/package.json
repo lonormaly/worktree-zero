@@ -1,0 +1,20 @@
+{
+  "name": "wt0-darwin-arm64",
+  "version": "0.0.0-dev",
+  "description": "wt0 prebuilt binary for macOS (Apple Silicon). Installed automatically as an optional dependency of the wt0 package -- do not install directly.",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin/wt0"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lonormaly/worktree-zero.git"
+  },
+  "homepage": "https://github.com/lonormaly/worktree-zero"
+}
