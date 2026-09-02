@@ -21,11 +21,22 @@ pub(crate) fn live_working_directories() -> Result<Vec<PathBuf>> {
 }
 
 /// The first live process working directory inside `root`, if any.
-pub(crate) fn live_working_directory(root: &Path) -> Result<Option<String>> {
-    Ok(live_working_directories()?
+/// A working directory inside `root` held by a process other than this one
+/// and the shell chain that launched it: `cd worktree && wt0 prepare --apply` is the
+/// documented way to prepare, and the invoker's own cwd is not a foreign
+/// occupant. Removal keeps the strict form — nothing should sit inside a
+/// worktree that is about to disappear, the caller included.
+pub(crate) fn foreign_working_directory(root: &Path) -> Result<Option<String>> {
+    let me = std::process::id();
+    let own = imp::ancestor_pids();
+    Ok(imp::live_working_directories_by_pid()?
         .into_iter()
-        .find(|path| path.starts_with(root))
-        .map(|path| path.display().to_string()))
+        .filter(|(pid, path)| path.starts_with(root) && !own.contains(pid))
+        // Our own children inherit our cwd — including the `lsof` doing this
+        // very probe, which has usually exited by now; a process that is gone
+        // holds nothing either way.
+        .find(|(pid, _)| imp::is_alive(*pid) && !imp::ancestors_of(*pid).contains(&me))
+        .map(|(_, path)| path.display().to_string()))
 }
 
 /// A path inside `root` that a live process currently holds open, if any.
@@ -40,18 +51,68 @@ mod imp {
     use std::process::Command;
 
     pub(super) fn live_working_directories() -> Result<Vec<PathBuf>> {
+        Ok(live_working_directories_by_pid()?
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect())
+    }
+
+    /// Every live process's working directory, with its pid.
+    pub(super) fn live_working_directories_by_pid() -> Result<Vec<(u32, PathBuf)>> {
         let output = Command::new("lsof")
-            .args(["-a", "-d", "cwd", "-Fn"])
+            .args(["-a", "-d", "cwd", "-Fpn"])
             .output()
             .context("lsof is required for safe cleanup and migration")?;
         if !output.status.success() && output.status.code() != Some(1) {
             bail!("lsof failed while checking active processes");
         }
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| line.strip_prefix('n'))
-            .map(PathBuf::from)
-            .collect())
+        let mut pid = 0;
+        let mut entries = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(raw) = line.strip_prefix('p') {
+                pid = raw.parse().unwrap_or(0);
+            } else if let Some(path) = line.strip_prefix('n') {
+                entries.push((pid, PathBuf::from(path)));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// This process and every ancestor up to init.
+    pub(super) fn ancestor_pids() -> Vec<u32> {
+        ancestors_of(std::process::id())
+    }
+
+    pub(super) fn is_alive(pid: u32) -> bool {
+        Command::new("ps")
+            .args(["-o", "pid=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|output| !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    }
+
+    /// `pid` and every ancestor up to init.
+    pub(super) fn ancestors_of(pid: u32) -> Vec<u32> {
+        let mut chain = vec![pid];
+        let mut current = pid;
+        for _ in 0..64 {
+            let parent = Command::new("ps")
+                .args(["-o", "ppid=", "-p", &current.to_string()])
+                .output()
+                .ok()
+                .and_then(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                })
+                .unwrap_or(0);
+            if parent <= 1 || chain.contains(&parent) {
+                break;
+            }
+            chain.push(parent);
+            current = parent;
+        }
+        chain
     }
 
     /// Content indexers open files read-only for a while after any tree
@@ -103,6 +164,22 @@ mod imp {
         Ok(Vec::new())
     }
 
+    pub(super) fn live_working_directories_by_pid() -> Result<Vec<(u32, PathBuf)>> {
+        Ok(Vec::new())
+    }
+
+    pub(super) fn ancestor_pids() -> Vec<u32> {
+        vec![std::process::id()]
+    }
+
+    pub(super) fn ancestors_of(pid: u32) -> Vec<u32> {
+        vec![pid]
+    }
+
+    pub(super) fn is_alive(_pid: u32) -> bool {
+        true
+    }
+
     /// Windows locks a directory tree that is in use: renaming it fails while
     /// any process has a working directory or an open directory handle inside
     /// it. A successful rename round-trip proves the tree was quiescent at
@@ -148,5 +225,31 @@ mod imp {
         let _ = child.wait();
         assert!(busy.is_some(), "expected the held directory to probe busy");
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod ancestry_tests {
+    use super::*;
+
+    // The invoker's own shell chain must never count as a foreign occupant:
+    // a test process whose cwd is `root` is exactly `cd root && wt0 …`.
+    #[test]
+    fn own_ancestry_is_not_a_foreign_working_directory() {
+        let root = std::env::temp_dir().join(format!("wt0-ancestry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create fixture");
+        let root = dunce::canonicalize(&root).expect("canonicalize");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("enter fixture");
+        let result = foreign_working_directory(&root);
+        std::env::set_current_dir(previous).expect("leave fixture");
+        assert_eq!(result.expect("probe").as_deref(), None);
+        let own = imp::ancestor_pids();
+        assert!(own.contains(&std::process::id()));
+        assert!(
+            own.len() >= 2,
+            "expected at least a parent in the chain: {own:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
