@@ -271,7 +271,7 @@ fn migrate_apply_converts_a_clean_existing_worktree_and_is_idempotent() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn git_stdout(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .current_dir(repo)
