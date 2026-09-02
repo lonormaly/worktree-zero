@@ -82,6 +82,13 @@ Each additional native worktree cost about 383 MiB. Each additional Worktree
 Zero runtime cost about 10 MiB — a **97% reduction in marginal storage** —
 and the fourth worktree still passed the repository's real test suite.
 
+That first-worktree row (-2.0%, essentially parity with native) predates
+deriving the baseline and the first prepared environment from the base
+checkout instead of a second physical copy of it
+([`flam-migration.md`](docs/design-partners/flam-migration.md#after---d13---the-first-worktree-2026-09-02)):
+measured on FLAM, the first worktree of a base commit now costs 15.7 MiB
+against a native 509 MiB.
+
 Duplication is only the first failure. Parallel agents **collide**: every dev
 server wants port 3000, every Compose stack wants the project name, every
 build tool wants the same cache directory — and a shared writable `.next`

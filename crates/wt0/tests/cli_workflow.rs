@@ -1529,6 +1529,111 @@ fn cloned_worktrees_adopt_the_baseline_index_and_stay_clean() {
     fs::remove_dir_all(root).expect("remove fixture");
 }
 
+// D13: the first worktree of a base commit derives its baseline from the
+// repository's own checkout instead of a second materialization from Git
+// objects. The base checkout is deliberately untrustworthy in three ways —
+// an ignored directory, an untracked file, and an uncommitted modification
+// to a tracked file — and none of that may reach the new worktree; the
+// modified file must carry the committed content, not the dirty one.
+#[test]
+fn create_derives_the_baseline_from_the_base_checkout() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-checkout-derive-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    let worktree = root.join("worktree");
+    fs::create_dir_all(repo.join("src")).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    // Runner images set core.autocrlf=true globally on Windows; the content
+    // assertions below target exact bytes, so pin checkout to raw LF.
+    git(&repo, &["config", "core.autocrlf", "false"]);
+    fs::write(repo.join("src/a.txt"), "committed a\n").expect("write fixture");
+    fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    // -f: a developer's global excludes file may ignore .gitignore itself.
+    git(&repo, &["add", "-f", "."]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    let commit = git_stdout_any(&repo, &["rev-parse", "HEAD"]);
+
+    // Untrustworthy checkout content that must never reach the baseline.
+    fs::create_dir_all(repo.join("node_modules/pkg")).expect("create node_modules");
+    fs::write(
+        repo.join("node_modules/pkg/index.js"),
+        "module.exports = 1;\n",
+    )
+    .expect("write dep");
+    fs::write(repo.join("untracked.txt"), "never committed\n").expect("write untracked");
+    fs::write(repo.join("src/a.txt"), "dirty in the checkout\n").expect("modify tracked file");
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "create", "checkout/derive", "--path"])
+        .arg(&worktree)
+        .output()
+        .expect("create worktree");
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&created.stdout).expect("create JSON");
+
+    // The tracked content matches the commit regardless of populate mode:
+    // the modified file carries the committed content, not the dirty one,
+    // and nothing untracked or ignored leaked in.
+    assert_eq!(
+        fs::read(worktree.join("src/a.txt")).expect("a.txt"),
+        b"committed a\n"
+    );
+    assert!(
+        !worktree.join("node_modules").exists(),
+        "ignored checkout content must never appear in the worktree"
+    );
+    assert!(
+        !worktree.join("untracked.txt").exists(),
+        "untracked checkout content must never appear in the worktree"
+    );
+    let status = git_stdout_any(&worktree, &["status", "--porcelain"]);
+    assert!(status.is_empty(), "fresh worktree is dirty:\n{status}");
+
+    // A plain filesystem (NTFS, ext4 without reflinks) cannot clone from the
+    // checkout, so only the copy-on-write mode claims the derivation.
+    if receipt["mode"] == "cow-clone" {
+        assert_eq!(
+            fs::read_to_string(
+                repo.join(".git/wt0/baselines")
+                    .join(&commit)
+                    .join("derived-from")
+            )
+            .expect("derived-from marker"),
+            "checkout"
+        );
+    }
+
+    // On Linux without reflinks the worktree is an overlay mount; only wt0
+    // can take it down, so the fixture is removed through it.
+    let removed = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["remove", "--force"])
+        .arg(&worktree)
+        .output()
+        .expect("remove worktree");
+    assert!(
+        removed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
 /// `git` output on every platform; missing keys yield an empty string.
 fn git_stdout_any(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")

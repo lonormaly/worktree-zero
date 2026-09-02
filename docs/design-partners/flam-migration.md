@@ -234,8 +234,10 @@ global-store links as the base.
 
 Marginal cost per additional usable worktree: **native 509 MiB, wt0
 8.7 MiB** (98.3% less) — inside the ≤15–20 MiB bar the Team session set as
-the go/no-go threshold. The first wt0 worktree pays the one-time baseline
-plus the first seal and costs the same as a native one.
+the go/no-go threshold. At the time of this measurement the first wt0
+worktree paid the one-time baseline plus the first seal and cost the same
+as a native one; D13, below, removes that cost by deriving both from the
+base checkout instead of a second physical copy.
 
 **Time (M2), honestly: no advantage.** Per-worktree wall clock varied
 widely on both sides (native 8–90 s, mean 39 s; wt0 14–88 s, mean 40 s).
@@ -243,6 +245,50 @@ With Bun's global store already warm, wt0's Bun path still runs
 `bun install --frozen-lockfile` in every worktree to verify and link, so
 create-plus-prepare is roughly a native install plus a fast clone. The
 storage promise is kept; a time promise is not made by these numbers.
+
+### After — D13 — the first worktree (2026-09-02)
+
+The M1 table above showed the first wt0 worktree of a base commit costing
+*more* than every one after it: 517 MiB, against 8.7 MiB marginal for
+worktrees two through ten. That 517 MiB was two one-time *second physical
+copies* of data the base checkout already held — `materialize_baseline`
+wrote the commit's tree fresh from Git objects instead of cloning the live
+checkout, and `wt0 prepare`'s first seal installed into empty air instead
+of cloning the checkout's own `node_modules`. D13 derives the baseline from
+the repository's main working tree when it is clean enough to trust
+(`cow.rs::derive_baseline_from_checkout`, tried before the cached-baseline
+derivation gap #6 already had), and seals a first prepared environment from
+the base checkout's `node_modules` the same way
+(`runtime.rs::seed_node_modules_from_base`). Same instrument, same isolated
+16 GiB APFS sparse image, FLAM at `origin/main` `be2d1c13`, Bun 1.3.14, wt0
+built from this branch:
+
+| Worktrees | Before (main, wt0 0.1.15) | After (D13) | Reduction |
+| ---: | ---: | ---: | ---: |
+| 1 | 517 MiB | **15.7 MiB** | 97.0% |
+| 4 | 543 MiB | **38.6 MiB** | 92.9% |
+| 10 | 595 MiB | **84.9 MiB** | 85.7% |
+
+Marginal cost per additional worktree beyond the first is essentially
+unchanged (≈7.7 MiB, against the earlier 8.7 MiB — D13 does not touch that
+path at all, only the first worktree's). Every worktree in the run resolved
+`next 16.3.1` from `apps/web` and held the same 1,940 global-store links as
+the base; `git status --porcelain` was empty in each; the first worktree's
+`derived-from` marker read `checkout`, worktrees two through ten attached
+the sealed environment from the store exactly as before. `wt0 create`
+itself now costs 3.6 MiB (the linked-worktree registration and index, not a
+second copy of the 368 MiB tracked tree); `wt0 prepare --apply`'s first seal
+costs 12.4 MiB (cloning the base's `node_modules` plus Bun's frozen-lockfile
+reconcile) instead of a second full install.
+
+The same optimization measured on the npm/Next fixture from
+[`drift.md`](drift.md) (Scenario 2, `wt0 prepare --apply`'s first seal with
+no native store to fall back on): **391.6 MiB before, 8.9 MiB after**
+(97.7% reduction) — cloning the base's 12,820-entry `node_modules` and
+letting `npm install` reconcile on top of it, instead of a fresh install
+into an empty tree. `wt0 doctor` reports `dependency_ready: true` and
+`prepared_environment_attached: true` afterward, and `next` resolves from
+the attached environment.
 
 ### Gap #7 — what a fresh worktree costs once its dependencies are usable (2026-09-02)
 

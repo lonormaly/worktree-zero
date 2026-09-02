@@ -2588,6 +2588,39 @@ fn lockfiles_match(base: &Path, target: &Path) -> bool {
     text(worktree) == text(base)
 }
 
+/// Whether `base`'s `node_modules` is a sound starting point for `wt0
+/// prepare` to seal a brand-new environment key at `target`, instead of
+/// installing into empty air: the same trust conditions as
+/// `node_modules_seed_refusal`'s lockfile, manager, and (for Bun) linker
+/// checks, minus the ones that do not apply here — native-store managers
+/// (pnpm, Yarn's `pnpm` linker) never reach a sealed prepare in the first
+/// place, and a live install on the base is caught here the same way.
+pub(crate) fn base_node_modules_seed_for_prepare(
+    base: &Path,
+    target: &Path,
+    manager: &str,
+) -> bool {
+    if !base.join("node_modules").is_dir() {
+        return false;
+    }
+    if !lockfiles_match(base, target) {
+        return false;
+    }
+    if crate::runtime::detect_javascript_package_managers(target) != [manager] {
+        return false;
+    }
+    if manager == "bun"
+        && crate::runtime::bun_isolated_global_store(base)
+            != crate::runtime::bun_isolated_global_store(target)
+    {
+        return false;
+    }
+    matches!(
+        crate::process::live_open_path(&base.join("node_modules")),
+        Ok(None)
+    )
+}
+
 /// Clone each seed path from the base checkout into `target` with
 /// copy-on-write. The base checkout is the store: what already exists there
 /// costs nothing to reuse, and the package manager or build tool then

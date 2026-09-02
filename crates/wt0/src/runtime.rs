@@ -63,7 +63,7 @@ struct DependencyStorage {
 #[derive(Debug)]
 struct PreparedEnvironment {
     key: String,
-    action: &'static str,
+    action: String,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -853,7 +853,7 @@ fn prepare_bun(root: &Path, apply: bool, json_output: bool) -> Result<()> {
         Some(i128::from(physical_after) - i128::from(physical_before)),
         prepared
             .as_ref()
-            .map(|environment| environment.action)
+            .map(|environment| environment.action.as_str())
             .unwrap_or("stale dependency layout retired after verification"),
     )
 }
@@ -900,7 +900,7 @@ fn prepare_node_environment(
         logical_bytes(&root.join("node_modules"))?,
         Some(&prepared.key),
         Some(i128::from(physical_after) - i128::from(physical_before)),
-        prepared.action,
+        &prepared.action,
     )
 }
 
@@ -989,13 +989,13 @@ fn prepare_portable_node_environment(
         if prepared_marker_key(root)?.as_deref() == Some(key) {
             return Ok(PreparedEnvironment {
                 key: key.to_owned(),
-                action: "prepared environment already attached",
+                action: "prepared environment already attached".to_owned(),
             });
         }
         attach_portable_node_environment(root, &exact_modules, manager, key, version, false)?;
         return Ok(PreparedEnvironment {
             key: key.to_owned(),
-            action: "attached exact prepared environment",
+            action: "attached exact prepared environment".to_owned(),
         });
     }
     if exact.exists() {
@@ -1007,6 +1007,7 @@ fn prepare_portable_node_environment(
 
     let platform_identity = platform_identity()?;
     let parent = newest_manager_environment(&family, manager, version, &platform_identity)?;
+    let mut derived_from_base = false;
     if let Some(parent) = &parent {
         attach_portable_node_environment(
             root,
@@ -1017,6 +1018,7 @@ fn prepare_portable_node_environment(
             true,
         )?;
     } else {
+        derived_from_base = seed_node_modules_from_base(root, manager)?;
         run_package_manager_install(root, manager, version)?;
         write_prepared_marker_for(root, manager, key, version)?;
     }
@@ -1024,12 +1026,64 @@ fn prepare_portable_node_environment(
     publish_manager_environment(root, &family, manager, key, version, &platform_identity)?;
     Ok(PreparedEnvironment {
         key: key.to_owned(),
-        action: if parent.is_some() {
-            "derived and sealed a prepared environment from the nearest compatible snapshot"
-        } else {
-            "sealed the first prepared environment for this platform"
-        },
+        action: prepared_environment_action(parent.is_some(), derived_from_base),
     })
+}
+
+/// The message reported for a freshly sealed (never-before-cached) prepared
+/// environment: whether the manager's install ran from scratch, or reconciled
+/// on top of a clone of the base checkout's own `node_modules` (see
+/// `seed_node_modules_from_base`). A `parent` cache hit (an existing
+/// compatible snapshot in the store) always takes priority over both, since
+/// it needs no install at all beyond the reconcile.
+fn prepared_environment_action(has_parent: bool, derived_from_base: bool) -> String {
+    if has_parent {
+        "derived and sealed a prepared environment from the nearest compatible snapshot".to_owned()
+    } else if derived_from_base {
+        "sealed the first prepared environment for this platform, derived from the base checkout's node_modules".to_owned()
+    } else {
+        "sealed the first prepared environment for this platform".to_owned()
+    }
+}
+
+/// Before a genuinely new environment key installs into an empty
+/// `node_modules`, try seeding it from the base checkout's own
+/// `node_modules` first: a copy-on-write clone shares the store's blocks,
+/// and the manager's ordinary install then reconciles only what differs
+/// from the base — measured to write nothing at all when the lockfile
+/// matches (`docs/design-partners/drift.md`). See
+/// `worktree::base_node_modules_seed_for_prepare` for the soundness gate:
+/// matching lockfile, matching manager, matching Bun linker layout, and the
+/// base tree not mid-install. Never fatal: a clone failure (typically no
+/// copy-on-write between the two locations) falls back to the ordinary
+/// from-scratch install, exactly as `wt0 create`'s seed-from-base policy
+/// does for the same reason.
+fn seed_node_modules_from_base(root: &Path, manager: &str) -> Result<bool> {
+    let repo = match worktree::discover_repo(root) {
+        Ok(repo) => repo,
+        Err(_) => return Ok(false),
+    };
+    let base = &repo.main_worktree;
+    if base.as_path() == root || !worktree::base_node_modules_seed_for_prepare(base, root, manager)
+    {
+        return Ok(false);
+    }
+    let modules = root.join("node_modules");
+    if modules.exists() {
+        return Ok(false);
+    }
+    let seeded = (|| -> Result<()> {
+        fs::create_dir(&modules).context("create node_modules for the base-checkout seed")?;
+        worktree::cow::clone_tree(&base.join("node_modules"), &modules)
+    })();
+    if let Err(error) = seeded {
+        eprintln!(
+            "wt0: could not seed node_modules from the base checkout ({error:#}); installing fresh"
+        );
+        let _ = fs::remove_dir_all(&modules);
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn attach_portable_node_environment(
@@ -1194,13 +1248,13 @@ fn prepare_bun_environment(
         if marker_key.as_deref() == Some(key) {
             return Ok(PreparedEnvironment {
                 key: key.to_owned(),
-                action: "prepared environment already attached",
+                action: "prepared environment already attached".to_owned(),
             });
         }
         attach_prepared_environment(root, &exact_modules, key, bun_version)?;
         return Ok(PreparedEnvironment {
             key: key.to_owned(),
-            action: "attached exact prepared environment",
+            action: "attached exact prepared environment".to_owned(),
         });
     }
 
@@ -1213,12 +1267,14 @@ fn prepare_bun_environment(
 
     let modules = root.join("node_modules");
     let parent = newest_prepared_environment(&family, bun_version, &platform_identity)?;
+    let mut derived_from_base = false;
     if let Some(parent) = &parent {
         attach_prepared_environment(root, &parent.join("node_modules"), key, bun_version)?;
     } else if modules.is_dir() {
         replace_dependency_tree(root)?;
         write_prepared_marker(root, key, bun_version)?;
     } else {
+        derived_from_base = seed_node_modules_from_base(root, "bun")?;
         run_bun_install(root)?;
         write_prepared_marker(root, key, bun_version)?;
     }
@@ -1227,11 +1283,7 @@ fn prepare_bun_environment(
 
     Ok(PreparedEnvironment {
         key: key.to_owned(),
-        action: if parent.is_some() {
-            "derived and sealed a prepared environment from the nearest compatible snapshot"
-        } else {
-            "sealed the first prepared environment for this platform"
-        },
+        action: prepared_environment_action(parent.is_some(), derived_from_base),
     })
 }
 

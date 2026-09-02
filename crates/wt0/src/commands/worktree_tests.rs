@@ -867,12 +867,12 @@ fn assert_tree_matches(tree: &Path, repo: &RepoContext, commit: &str) -> Result<
     Ok(())
 }
 
-// Gap #6: a new base commit must not pay a full materialization when a
-// nearby baseline exists — it is derived from the nearest one, and the
-// derived tree is proven identical to the commit (modified, added, deleted,
-// and nested paths alike).
+// D13: the repository's own main working tree is tried before any cached
+// baseline — a fresh commit's baseline is derived straight from the
+// checkout when one is available, so the store pays no second physical copy
+// of content the checkout already holds.
 #[test]
-fn baselines_derive_from_the_nearest_existing_baseline() -> Result<()> {
+fn baselines_derive_from_the_checkout_before_any_cached_baseline() -> Result<()> {
     let fixture = Fixture::new()?;
     let repo = discover_repo(&fixture.repo)?;
     let first = resolve_commit(&repo, "HEAD")?;
@@ -887,17 +887,19 @@ fn baselines_derive_from_the_nearest_existing_baseline() -> Result<()> {
     git(&fixture.repo, ["commit", "-q", "-m", "second"])?;
     let second = resolve_commit(&repo, "HEAD")?;
 
+    // The checkout is clean and at `second`, so it is the cheapest possible
+    // derivation source and wins over the cached `first` baseline.
     let second_tree = cow::ensure_baseline(&repo, &second, None)?;
     assert_tree_matches(&second_tree, &repo, &second)?;
     let derived_from = second_tree.parent().unwrap().join("derived-from");
     if cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
         assert_eq!(
             fs::read_to_string(&derived_from)?,
-            first,
-            "second baseline must derive from the first"
+            "checkout",
+            "second baseline must derive from the checkout, not the cached first baseline"
         );
     } else {
-        // A plain filesystem (NTFS, ext4) cannot clone the parent; the full
+        // A plain filesystem (NTFS, ext4) cannot clone the checkout; the full
         // materialization is the correct result and must not claim derivation.
         assert!(!derived_from.exists());
     }
@@ -906,15 +908,100 @@ fn baselines_derive_from_the_nearest_existing_baseline() -> Result<()> {
     Ok(())
 }
 
-// The shortcut is proven, not trusted: a parent baseline that acquired a
-// stray file makes the derived tree fail verification, and the fallback
-// still produces an exact baseline.
+// A dirty checkout still derives correctly: modified, untracked, and
+// ignored paths are excluded from the clone and the modified/deleted ones
+// are re-materialized from `commit`, while clean tracked content (including
+// nested directories) still clones with copy-on-write.
 #[test]
-fn a_corrupt_parent_baseline_falls_back_to_a_full_materialization() -> Result<()> {
+fn baselines_derive_from_a_dirty_checkout_excludes_untrustworthy_paths() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let commit = resolve_commit(&repo, "HEAD")?;
+
+    fs::write(fixture.repo.join("file.txt"), "dirty in the checkout\n")?;
+    fs::write(fixture.repo.join("untracked.txt"), "never committed\n")?;
+    fs::create_dir_all(fixture.repo.join("node_modules/pkg"))?;
+    fs::write(fixture.repo.join(".gitignore"), "node_modules/\n")?;
+    fs::write(
+        fixture.repo.join("node_modules/pkg/index.js"),
+        "module.exports = 1;\n",
+    )?;
+
+    let tree = cow::ensure_baseline(&repo, &commit, None)?;
+    assert_tree_matches(&tree, &repo, &commit)?;
+    assert!(
+        !tree.join("untracked.txt").exists(),
+        "untracked checkout content must never appear in the baseline"
+    );
+    assert!(
+        !tree.join("node_modules").exists(),
+        "ignored checkout content must never appear in the baseline"
+    );
+    let derived_from = tree.parent().unwrap().join("derived-from");
+    if cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+        assert_eq!(fs::read_to_string(&derived_from)?, "checkout");
+    }
+    Ok(())
+}
+
+// Gap #6, still reachable: when the checkout is not a usable derivation
+// source (simulated here by pointing `main_worktree` at a path that is not
+// a working tree), a new base commit still avoids a full materialization by
+// deriving from the nearest cached baseline instead.
+#[test]
+fn baselines_fall_back_to_the_nearest_cached_baseline_without_a_checkout() -> Result<()> {
     let fixture = Fixture::new()?;
     let repo = discover_repo(&fixture.repo)?;
     let first = resolve_commit(&repo, "HEAD")?;
     let first_tree = cow::ensure_baseline(&repo, &first, None)?;
+    assert_tree_matches(&first_tree, &repo, &first)?;
+
+    fs::write(fixture.repo.join("file.txt"), "changed\n")?;
+    fs::create_dir_all(fixture.repo.join("nested/deeper"))?;
+    fs::write(fixture.repo.join("nested/deeper/new.txt"), "added\n")?;
+    fs::remove_file(fixture.repo.join("file with spaces.txt"))?;
+    git(&fixture.repo, ["add", "-A"])?;
+    git(&fixture.repo, ["commit", "-q", "-m", "second"])?;
+    let second = resolve_commit(&repo, "HEAD")?;
+
+    let repo_without_checkout = RepoContext {
+        top_level: repo.top_level.clone(),
+        common_git_dir: repo.common_git_dir.clone(),
+        main_worktree: fixture.root.join("no-such-checkout"),
+    };
+    let second_tree = cow::ensure_baseline(&repo_without_checkout, &second, None)?;
+    assert_tree_matches(&second_tree, &repo, &second)?;
+    let derived_from = second_tree.parent().unwrap().join("derived-from");
+    if cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+        assert_eq!(
+            fs::read_to_string(&derived_from)?,
+            first,
+            "second baseline must derive from the first when no checkout is available"
+        );
+    } else {
+        assert!(!derived_from.exists());
+    }
+    assert_tree_matches(&first_tree, &repo, &first)?;
+    Ok(())
+}
+
+// The shortcut is proven, not trusted: a parent baseline that acquired a
+// stray file makes the derived tree fail verification, and the fallback
+// still produces an exact baseline. `main_worktree` is pointed at a
+// non-checkout path so this exercises the nearest-cached-baseline fallback
+// specifically, rather than the checkout derivation that would otherwise
+// win first (and never touch the corrupted parent at all).
+#[test]
+fn a_corrupt_parent_baseline_falls_back_to_a_full_materialization() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let repo_without_checkout = RepoContext {
+        top_level: repo.top_level.clone(),
+        common_git_dir: repo.common_git_dir.clone(),
+        main_worktree: fixture.root.join("no-such-checkout"),
+    };
+    let first = resolve_commit(&repo, "HEAD")?;
+    let first_tree = cow::ensure_baseline(&repo_without_checkout, &first, None)?;
     fs::write(first_tree.join("stray.txt"), "should never propagate\n")?;
 
     fs::write(fixture.repo.join("file.txt"), "changed again\n")?;
@@ -922,7 +1009,7 @@ fn a_corrupt_parent_baseline_falls_back_to_a_full_materialization() -> Result<()
     git(&fixture.repo, ["commit", "-q", "-m", "third"])?;
     let third = resolve_commit(&repo, "HEAD")?;
 
-    let third_tree = cow::ensure_baseline(&repo, &third, None)?;
+    let third_tree = cow::ensure_baseline(&repo_without_checkout, &third, None)?;
     assert_tree_matches(&third_tree, &repo, &third)?;
     assert!(
         !third_tree.parent().unwrap().join("derived-from").exists(),
