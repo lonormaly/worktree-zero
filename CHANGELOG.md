@@ -5,6 +5,18 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ## Unreleased
 
+### Changed
+
+- **`node_modules` seeds behind an identical lockfile, for every package
+  manager.** The gate that admitted only Bun global-store link trees now
+  admits the root `node_modules` of npm, pnpm, Yarn, and Bun whenever the
+  worktree's lockfile is byte-identical to the base's (and, for Bun, the
+  linker layout matches; the base must not be mid-install). Measured: after
+  seeding, `npm install` touched three paths and wrote nothing. `wt0 doctor`
+  now states what a materialized tree costs per worktree — about 2 KB of
+  filesystem metadata per file, the number no per-worktree layout can
+  beat — once it passes 20 MiB, and recommends a link-tree layout.
+
 ### Fixed
 
 - **`WT0_REPO_ROOT` is the main checkout again.** When `wt0 remove <path>`

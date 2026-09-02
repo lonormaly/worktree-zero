@@ -49,45 +49,51 @@ apps/web/.next/cache
 
 A seeded cache is warm from the first build, and a cache that validates its
 entries by content hash (Nx, Next, Turbo) treats a torn entry as a miss, so
-seeding from a base that is being written to is safe. The physical cost is
-the clone plus per-file metadata — small for caches, but real: cloning is
-per file, so a tree of hundreds of thousands of files costs minutes and tens
-of MiB of inodes even at zero data.
+seeding from a base that is being written to is safe. On APFS the whole
+tree is cloned in one `clonefile` call; elsewhere file by file.
 
-That is why **`node_modules` is allowed only when it is layout-matched**.
-Measured on a 230,000-file live `node_modules`: 168 s to clone, and after the
-package manager reconciled, a 4.2 GB junk mix of the base's hoisted layout and
-the worktree's isolated one — worse than a cold install. One shape escapes
-that cost: under Bun's isolated global store a `node_modules` is a *link
-tree*, so the clone is links rather than packages and an identical lockfile
-resolves to identical store paths. Six conditions prove it, checked in order,
-each with its own receipt reason:
+**`node_modules` seeds behind an identical lockfile.** The base checkout is
+then the store for dependencies too: the package manager's ordinary install
+in the new worktree reconciles a tree that already matches and rewrites
+nothing. Measured (`docs/design-partners/flam-migration.md`, gap #7): after
+seeding an npm tree, `npm install` touched three paths and wrote 0 MiB;
+after seeding a hoisted Bun tree, `bun install` recreated only the workspace
+trees the root-only rule leaves out. With a *different* lockfile the
+reconcile leaves a mix of the base's layout and the worktree's, so the
+lockfile is the proof. Four conditions, checked in order, each with its own
+receipt reason:
 
 1. the seed is the root `node_modules` — a nested workspace tree is only part
    of a layout ("only the root node_modules can be seeded");
-2. Bun is the worktree's package manager (`bun.lock` or `bun.lockb`); any
-   other manager keeps the sealed-prepared-environment refusal;
-3. base and worktree both carry a `bunfig.toml` whose `[install]` section sets
-   `linker = "isolated"` and `globalStore = true` ("base and worktree must
-   both use Bun's isolated global store");
-4. the base really was installed that way — `node_modules/.bun` exists and
-   holds at least one store symlink ("base node_modules is not a global-store
-   link tree");
-5. the worktree's lockfile is byte-identical to the base's, so both resolve to
-   the same store ("lockfile differs from the base; prepared environments
-   handle lockfile changes"); and
-6. no live process holds the base's `node_modules` open, so it is not
+2. the worktree carries its manager's lockfile (`bun.lock`/`bun.lockb`,
+   `pnpm-lock.yaml`, `npm-shrinkwrap.json`/`package-lock.json`, `yarn.lock`)
+   and it is identical to the base's, line endings aside ("lockfile differs from the base;
+   prepared environments handle lockfile changes" — or, without one, "no
+   lockfile proves the base tree matches");
+3. for Bun, base and worktree ask for the same linker layout in
+   `bunfig.toml` — a global-store link tree and a hoisted tree are different
+   shapes ("base and worktree must use the same Bun linker layout"); and
+4. no live process holds the base's `node_modules` open, so it is not
    mid-install ("base node_modules is in use").
 
-Every other dependency tree comes from a sealed prepared environment (`wt0
-prepare`), which is the base's install made consistent and keyed to the
-lockfile; that is the correct "origin as store" for dependencies, and it is
-attached automatically.
+What the gate does not judge is size, because the cost is not the bytes.
+Copy-on-write shares blocks, not inodes: every worktree that materializes a
+tree — seeded, attached from a prepared environment, or installed natively —
+pays about 2 KB of filesystem metadata per file (measured on APFS: 236,332
+files cost 471 MiB per worktree, 11,687 cost 5 MiB, a 12,669-link Bun
+global-store tree 9 MiB). The receipt reports the file count, and `wt0
+doctor` states what that count costs per worktree once it passes 20 MiB —
+the point at which only a link-tree layout (Bun's global store, pnpm) keeps
+the promise for that tree.
+
+A worktree whose lockfile changed gets its dependencies from a sealed
+prepared environment (`wt0 prepare`), the base's install made consistent and
+keyed to the lockfile, attached automatically.
 
 The same rules as `.wt0-generated` apply: relative paths only; `.env*`,
 `.dev.vars`, and `secrets` are rejected by the policy. Per entry the create
 receipt reports `seeded`, `absent` (the base has nothing there), `refused`
-(tracked in the new worktree, or a dependency tree that is not layout-matched),
+(tracked in the new worktree, or a dependency tree without a matching lockfile),
 or `skipped` with a reason (no copy-on-write between the two locations — a
 full copy is never substituted). Mutable state — databases, emulator persistence, build
 *output* — stays private per runtime and must not be seeded. `--no-seed`

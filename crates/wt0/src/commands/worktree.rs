@@ -2475,50 +2475,53 @@ pub(crate) fn project_seed_policy(root: &Path) -> Result<Vec<PathBuf>> {
 /// The refusal every dependency tree gets when it is not a layout-matched Bun
 /// global-store link tree: the sealed prepared environment is the consistent,
 /// lockfile-keyed form of the same install, and is what `wt0 prepare` attaches.
-const DEPENDENCY_SEED_REFUSAL: &str = "dependency trees are attached from sealed prepared environments (wt0 prepare); seed caches, not node_modules";
+const DEPENDENCY_SEED_REFUSAL: &str =
+    "no lockfile proves the base tree matches; prepared environments (wt0 prepare) handle that";
+
+/// Filesystem metadata a cloned file costs on APFS, measured: 236,332 files
+/// cost 471 MiB per worktree, 11,687 cost 5 MiB. Copy-on-write shares blocks,
+/// not inodes, so this — not the bytes — is what a seeded tree costs.
+pub(crate) const CLONED_FILE_METADATA_BYTES: u64 = 2048;
 
 /// Why this `node_modules` seed is refused, or `None` when cloning it is
-/// provably cheap and sound.
+/// sound: the package manager's ordinary install then reconciles a tree that
+/// already matches and rewrites nothing.
 ///
-/// Measured, not assumed: cloning a live 230,000-file hoisted `node_modules`
-/// took 168 s and, once the package manager reconciled, left a junk mix of the
-/// base's layout and the worktree's. Exactly one shape escapes that. Under
-/// Bun's isolated global store a `node_modules` is a *link tree*: the packages
-/// live in one machine-wide store and the tree is symlinks into it, so the
-/// clone is thousands of links instead of hundreds of thousands of files, and
-/// an identical lockfile resolves to the identical store paths — the base's
-/// links are already the links the worktree wants. Six conditions prove that,
-/// in order, each with its own receipt reason:
+/// Measured, not assumed (docs/design-partners/flam-migration.md, gap #7):
+/// with a byte-identical lockfile, `npm install` after seeding touched three
+/// paths and wrote nothing, and Bun recreated only what was not seeded. With
+/// a different lockfile the reconcile leaves a mix of the base's layout and
+/// the worktree's, so the lockfile is the proof. Four conditions, in order,
+/// each with its own receipt reason:
 ///
 /// 1. the seed is the root `node_modules` (a nested workspace tree is only
 ///    part of a layout, and hoisting decides the rest);
-/// 2. Bun is the worktree's package manager (no other manager has this shape);
-/// 3. base and worktree both ask for the isolated global store;
-/// 4. the base really was installed that way (`node_modules/.bun` link tree);
-/// 5. the lockfiles are byte-identical, so both resolve to the same store; and
-/// 6. no live process holds the base tree open, so it is not mid-install.
+/// 2. the worktree carries the manager's lockfile and it is byte-identical
+///    to the base's, so both resolve to the same tree;
+/// 3. for Bun, base and worktree ask for the same linker layout (a global
+///    store link tree and a hoisted tree are different shapes); and
+/// 4. no live process holds the base tree open, so it is not mid-install.
+///
+/// What this does not judge is size: the receipt reports the file count, and
+/// `wt0 doctor` states what that count costs per worktree.
 fn node_modules_seed_refusal(base: &Path, target: &Path, relative: &Path) -> Option<String> {
     if relative != Path::new("node_modules") {
         return Some("only the root node_modules can be seeded".to_owned());
     }
-    let bun = crate::runtime::detect_javascript_package_managers(target).as_slice() == ["bun"]
-        && (target.join("bun.lock").is_file() || target.join("bun.lockb").is_file());
-    if !bun {
-        return Some(DEPENDENCY_SEED_REFUSAL.to_owned());
-    }
-    if !crate::runtime::bun_isolated_global_store(base)
-        || !crate::runtime::bun_isolated_global_store(target)
-    {
-        return Some("base and worktree must both use Bun's isolated global store".to_owned());
-    }
-    if !crate::runtime::has_global_links(base).unwrap_or(false) {
-        return Some("base node_modules is not a global-store link tree".to_owned());
-    }
-    if !bun_lockfiles_match(base, target) {
-        return Some(
+    if !lockfiles_match(base, target) {
+        return Some(if lockfile_in(target).is_some() {
             "lockfile differs from the base; prepared environments handle lockfile changes"
-                .to_owned(),
-        );
+                .to_owned()
+        } else {
+            DEPENDENCY_SEED_REFUSAL.to_owned()
+        });
+    }
+    let bun = crate::runtime::detect_javascript_package_managers(target).as_slice() == ["bun"];
+    if bun
+        && crate::runtime::bun_isolated_global_store(base)
+            != crate::runtime::bun_isolated_global_store(target)
+    {
+        return Some("base and worktree must use the same Bun linker layout".to_owned());
     }
     // An install in flight would be cloned half-written; a failed probe is
     // treated as "in use" rather than waved through.
@@ -2531,20 +2534,42 @@ fn node_modules_seed_refusal(base: &Path, target: &Path, relative: &Path) -> Opt
     None
 }
 
-/// Whether the worktree's Bun lockfile is byte-for-byte the base's. `bun.lock`
-/// is the text lockfile and `bun.lockb` the older binary one; whichever the
-/// worktree carries is the one compared, and a base missing it never matches.
-fn bun_lockfiles_match(base: &Path, target: &Path) -> bool {
-    for name in ["bun.lock", "bun.lockb"] {
-        let lock = target.join(name);
-        if lock.is_file() {
-            return match (fs::read(&lock), fs::read(base.join(name))) {
-                (Ok(worktree), Ok(base)) => worktree == base,
-                _ => false,
-            };
-        }
+/// Lockfiles that pin a `node_modules` layout, most specific first: whichever
+/// the worktree carries is the one that must match the base.
+const LOCKFILES: [&str; 6] = [
+    "bun.lock",
+    "bun.lockb",
+    "pnpm-lock.yaml",
+    "npm-shrinkwrap.json",
+    "package-lock.json",
+    "yarn.lock",
+];
+
+fn lockfile_in(root: &Path) -> Option<&'static str> {
+    LOCKFILES.into_iter().find(|name| root.join(name).is_file())
+}
+
+/// Whether the worktree's lockfile is the base's. A worktree without one, or
+/// a base missing the same file, never matches. Text lockfiles compare with
+/// line endings normalized: a checkout under `core.autocrlf` differs from
+/// the base only in `\r`, and resolves to the same tree.
+fn lockfiles_match(base: &Path, target: &Path) -> bool {
+    let Some(name) = lockfile_in(target) else {
+        return false;
+    };
+    let (Ok(worktree), Ok(base)) = (fs::read(target.join(name)), fs::read(base.join(name))) else {
+        return false;
+    };
+    if name == "bun.lockb" {
+        return worktree == base;
     }
-    false
+    let text = |bytes: Vec<u8>| {
+        bytes
+            .into_iter()
+            .filter(|byte| *byte != b'\r')
+            .collect::<Vec<u8>>()
+    };
+    text(worktree) == text(base)
 }
 
 /// Clone each seed path from the base checkout into `target` with
@@ -2652,6 +2677,12 @@ fn seed_from_base(repo: &RepoContext, target: &Path) -> Vec<serde_json::Value> {
 }
 
 /// Logical file count and bytes under a path, without following symlinks.
+/// Regular files under `path`, following no symlinks — the number that sets
+/// a cloned tree's per-worktree cost.
+pub(crate) fn tree_files(path: &Path) -> u64 {
+    tree_size(path).0
+}
+
 fn tree_size(path: &Path) -> (u64, u64) {
     let mut files = 0;
     let mut bytes = 0;

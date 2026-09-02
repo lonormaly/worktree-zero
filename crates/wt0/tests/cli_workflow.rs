@@ -1093,7 +1093,8 @@ fn seeding_clones_node_modules_only_when_the_bun_layout_matches() {
     );
     assert!(!changed.join("node_modules").exists());
 
-    // Without the base's bunfig the layouts are not provably the same.
+    // Without the base's bunfig the base is a hoisted tree while the worktree
+    // asks for the global store: different shapes, refused.
     fs::remove_file(repo.join("bunfig.toml")).expect("drop the base bunfig");
     let unmatched = root.join("unmatched");
     let receipt = create("agent/bun-unmatched", None, &unmatched);
@@ -1102,10 +1103,126 @@ fn seeding_clones_node_modules_only_when_the_bun_layout_matches() {
     assert!(
         modules["reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("isolated global store")),
+            .is_some_and(|reason| reason.contains("same Bun linker layout")),
         "{modules}"
     );
     assert!(!unmatched.join("node_modules").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Any package manager's `node_modules` seeds when the worktree's lockfile is
+/// byte-identical to the base's — measured: npm's reconcile then rewrites
+/// nothing — and never without a lockfile to prove it. `doctor` states what
+/// a materialized tree costs per worktree once that cost passes the bar.
+#[test]
+fn seeding_clones_any_node_modules_behind_an_identical_lockfile() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-seed-npm-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write ignore rules");
+    fs::write(repo.join(".wt0-seed"), "node_modules\n").expect("write seed policy");
+    fs::write(repo.join("package.json"), "{\"name\":\"fixture\"}\n").expect("write manifest");
+    git(
+        &repo,
+        &["add", "-f", ".gitignore", ".wt0-seed", "package.json"],
+    );
+    git(&repo, &["commit", "-q", "-m", "no lockfile yet"]);
+
+    // Enough small files that the tree's metadata cost passes the 20 MiB
+    // bar doctor speaks up at (~2 KB per file).
+    let package = repo.join("node_modules/pkg");
+    fs::create_dir_all(&package).expect("create the package directory");
+    for i in 0..10_500 {
+        fs::write(package.join(format!("f{i}.js")), "1\n").expect("write a package file");
+    }
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let create = |branch: &str, base: Option<&str>, path: &Path| -> serde_json::Value {
+        let mut command = Command::new(wt0);
+        command
+            .current_dir(&repo)
+            .args(["--json", "create", branch, "--path"])
+            .arg(path);
+        if let Some(base) = base {
+            command.args(["--base", base]);
+        }
+        let created = command.output().expect("create worktree");
+        assert!(
+            created.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        serde_json::from_slice(&created.stdout).expect("create JSON")
+    };
+    let seed_of = |receipt: &serde_json::Value, path: &str| -> serde_json::Value {
+        receipt["seeded"]
+            .as_array()
+            .expect("seed receipts")
+            .iter()
+            .find(|seed| seed["path"] == path)
+            .cloned()
+            .unwrap_or_else(|| panic!("no seed receipt for {path}: {receipt}"))
+    };
+
+    // No lockfile anywhere: nothing proves the base tree is the right one.
+    let unproven = root.join("unproven");
+    let modules = seed_of(&create("agent/unproven", None, &unproven), "node_modules");
+    assert_eq!(modules["status"], "refused", "{modules}");
+    assert!(
+        modules["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no lockfile")),
+        "{modules}"
+    );
+
+    fs::write(repo.join("package-lock.json"), "{\"lockfileVersion\": 3}\n")
+        .expect("write lockfile");
+    git(&repo, &["add", "-f", "package-lock.json"]);
+    git(&repo, &["commit", "-q", "-m", "lockfile"]);
+
+    let matched = root.join("matched");
+    let receipt = create("agent/matched", None, &matched);
+    let modules = seed_of(&receipt, "node_modules");
+    if modules["status"] == "seeded" {
+        assert_eq!(modules["files"], 10_500, "{modules}");
+        assert_eq!(
+            fs::read_to_string(matched.join("node_modules/pkg/f7.js")).expect("seeded file"),
+            "1\n"
+        );
+    } else {
+        // No copy-on-write between the two locations: skipped, never copied.
+        assert_eq!(modules["status"], "skipped", "{modules}");
+        assert!(!matched.join("node_modules").exists());
+    }
+
+    let doctor = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "doctor"])
+        .output()
+        .expect("doctor");
+    // Not ready (npm without a prepared environment) exits non-zero; the
+    // report is still the JSON on stdout.
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)
+        .unwrap_or_else(|_| panic!("doctor JSON: {}", String::from_utf8_lossy(&doctor.stderr)));
+    let advice = doctor["dependencies"]["recommendations"]
+        .as_array()
+        .expect("recommendations")
+        .iter()
+        .filter_map(|item| item.as_str())
+        .find(|item| item.contains("10500 files"))
+        .unwrap_or_else(|| panic!("no metadata advice in {doctor}"));
+    assert!(advice.contains("20 MiB of filesystem metadata"), "{advice}");
 
     let _ = fs::remove_dir_all(root);
 }
