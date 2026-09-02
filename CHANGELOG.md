@@ -3,6 +3,18 @@
 All notable changes to Worktree Zero. Versions follow semantic versioning;
 pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
+## Unreleased
+
+### Fixed
+
+- **`wt0 prepare --apply` works from inside a worktree that already has a
+  dependency tree.** The replace-dependencies guard counted the invoking
+  shell, wt0 itself, and the `lsof` doing the probe as foreign occupants,
+  so `cd worktree && wt0 prepare --apply` refused whenever `node_modules`
+  existed (a seeded tree, a re-prepare). The guard now ignores this
+  process, its ancestors, its descendants, and exited processes; removal
+  keeps the strict rule.
+
 ## 0.1.15 — 2026-09-02
 
 ### Added
