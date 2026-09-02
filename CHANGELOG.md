@@ -7,6 +7,12 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Added
 
+- **npm publishing is a workflow, not a laptop.** `Publish npm`
+  (`.github/workflows/npm.yml`) publishes `wt0` and its six platform packages
+  from the GitHub release's assets when a release is published, or on
+  dispatch for a given version, using the `NPM_TOKEN` repository secret;
+  versions already on the registry are skipped, so re-runs are safe.
+
 - **`npm i -g wt0` / `npx wt0`.** The `wt0` npm package dispatches to one of
   six platform packages (`wt0-darwin-arm64`, `wt0-darwin-x64`,
   `wt0-linux-x64`, `wt0-linux-arm64`, `wt0-win32-x64`, `wt0-win32-arm64`)

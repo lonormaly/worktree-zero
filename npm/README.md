@@ -24,9 +24,13 @@ the Cargo workspace version being released.
 
 ## Publishing a release
 
-Requires an npm account with publish rights to the `wt0` / `wt0-*` packages
-(logged in via `npm login`), run **after** `wt0`'s GitHub release for that
-version has finished uploading its tarballs (see `.github/workflows/release.yml`).
+Publishing is automated: the `Publish npm` workflow (`.github/workflows/npm.yml`)
+runs when a GitHub release is published and can be dispatched for any released
+version (`gh workflow run "Publish npm" -f version=0.1.16`). It authenticates
+with the `NPM_TOKEN` repository secret — a granular npm access token with
+publish rights to `wt0` / `wt0-*` and two-factor bypass — and skips versions
+already on the registry, so re-runs are safe. Manual fallback, from a logged-in
+laptop:
 
 ```bash
 npm/publish.sh <version>   # e.g. npm/publish.sh 0.1.16

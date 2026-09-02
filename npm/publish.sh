@@ -22,6 +22,17 @@ dist_dir="$script_dir/dist"
 
 "$script_dir/build.sh" "$version"
 
+# A re-run (a second dispatch, a retried job) must never fail on a version
+# that is already on the registry; publishing is append-only there anyway.
+publish_once() {
+  local pkg="$1" tarball="$2"
+  if npm view "${pkg}@${version}" version >/dev/null 2>&1; then
+    echo "==> ${pkg}@${version} is already published; skipping"
+    return 0
+  fi
+  npm publish --access public "$tarball"
+}
+
 platform_packages="
 wt0-darwin-arm64
 wt0-darwin-x64
@@ -34,10 +45,10 @@ wt0-win32-arm64
 echo "==> Publishing platform packages"
 for pkg in $platform_packages; do
   tarball="$dist_dir/${pkg}-${version}.tgz"
-  npm publish --access public "$tarball"
+  publish_once "$pkg" "$tarball"
 done
 
 echo "==> Publishing wt0"
-npm publish --access public "$dist_dir/wt0-${version}.tgz"
+publish_once wt0 "$dist_dir/wt0-${version}.tgz"
 
 echo "==> Published wt0@${version} and its platform packages"
