@@ -58,6 +58,13 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   marker shows the lockfile changed), reporting
   `native store (pnpm): installed from the shared store; nothing to seal`
   and writing no `.wt0-environment.json`.
+- README declares the measured cost of a worktree today. A new "What a
+  worktree costs you today — measured" section shows, per package manager,
+  what `git worktree add` plus a plain install costs per extra worktree
+  versus wt0 — including the honest case (a 236k-file Bun-hoisted tree,
+  where wt0 offers no reduction and the fix is Bun's global store) —
+  with receipts in `docs/design-partners/flam-migration.md`'s new "What
+  most users pay today" addendum.
 
 ## 0.1.16 — 2026-09-02
 
