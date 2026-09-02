@@ -277,7 +277,10 @@ pub(super) fn materialize_baseline_at(
     // then share blocks across commits instead of every new base paying a
     // full materialization. Any doubt about the derived tree falls back to
     // the plain checkout, so correctness never depends on the shortcut.
-    let derived_from = match nearest_baseline(&root, repo, commit) {
+    let derived_from = match store_clones(&root)
+        .then(|| nearest_baseline(&root, repo, commit))
+        .flatten()
+    {
         Some(parent) => match derive_baseline(repo, &root, &parent, commit, &temporary_tree) {
             Ok(()) => Some(parent),
             Err(error) => {
@@ -314,6 +317,20 @@ pub(super) fn materialize_baseline_at(
     }
     let _ = fs::remove_dir_all(&temporary);
     Ok(final_tree)
+}
+
+/// Whether files inside `root` clone with copy-on-write onto the same
+/// volume — derivation is pointless (and would only waste a failed clone
+/// attempt) on a plain filesystem.
+fn store_clones(root: &Path) -> bool {
+    let token = Uuid::new_v4();
+    let source = root.join(format!(".wt0-derive-probe-{token}.source"));
+    if fs::write(&source, b"wt0-cow-probe").is_err() {
+        return false;
+    }
+    let supported = clones_into(&source, root);
+    let _ = fs::remove_file(&source);
+    supported
 }
 
 /// How many most-recently-used baselines to consider as derivation parents.
