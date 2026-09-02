@@ -305,6 +305,73 @@ worktrees (gate 2), crash-recovery reaping (gate 5). M3 (real-fleet reclaim,
 covered by the concurrency suite and the Team session's round trip; M6
 waits on the adapter landing on FLAM `main`.
 
+#### What most users pay today (2026-09-02)
+
+Every number above compares native Git against wt0. This addendum answers a
+narrower question: what does the setup **most repositories actually run** —
+`git worktree add` plus the package manager's own install, no store, no
+wt0 — cost per extra worktree, right now? Same instrument as the rest of
+this document (dedicated APFS sparse image, exact `df -k` deltas, times are
+upper bounds on a busy laptop), 3 worktrees per row unless noted. Fixture A
+is the Next app used throughout this repository's docs (`next@16.3.1`,
+`react@19.2.4`, `react-dom@19.2.4`, dev deps `typescript@5.9.3`,
+`@types/react@19.2.14`, `@types/node@24.10.1`, `eslint@9.39.1`,
+`tailwindcss@4.1.18`); Fixture B is FLAM itself (`bunfig.toml` switched to
+`linker = "hoisted"` for this test — FLAM's real config is
+`isolated`+`globalStore`, measured separately above). Every manager's
+cache/store was placed on the same volume as the worktrees
+(`npm_config_cache`, `BUN_INSTALL_CACHE_DIR`, `YARN_CACHE_FOLDER`).
+
+| Setup | Native `git worktree add` + install, per worktree | wt0 `create --require-cow` (seeded) + install, per worktree |
+| --- | ---: | ---: |
+| npm hoisted, Fixture A | 367.4 MiB, 9 s (1-run confirm; docs above: 388–389 MiB, 60–74 s cold cache) | +4–5 MiB seed, +0 MiB reconcile, 2–5 s (gap #7 above) |
+| Yarn classic 1.22.22, Fixture A | 404.7 MiB mean (404.7/409.4/409.4), 6.7 s mean | ≈0 MiB (noise: −21.4 to +4.7 MiB across 3 creates), 0 MiB / 0 s reconcile (`yarn install` reports "Already up-to-date"), ~3.3 s create |
+| Bun 1.3.14 hoisted (no store), Fixture A | 4.45 MiB mean (4.8/4.1/4.4), 2 s mean | 2.93 MiB seed + −0.2 MiB reconcile (noise) = 2.70 MiB mean, ~5 s |
+| Bun 1.3.14 hoisted (no store), Fixture B (FLAM, 236,332 files) | 452.1 MiB mean (469.3/467.3/420.0), 96.7 s mean (checkout 4–9 s + install 75–109 s) | 458.6 MiB seed + 1.65 MiB reconcile = 460.2 MiB, 148 s (1 run — the other 2 of 3 planned were skipped to stay inside the session's ~45-minute budget; a single run is consistent with the already-published 471 MiB seed figure above) |
+
+Two findings, neither anticipated going in:
+
+1. **On APFS, same-volume cache is what actually matters for Bun, not the
+   linker mode.** Bun's own install path clonefiles package files out of
+   its cache into `node_modules` — even in plain `hoisted` mode, with no
+   `globalStore` configured. With the cache on the same volume as the
+   worktree, that clonefile shares blocks with the cache the same way wt0
+   shares blocks with its baseline: Fixture A's *native* Bun-hoisted install
+   cost 4.45 MiB, not the ~388 MiB npm/Yarn pay for the identical dependency
+   tree. The 236,332-file FLAM number (452 MiB) is **not** a failure of this
+   mechanism — see finding 2. This is also the reason gap #7's Bun-hoisted
+   FLAM figure was only ever an upper bound: that run's cache sat on a
+   different volume, which forces Bun to fall back to a real byte copy
+   (+4,234 MiB, 616 s) instead of a clonefile. Most FLAM-like setups do keep
+   the cache on the same disk as the checkout (it's the default location),
+   so 452 MiB / 97 s, not 4,234 MiB / 616 s, is the honest "today" number for
+   this row.
+2. **wt0 gives no advantage over that same-volume-cache baseline for a
+   236,332-file hoisted tree — both hit the same ~2 KB/file metadata floor.**
+   Native Bun-hoisted (452 MiB) and wt0-seeded (460 MiB) land within noise of
+   each other, because both are paying per-*file* clonefile metadata for
+   236k files, and clonefile cannot share directory entries, only blocks.
+   Ten worktrees costs roughly 4.4 GiB either way. The fix is the same one
+   gap #7 already recommends and this document's finding 1 explains why it
+   works structurally: Bun's `isolated` linker with `globalStore = true`
+   replaces per-worktree clonefiled *files* with per-worktree *symlinks* to
+   one real copy — no per-file metadata floor, because nothing new is
+   cloned. That configuration (FLAM's actual `bunfig.toml`) measured 3 MiB
+   marginal above and independently in
+   [`dependency-link-trees.md`](../research/dependency-link-trees.md). One
+   config line closes a gap wt0's own storage sharing cannot.
+
+wt0 dogfooding receipts for this session:
+
+```
+$ ./target/release/wt0 create claude/readme-today \
+    --path /Users/shaisnir/Development/wt0-agent-readme \
+    --owner readme-agent --require-cow
+mode: cow-clone
+runtime: 01a06379-f4a2-7de0-a4df-73b70e09ac91
+/Users/shaisnir/Development/wt0-agent-readme
+```
+
 ### Gate 7 — M1 on Linux (Btrfs) and Windows (ReFS), in CI
 
 The macOS/APFS numbers above were measured by hand, once, on an isolated
