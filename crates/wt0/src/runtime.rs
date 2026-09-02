@@ -139,16 +139,32 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
         Some("yarn") if yarn_uses_pnp(&root) => true,
         Some(_) => root.join("node_modules").is_dir() && prepared_attached,
     };
-    let recommendations: Vec<&str> = match javascript_manager.as_deref() {
+    let mut recommendations: Vec<String> = match javascript_manager.as_deref() {
         Some("bun")
             if !bun
                 .as_ref()
                 .is_some_and(|report| bun_global_store_ready(report, &root)) =>
         {
-            vec![BUN_GLOBAL_STORE_ADVICE]
+            vec![BUN_GLOBAL_STORE_ADVICE.to_owned()]
         }
         _ => Vec::new(),
     };
+    // Every worktree that materializes a dependency tree — seeded, attached,
+    // or installed — pays filesystem metadata per file, whatever the bytes
+    // share. Say what this tree costs before anyone relies on it.
+    let modules = root.join("node_modules");
+    let modules_files = if modules.is_dir() && !bun_links_ready {
+        worktree::tree_files(&modules)
+    } else {
+        0
+    };
+    let modules_metadata = modules_files * worktree::CLONED_FILE_METADATA_BYTES;
+    if modules_metadata > DEPENDENCY_METADATA_ADVICE_BYTES {
+        recommendations.push(format!(
+            "node_modules holds {modules_files} files; every worktree that materializes it pays about {} of filesystem metadata (measured ~2 KB per file on APFS) — a link-tree layout (Bun's global store, pnpm) keeps a tree this size under 20 MiB",
+            format_mib(modules_metadata)
+        ));
+    }
     let dependency_ready = dependency_adapter_shipped
         && manager_ready
         && stale == 0
@@ -669,6 +685,14 @@ pub(crate) fn prepare_for_agent_run(root: &Path) -> Result<()> {
 /// global virtual store. Recommended, never required: without it wt0 seals
 /// the materialized tree once and clones it per worktree, exactly as it does
 /// for npm, pnpm, and Yarn.
+/// Above this much per-worktree metadata (the ≤15–20 MiB bar, with room for
+/// the checkout itself) `doctor` names the cost of the dependency tree.
+const DEPENDENCY_METADATA_ADVICE_BYTES: u64 = 20 * 1024 * 1024;
+
+fn format_mib(bytes: u64) -> String {
+    format!("{} MiB", bytes / (1024 * 1024))
+}
+
 pub(crate) const BUN_GLOBAL_STORE_ADVICE: &str = "enable Bun's global virtual store for the smallest footprint: bunfig.toml [install] linker = \"isolated\" and globalStore = true, with Bun 1.3.14 or newer";
 
 fn bun_global_store_ready(bun: &BunReport, root: &Path) -> bool {
