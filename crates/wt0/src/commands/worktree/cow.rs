@@ -352,7 +352,7 @@ fn nearest_baseline(root: &Path, repo: &RepoContext, commit: &str) -> Option<Str
             Some((ready.modified().ok()?, name))
         })
         .collect();
-    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
     candidates
         .into_iter()
         .take(NEAREST_BASELINE_CANDIDATES)
