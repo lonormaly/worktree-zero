@@ -209,6 +209,11 @@ namespace, database, and generated root; a normal removal leaving no orphan
 
 ## After
 
+Whether an install *after* create stays a delta or rewrites a seeded or
+prepared tree — the natural follow-up to M1's storage numbers — is measured
+separately in [`drift.md`](drift.md): delta-only in every scenario tested,
+with one state-tracking gap in the attached-prepared-environment case.
+
 ### M1 + M2 — 1, 4, and 10 usable worktrees on an isolated volume (2026-09-02)
 
 Instrument: a dedicated 16 GiB APFS sparse image (`hdiutil`), so every
