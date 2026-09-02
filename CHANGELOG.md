@@ -5,6 +5,23 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ## Unreleased
 
+### Changed
+
+- **`wt0 create` is now sub-second for large checkouts.** Three costs sat
+  on the critical path of every cloned worktree and are gone: the baseline
+  was cloned file by file where APFS clones the whole directory in one
+  `clonefile` call (FLAM's 368 MiB, 4,040-file tree: 4.5 s → 0.07 s);
+  the new worktree's index carried no stat data, so wt0's verification — and
+  the agent's first `git status` — hashed every tracked file (15 s → 0.14 s;
+  each baseline now keeps the stat-populated index it was materialized with,
+  and cloned worktrees adopt it under a per-worktree
+  `core.checkStat=minimal` / `core.trustctime=false`, leaving the main
+  checkout's configuration untouched); and every lease scan spawned
+  `git rev-parse` per registered worktree, now a single file read. Measured
+  on FLAM with 19 worktrees registered: create 7–29 s → 0.8–1.4 s. Linux
+  reflinks and ReFS clones now preserve modification times so the adopted
+  index holds there too.
+
 ### Fixed
 
 - **`wt0 prepare --apply` works from inside a worktree that already has a
