@@ -36,7 +36,7 @@ git -C "$repo" commit -qm fixture
 
 (cd "$repo" && "$WT0" create fallback/first --path "$first" >/dev/null)
 # doctor exits non-zero while the worktree is unprepared; the report still carries the advice.
-doctor="$(cd "$first" && "$WT0" doctor --json || true)"
+doctor="$(cd "$first" && { "$WT0" doctor --json || true; })"
 printf '%s' "$doctor" | grep -q 'global virtual store' || {
   echo "doctor must recommend Bun's global store, got: $doctor" >&2
   exit 1
