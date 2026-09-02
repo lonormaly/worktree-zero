@@ -76,6 +76,11 @@ pub struct WorktreeAdd {
     #[arg(long, value_name = "SIZE")]
     pub require_free: Option<String>,
 
+    /// Do not seed the ignored trees listed in `.wt0-seed` from the base
+    /// checkout (also `WT0_SEED=0`).
+    #[arg(long)]
+    pub no_seed: bool,
+
     /// JSON output.
     #[arg(long)]
     pub json: bool,
@@ -198,6 +203,11 @@ pub struct WorktreeRun {
     #[arg(long, value_name = "SIZE")]
     pub require_free: Option<String>,
 
+    /// Do not seed the ignored trees listed in `.wt0-seed` from the base
+    /// checkout (also `WT0_SEED=0`).
+    #[arg(long)]
+    pub no_seed: bool,
+
     /// Command and arguments to execute in the new worktree.
     #[arg(required = true)]
     pub command: Vec<OsString>,
@@ -297,11 +307,23 @@ fn add(args: WorktreeAdd, json: bool) -> Result<()> {
             "owner": created.lease.owner,
             "slug": branch_slug(&args.branch),
             "reused": created.reused,
+            "seeded": created.seeded,
         }));
     } else {
         eprintln!("mode: {}", created.mode);
         if created.reused {
             eprintln!("reused existing runtime");
+        }
+        for seed in &created.seeded {
+            eprintln!(
+                "seed: {} — {}{}",
+                seed["path"].as_str().unwrap_or(""),
+                seed["status"].as_str().unwrap_or(""),
+                seed["reason"]
+                    .as_str()
+                    .map(|reason| format!(" ({reason})"))
+                    .unwrap_or_default()
+            );
         }
         eprintln!("runtime: {}", created.lease.runtime_id);
         println!("{}", created.target.display());
@@ -316,6 +338,7 @@ struct CreatedWorktree {
     ephemeral: bool,
     lease: RuntimeLease,
     reused: bool,
+    seeded: Vec<serde_json::Value>,
 }
 
 fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
@@ -354,6 +377,18 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         PopulateMode::Overlay => add_overlay_worktree(&repo, &args.branch, &target, &base)?,
         PopulateMode::GitCheckout => add_git_worktree(&repo, &args.branch, &target, &base)?,
     }
+
+    // Seed ignored trees from the base checkout before anything runs in the
+    // worktree: the package manager and build tools then find a warm tree and
+    // reconcile only the difference. Never fatal — a seed that cannot be
+    // cloned is reported and skipped, so a create never fails on it.
+    let seeding_disabled = args.no_seed
+        || std::env::var("WT0_SEED").is_ok_and(|value| value == "0" || value == "false");
+    let seeded = if seeding_disabled {
+        Vec::new()
+    } else {
+        seed_from_base(&repo, &target)
+    };
 
     let lease = {
         let _slot_lock = StateLock::slots(&repo.common_git_dir);
@@ -435,6 +470,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
             "port_base": lease.port_base,
             "owner": lease.owner,
             "mode": mode.label(),
+            "seeded": seeded.iter().filter(|seed| seed["status"] == "seeded").count(),
         }),
     );
     Ok(CreatedWorktree {
@@ -444,6 +480,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         ephemeral: args.ephemeral,
         lease,
         reused: false,
+        seeded,
     })
 }
 
@@ -537,6 +574,7 @@ fn reuse_existing_runtime(
             owner: lease.owner.clone(),
         },
         reused: true,
+        seeded: Vec::new(),
     })
 }
 
@@ -553,6 +591,7 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
         idempotency_key: args.idempotency_key,
         owner: args.owner,
         require_free: args.require_free,
+        no_seed: args.no_seed,
         json: false,
     })?;
     eprintln!(
@@ -2330,6 +2369,165 @@ fn validate_generated_policy(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(validated)
+}
+
+pub(crate) const SEED_POLICY_FILE: &str = ".wt0-seed";
+
+/// Read and validate a worktree's checked-in seed policy: the ignored trees
+/// (`node_modules`, `.next/cache`, `.nx/cache`, …) that a new worktree
+/// clones from the base checkout before anything runs in it. Same rules as
+/// the generated-path policy — relative paths only, never `.env*`, `.dev.vars`
+/// or `secrets` — because a seed copies bytes, and secrets must stay put.
+pub(crate) fn project_seed_policy(root: &Path) -> Result<Vec<PathBuf>> {
+    let path = root.join(SEED_POLICY_FILE);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let entries = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    validate_generated_policy(&entries)
+        .with_context(|| format!("invalid seed policy {}", path.display()))
+}
+
+/// Clone each seed path from the base checkout into `target` with
+/// copy-on-write. The base checkout is the store: what already exists there
+/// costs nothing to reuse, and the package manager or build tool then
+/// reconciles only what differs. One receipt per policy entry: `seeded`,
+/// `absent` (nothing to seed from), `refused` (not ignored in the new
+/// worktree, so it would shadow tracked content), or `skipped` (the clone
+/// failed — typically no copy-on-write between the two locations; a full
+/// copy is never substituted).
+fn seed_from_base(repo: &RepoContext, target: &Path) -> Vec<serde_json::Value> {
+    let policy = match project_seed_policy(target) {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("wt0: seed policy ignored: {error:#}");
+            return Vec::new();
+        }
+    };
+    let mut receipts = Vec::new();
+    for relative in policy {
+        let source = repo.top_level.join(&relative);
+        let destination = target.join(&relative);
+        let receipt = |status: &str, reason: Option<String>, files: u64, bytes: u64| {
+            json!({
+                "path": relative.to_string_lossy(),
+                "status": status,
+                "reason": reason,
+                "files": files,
+                "logical_bytes": bytes,
+            })
+        };
+        // Measured, not assumed: cloning a live 230k-file node_modules took
+        // 168 s and left a junk layout after the manager reconciled; the
+        // sealed prepared environment is the consistent, lockfile-keyed form
+        // of the same install and is what `wt0 prepare` attaches.
+        if relative
+            .components()
+            .any(|component| component.as_os_str() == "node_modules")
+        {
+            receipts.push(receipt(
+                "refused",
+                Some(
+                    "dependency trees are attached from sealed prepared environments (wt0 prepare); seed caches, not node_modules"
+                        .to_owned(),
+                ),
+                0,
+                0,
+            ));
+            continue;
+        }
+        if !source.exists() {
+            receipts.push(receipt("absent", None, 0, 0));
+            continue;
+        }
+        // The destination does not exist yet, so a `dir/` ignore pattern only
+        // matches when the query names a directory explicitly.
+        let query = if source.is_dir() {
+            format!("{}/", relative.to_string_lossy().trim_end_matches('/'))
+        } else {
+            relative.to_string_lossy().into_owned()
+        };
+        let ignored = Command::new("git")
+            .args(["check-ignore", "-q", "--"])
+            .arg(&query)
+            .current_dir(target)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !ignored {
+            receipts.push(receipt(
+                "refused",
+                Some(
+                    "not git-ignored in the new worktree; seeding would shadow tracked content"
+                        .to_owned(),
+                ),
+                0,
+                0,
+            ));
+            continue;
+        }
+        if destination.exists() {
+            receipts.push(receipt("skipped", Some("already present".to_owned()), 0, 0));
+            continue;
+        }
+        let cloned = (|| -> Result<()> {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if source.is_dir() {
+                fs::create_dir(&destination)?;
+                cow::clone_tree(&source, &destination)
+            } else {
+                cow::clone_file(&source, &destination)
+            }
+        })();
+        match cloned {
+            Ok(()) => {
+                let (files, bytes) = tree_size(&destination);
+                receipts.push(receipt("seeded", None, files, bytes));
+            }
+            Err(error) => {
+                let _ = if destination.is_dir() {
+                    fs::remove_dir_all(&destination)
+                } else {
+                    fs::remove_file(&destination)
+                };
+                receipts.push(receipt("skipped", Some(format!("{error:#}")), 0, 0));
+            }
+        }
+    }
+    receipts
+}
+
+/// Logical file count and bytes under a path, without following symlinks.
+fn tree_size(path: &Path) -> (u64, u64) {
+    let mut files = 0;
+    let mut bytes = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                stack.push(entry.path());
+            } else if kind.is_file() {
+                files += 1;
+                bytes += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+            }
+        }
+    }
+    (files, bytes)
 }
 
 fn is_known_generated_path(path: &Path) -> bool {

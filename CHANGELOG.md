@@ -5,6 +5,20 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ## Unreleased
 
+### Added
+
+- **Seeding — warm caches from the base checkout.** A checked-in
+  `.wt0-seed` lists ignored, self-validating caches (`.nx/cache`,
+  `.next/cache`, `.turbo`, …) that every new worktree copy-on-write clones
+  from the base checkout before anything runs in it, so the first build
+  starts warm. Tracked paths are refused, secrets are rejected by the
+  policy, and a clone that cannot be copy-on-write is skipped with a reason
+  rather than copied. `node_modules` is refused by measurement: cloning a
+  live 230k-file tree took 168 s and reconciled into a junk layout; sealed
+  prepared environments remain the origin-as-store for dependencies.
+  Receipts carry one entry per seed; `capabilities` reports `project_seed`;
+  `--no-seed` / `WT0_SEED=0` opt out.
+
 ### Changed
 
 - **Every JavaScript package manager gets the same contract.** Bun without

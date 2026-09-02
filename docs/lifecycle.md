@@ -35,6 +35,42 @@ window released. A project reconciles its own external resources — a
 per-runtime database, a namespace — from those events; wt0 never deletes
 what only the project's hooks know about.
 
+### Seeding: the base checkout as the store
+
+A checked-in `.wt0-seed` lists ignored, self-validating caches to
+copy-on-write clone from the base checkout into every new worktree before
+anything runs in it — one relative path per line, `#` comments allowed:
+
+```text
+.nx/cache
+apps/web/.next/cache
+.turbo
+```
+
+A seeded cache is warm from the first build, and a cache that validates its
+entries by content hash (Nx, Next, Turbo) treats a torn entry as a miss, so
+seeding from a base that is being written to is safe. The physical cost is
+the clone plus per-file metadata — small for caches, but real: cloning is
+per file, so a tree of hundreds of thousands of files costs minutes and tens
+of MiB of inodes even at zero data.
+
+That is why **`node_modules` is refused as a seed**. Measured on a
+230,000-file live `node_modules`: 168 s to clone, and after the package
+manager reconciled, a 4.2 GB junk mix of the base's hoisted layout and the
+worktree's isolated one — worse than a cold install. Dependency trees come
+from sealed prepared environments (`wt0 prepare`), which are the base's
+install made consistent and keyed to the lockfile; that is the correct
+"origin as store" for dependencies, and it is attached automatically.
+
+The same rules as `.wt0-generated` apply: relative paths only; `.env*`,
+`.dev.vars`, and `secrets` are rejected by the policy. Per entry the create
+receipt reports `seeded`, `absent` (the base has nothing there), `refused`
+(tracked in the new worktree, or a dependency tree), or `skipped` with a
+reason (no copy-on-write between the two locations — a full copy is never
+substituted). Mutable state — databases, emulator persistence, build
+*output* — stays private per runtime and must not be seeded. `--no-seed`
+or `WT0_SEED=0` disables seeding for one create.
+
 ### Free-disk floor
 
 `wt0 create --require-free 20G` (or `WT0_REQUIRE_FREE=20G`) refuses to create

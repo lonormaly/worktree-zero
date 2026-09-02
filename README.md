@@ -71,7 +71,13 @@ Package managers are adapters, not prerequisites: Bun, pnpm, npm, and Yarn
 are detected from the lockfile, their native sharing is preserved, and
 prepared environments are keyed by lockfile, manifests, manager version, OS,
 and ABI — changing one dependency starts from the nearest compatible snapshot
-instead of a full copy. `wt0 run` applies the same ownership rule to Cargo
+instead of a full copy. No virtual store is *required*: without one, wt0
+seals the manager's own install once and clones it per worktree. The
+manager's store is still recommended — it is the smallest footprint, and it
+shares across repositories, which a per-repository seal cannot. A checked-in
+`.wt0-seed` additionally clones the base checkout's build caches
+(`.nx/cache`, `.next/cache`) into every new worktree, so the first build
+starts warm. `wt0 run` applies the same ownership rule to Cargo
 target directories, Nx workspace state, and Wrangler local persistence.
 
 ### 2. Identity: collision-free by construction

@@ -796,3 +796,117 @@ fn owner_slug_floor_and_orphan_events_cover_the_adapter_surface() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+// Gap #7: the base checkout is the store. Ignored trees listed in .wt0-seed
+// are copy-on-write cloned into a new worktree before anything runs in it;
+// tracked paths are refused, secrets are rejected by the policy itself, and
+// a seeded tree is private to the worktree.
+#[test]
+fn seeding_clones_ignored_trees_from_the_base_checkout() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-seed-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    let machine = root.join("machine-state");
+    fs::create_dir_all(&machine).expect("create machine-state fixture");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+    fs::write(repo.join(".gitignore"), "node_modules/\n.cache/\n").expect("write gitignore");
+    fs::write(
+        repo.join(".wt0-seed"),
+        "# warm the new worktree from this checkout\nnode_modules\n.cache/build\nREADME.md\n",
+    )
+    .expect("write seed policy");
+    // -f: a developer's global excludes file may ignore .gitignore itself.
+    git(&repo, &["add", "-f", "."]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    // Ignored state that only exists in the base checkout.
+    fs::create_dir_all(repo.join("node_modules/pkg")).expect("create node_modules");
+    fs::write(
+        repo.join("node_modules/pkg/index.js"),
+        "module.exports = 1;\n",
+    )
+    .expect("write dep");
+    fs::create_dir_all(repo.join(".cache/build")).expect("create cache");
+    fs::write(repo.join(".cache/build/warm.bin"), vec![7_u8; 65536]).expect("write cache");
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let worktree = root.join("seeded");
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .env("WT0_MACHINE_STATE", &machine)
+        .args(["--json", "create", "agent/seeded", "--path"])
+        .arg(&worktree)
+        .output()
+        .expect("create worktree");
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&created.stdout).expect("create JSON");
+    let seeds = receipt["seeded"].as_array().expect("seed receipts");
+    let by_path = |path: &str| {
+        seeds
+            .iter()
+            .find(|seed| seed["path"] == path)
+            .unwrap_or_else(|| panic!("no seed receipt for {path}: {seeds:?}"))
+            .clone()
+    };
+    // A tracked path is refused, whatever the filesystem can do; so is a
+    // dependency tree — those come from sealed prepared environments.
+    assert_eq!(by_path("README.md")["status"], "refused");
+    let modules = by_path("node_modules");
+    assert_eq!(modules["status"], "refused");
+    assert!(modules["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("wt0 prepare")));
+    assert!(!worktree.join("node_modules").exists());
+
+    let cache = by_path(".cache/build");
+    if cache["status"] == "seeded" {
+        assert_eq!(cache["files"], 1);
+        assert_eq!(cache["logical_bytes"], 65536);
+        assert_eq!(
+            fs::read(worktree.join(".cache/build/warm.bin")).expect("seeded cache"),
+            vec![7_u8; 65536]
+        );
+        // Private: a change in the worktree never reaches the base checkout.
+        fs::write(worktree.join(".cache/build/warm.bin"), b"changed").expect("edit seeded");
+        assert_eq!(
+            fs::read(repo.join(".cache/build/warm.bin")).expect("base cache"),
+            vec![7_u8; 65536]
+        );
+    } else {
+        // No copy-on-write between the two locations (plain ext4, an overlay
+        // mount): the seed is skipped with a reason, never degraded to a copy.
+        assert_eq!(cache["status"], "skipped", "{cache}");
+        assert!(cache["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()));
+        assert!(!worktree.join(".cache/build").exists());
+    }
+
+    // --no-seed leaves the worktree bare.
+    let bare = root.join("bare");
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .env("WT0_MACHINE_STATE", &machine)
+        .args(["--json", "create", "agent/bare", "--no-seed", "--path"])
+        .arg(&bare)
+        .output()
+        .expect("create bare worktree");
+    let receipt: serde_json::Value = serde_json::from_slice(&created.stdout).expect("bare JSON");
+    assert!(receipt["seeded"].as_array().is_some_and(Vec::is_empty));
+    assert!(!bare.join(".cache").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
