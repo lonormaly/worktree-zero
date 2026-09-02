@@ -19,3 +19,7 @@ plan
 
 # Claude Code agent isolation worktrees
 .claude/worktrees/
+
+# npm packaging: build.sh places these; dist/ (above) already covers
+# npm/dist/, but the platform binaries need their own rule.
+npm/platforms/*/bin/

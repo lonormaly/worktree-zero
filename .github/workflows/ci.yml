@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Shellcheck integration and benchmark scripts
-        run: shellcheck tests/*.sh integrations/tilt/examples/*.sh
+        run: shellcheck tests/*.sh integrations/tilt/examples/*.sh npm/*.sh
       - name: Plugin manifest versions match the workspace version
         run: |
           version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -24,6 +24,22 @@ jobs:
           for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json; do
             jq -e --arg v "$version" '.version == $v' "$manifest" >/dev/null \
               || { echo "$manifest version does not match workspace $version"; exit 1; }
+          done
+      - name: npm package.json versions stay at the build-time placeholder
+        run: |
+          # npm/build.sh stamps the real version (matching the workspace
+          # version above) into every npm/*/package.json at build time, from
+          # the version it's invoked with -- these files must not carry a
+          # committed real version that could drift out of sync.
+          placeholder="0.0.0-dev"
+          jq -e --arg v "$placeholder" '.version == $v' npm/wt0/package.json >/dev/null \
+            || { echo "npm/wt0/package.json version is not the $placeholder placeholder"; exit 1; }
+          jq -e --arg v "$placeholder" \
+            '.optionalDependencies | to_entries | all(.value == $v)' npm/wt0/package.json >/dev/null \
+            || { echo "npm/wt0/package.json optionalDependencies are not all $placeholder"; exit 1; }
+          for manifest in npm/platforms/*/package.json; do
+            jq -e --arg v "$placeholder" '.version == $v' "$manifest" >/dev/null \
+              || { echo "$manifest version is not the $placeholder placeholder"; exit 1; }
           done
 
   msrv:
