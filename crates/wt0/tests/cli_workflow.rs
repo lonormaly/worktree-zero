@@ -1153,6 +1153,19 @@ fn cloned_worktrees_adopt_the_baseline_index_and_stay_clean() {
     let status = git_stdout_any(&worktree, &["status", "--porcelain"]);
     assert_eq!(status.trim(), "M src/a.txt");
 
+    // On Linux without reflinks the worktree is an overlay mount; only wt0
+    // can take it down, so the fixture is removed through it.
+    let removed = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["remove", "--force"])
+        .arg(&worktree)
+        .output()
+        .expect("remove worktree");
+    assert!(
+        removed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
     fs::remove_dir_all(root).expect("remove fixture");
 }
 
