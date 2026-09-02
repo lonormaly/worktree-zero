@@ -156,11 +156,66 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let generated_ready = generated.total() <= DEFAULT_GENERATED_BUDGET_BYTES;
     let ready = dependency_ready && generated_ready;
 
+    // The one-screen verdict: does wt0's promise hold on this machine for
+    // this repository? Three lines, one per promise, then a word.
+    let cow_available = worktree::discover_repo(&root)
+        .and_then(|repo| worktree::cow::clone_supported(&repo.common_git_dir, &root))
+        .unwrap_or(false);
+    let dependency_sharing = match javascript_manager.as_deref() {
+        None => "none-detected".to_owned(),
+        Some("yarn") if yarn_uses_pnp(&root) => "native (Yarn PnP)".to_owned(),
+        Some("bun")
+            if bun
+                .as_ref()
+                .is_some_and(|report| bun_global_store_ready(report, &root)) =>
+        {
+            "native store (Bun global virtual store)".to_owned()
+        }
+        Some(manager) if prepared_attached => format!("prepared environment ({manager})"),
+        Some(manager) => format!("not yet prepared ({manager}; run wt0 prepare --apply)"),
+    };
+    let policy_paths = worktree::project_generated_policy(&root)
+        .map(|paths| paths.len())
+        .unwrap_or(0);
+    let seed_paths = worktree::project_seed_policy(&root)
+        .map(|paths| paths.len())
+        .unwrap_or(0);
+    let generated_sharing = if policy_paths > 0 {
+        format!("bounded and reclaimable ({policy_paths} reviewed paths in .wt0-generated)")
+    } else {
+        "report-only (no .wt0-generated policy; gc will refuse unknown ignored state)".to_owned()
+    };
+    let mut shortfalls: Vec<&str> = Vec::new();
+    if !cow_available {
+        shortfalls.push("tracked files are full copies here: no copy-on-write on this volume");
+    }
+    if dependency_sharing.starts_with("not yet prepared") {
+        shortfalls.push("dependencies are not shared until `wt0 prepare --apply` seals them");
+    }
+    if policy_paths == 0 {
+        shortfalls
+            .push("generated state cannot be reclaimed until a .wt0-generated policy is reviewed");
+    }
+    let verdict = match shortfalls.len() {
+        0 => "holds",
+        1 | 2 => "partial",
+        _ => "not yet",
+    };
+
     let report = json!({
         "schema_version": 1,
         "root": root,
         "ready": ready,
         "dependency_ready": dependency_ready,
+        "promise": {
+            "verdict": verdict,
+            "copy_on_write": if cow_available { "available" } else { "unavailable" },
+            "backend": crate::capabilities::source_backend(),
+            "dependency_sharing": dependency_sharing,
+            "generated_state": generated_sharing,
+            "seed_paths": seed_paths,
+            "shortfalls": shortfalls,
+        },
         "source": {
             "git_objects_shared": true,
             "physical_measurement": "df-delta",
@@ -206,6 +261,20 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("Worktree Zero doctor: {}", root.display());
+        println!("  promise:           {verdict}");
+        println!(
+            "    copy-on-write:   {} ({})",
+            if cow_available { "yes" } else { "no" },
+            crate::capabilities::source_backend()
+        );
+        println!("    dependencies:    {dependency_sharing}");
+        println!("    generated state: {generated_sharing}");
+        if seed_paths > 0 {
+            println!("    seeded caches:   {seed_paths} path(s) in .wt0-seed");
+        }
+        for shortfall in &shortfalls {
+            println!("    shortfall:       {shortfall}");
+        }
         println!(
             "  stale dependencies: {}",
             human_bytes(

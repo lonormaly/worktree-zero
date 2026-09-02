@@ -269,7 +269,7 @@ fn has_named_file(root: &Path, names: &[&str]) -> bool {
     })
 }
 
-fn source_backend() -> &'static str {
+pub(crate) fn source_backend() -> &'static str {
     if cfg!(target_os = "macos") {
         "apfs-clonefile"
     } else if cfg!(target_os = "linux") {

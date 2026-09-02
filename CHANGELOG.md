@@ -7,6 +7,13 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Added
 
+- **`wt0 doctor` opens with the verdict.** A `promise` block (JSON) and a
+  four-line header (text) answer whether wt0's promise holds on this
+  machine for this repository: copy-on-write available and which backend,
+  how dependencies are shared (native store, prepared environment, Yarn
+  PnP, or not yet prepared), whether generated state is bounded and
+  reclaimable under a reviewed policy, and every shortfall by name.
+
 - **Seeding — warm caches from the base checkout.** A checked-in
   `.wt0-seed` lists ignored, self-validating caches (`.nx/cache`,
   `.next/cache`, `.turbo`, …) that every new worktree copy-on-write clones

@@ -121,6 +121,31 @@ deletion. The full contract — lease mechanics, every GC guard, the
 `.wt0-generated` review policy, and the hook API — is in
 [docs/lifecycle.md](docs/lifecycle.md).
 
+## What wt0 is, and is not
+
+The required surface is four commands — `create`, `run`, `remove`, `gc` —
+plus one reviewed policy file (`.wt0-generated`). Everything else is
+optional and additive: lifecycle hooks, `fleet` and `events`, the MCP
+server, shared stores, port windows, owner metadata, seeding. `wt0 doctor`
+answers the only question that matters in one screen: whether the promise
+holds on this machine — copy-on-write available, dependencies shared, and
+generated state bounded — and names each shortfall.
+
+Three things wt0 deliberately does not do:
+
+- **It does not replace Git or your package manager.** Git owns refs and
+  history; the manager owns resolution and its own store. wt0 shares what
+  they leave duplicated and cleans up what they leave behind.
+- **It does not deduplicate active build output.** `.next`, `.nx`, and
+  emulator state are mutable per worktree by nature; wt0 bounds them (owned
+  storage, retired with the runtime), reclaims them safely (policy + `gc`),
+  and can warm caches from the base checkout — it never shares a writable
+  build directory between two live agents.
+- **It does not require a virtual store.** Without one, wt0 seals the
+  manager's own install once and clones it per worktree. The manager's
+  store is recommended because it is smaller and shares across
+  repositories.
+
 ## Built for agents
 
 Agents call one versioned, non-interactive contract — JSON CLI, MCP server,
