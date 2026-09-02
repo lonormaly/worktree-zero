@@ -2549,16 +2549,27 @@ fn lockfile_in(root: &Path) -> Option<&'static str> {
     LOCKFILES.into_iter().find(|name| root.join(name).is_file())
 }
 
-/// Whether the worktree's lockfile is byte-for-byte the base's. A worktree
-/// without one, or a base missing the same file, never matches.
+/// Whether the worktree's lockfile is the base's. A worktree without one, or
+/// a base missing the same file, never matches. Text lockfiles compare with
+/// line endings normalized: a checkout under `core.autocrlf` differs from
+/// the base only in `\r`, and resolves to the same tree.
 fn lockfiles_match(base: &Path, target: &Path) -> bool {
     let Some(name) = lockfile_in(target) else {
         return false;
     };
-    match (fs::read(target.join(name)), fs::read(base.join(name))) {
-        (Ok(worktree), Ok(base)) => worktree == base,
-        _ => false,
+    let (Ok(worktree), Ok(base)) = (fs::read(target.join(name)), fs::read(base.join(name))) else {
+        return false;
+    };
+    if name == "bun.lockb" {
+        return worktree == base;
     }
+    let text = |bytes: Vec<u8>| {
+        bytes
+            .into_iter()
+            .filter(|byte| *byte != b'\r')
+            .collect::<Vec<u8>>()
+    };
+    text(worktree) == text(base)
 }
 
 /// Clone each seed path from the base checkout into `target` with

@@ -67,7 +67,7 @@ receipt reason:
    of a layout ("only the root node_modules can be seeded");
 2. the worktree carries its manager's lockfile (`bun.lock`/`bun.lockb`,
    `pnpm-lock.yaml`, `npm-shrinkwrap.json`/`package-lock.json`, `yarn.lock`)
-   and it is byte-identical to the base's ("lockfile differs from the base;
+   and it is identical to the base's, line endings aside ("lockfile differs from the base;
    prepared environments handle lockfile changes" — or, without one, "no
    lockfile proves the base tree matches");
 3. for Bun, base and worktree ask for the same linker layout in
