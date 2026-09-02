@@ -3,6 +3,16 @@
 All notable changes to Worktree Zero. Versions follow semantic versioning;
 pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
+## Unreleased
+
+### Fixed
+
+- **Spotlight no longer blocks cleanup on macOS**: the open-path guard that
+  refuses to remove a worktree in use ignored nothing, so a freshly created
+  checkout was un-reapable for about a minute while `mdworker` indexed it.
+  System content indexers (`mdworker`, `mds`, `fseventsd`) are now exempt;
+  every other process — agents, editors, dev servers — still vetoes.
+
 ## 0.1.14 — 2026-09-02
 
 ### Added
