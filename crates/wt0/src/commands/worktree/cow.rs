@@ -142,10 +142,12 @@ fn preserve_modified_time(source: &Path, destination: &Path) -> Result<()> {
 /// recreated as symlinks. Equivalent to the former `cp -c -R source/. dest`
 /// without the platform-specific `cp` dependency. On APFS the whole tree is
 /// cloned in one `clonefile` call, which is tens of times faster than
-/// cloning file by file.
-pub(crate) fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
+/// cloning file by file. Returns the number of files and symlinks cloned
+/// file-by-file — 0 on the atomic path, which clones in a single syscall and
+/// so never counts them.
+pub(crate) fn clone_tree(source: &Path, destination: &Path) -> Result<usize> {
     if clone_tree_atomically(source, destination)? {
-        return Ok(());
+        return Ok(0);
     }
     clone_tree_entries(source, destination)
 }
@@ -193,7 +195,8 @@ fn clone_tree_atomically(_source: &Path, _destination: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn clone_tree_entries(source: &Path, destination: &Path) -> Result<()> {
+fn clone_tree_entries(source: &Path, destination: &Path) -> Result<usize> {
+    let mut cloned = 0;
     for entry in
         fs::read_dir(source).with_context(|| format!("read clone source {}", source.display()))?
     {
@@ -204,16 +207,18 @@ fn clone_tree_entries(source: &Path, destination: &Path) -> Result<()> {
         if kind.is_dir() {
             fs::create_dir(&to).with_context(|| format!("create directory {}", to.display()))?;
             copy_permissions(&from, &to)?;
-            clone_tree_entries(&from, &to)?;
+            cloned += clone_tree_entries(&from, &to)?;
         } else if kind.is_symlink() {
             let target =
                 fs::read_link(&from).with_context(|| format!("read symlink {}", from.display()))?;
             create_symlink(&target, &from, &to)?;
+            cloned += 1;
         } else {
             clone_file(&from, &to)?;
+            cloned += 1;
         }
     }
-    Ok(())
+    Ok(cloned)
 }
 
 #[cfg(unix)]
