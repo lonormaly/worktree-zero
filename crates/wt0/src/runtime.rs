@@ -1629,7 +1629,7 @@ fn validate_environment_links(root: &Path, path: &Path) -> Result<()> {
 }
 
 fn replace_dependency_tree(root: &Path) -> Result<()> {
-    if let Some(path) = crate::process::live_working_directory(root)? {
+    if let Some(path) = crate::process::foreign_working_directory(root)? {
         bail!(
             "refusing dependency replacement while a process works inside {}: {path}",
             root.display()
