@@ -5,6 +5,16 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ## Unreleased
 
+### Fixed
+
+- **`WT0_REPO_ROOT` is the main checkout again.** When `wt0 remove <path>`
+  named a linked worktree from outside the repository, hooks received that
+  worktree as `WT0_REPO_ROOT` instead of the main working tree, so a
+  `pre-remove` hook archiving into the primary checkout archived into the
+  checkout being deleted. `wt0 list` likewise marked whichever worktree the
+  command ran from as `main`. Both now use the main working tree that
+  `git worktree list` reports.
+
 ### Changed
 
 - **`wt0 create` is now sub-second for large checkouts.** Three costs sat
