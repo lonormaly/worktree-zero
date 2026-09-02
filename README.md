@@ -32,19 +32,20 @@ free-space deltas only, 3 worktrees per row unless noted:
 | Setup | Per extra worktree, today | Per extra worktree, wt0 | Ten worktrees, today → wt0 |
 | --- | ---: | ---: | ---: |
 | npm hoisted (Next app) | 388 MiB, 60–74 s | 4–5 MiB, 2–5 s | 3.8 GiB → 429 MiB |
-| Yarn classic (Next app) | 405 MiB, 7 s | ≈0 MiB, <1 s | 4.0 GiB → 405 MiB |
-| Bun hoisted, no store (Next app) | 4.5 MiB, 2 s | 2.7 MiB, 5 s | 45 MiB → 29 MiB |
-| Bun hoisted, no store (FLAM, 236k files) | 452 MiB, 97 s | 460 MiB, 148 s — no reduction, see below | 4.4 GiB → 4.5 GiB |
+| Yarn classic (Next app) | 405 MiB, 7 s | ≈0–5 MiB, 3–4 s | 4.0 GiB → ≈430 MiB |
+| Bun hoisted, no store, cache on the same volume (Next app) | 4.5 MiB, 2 s | 2.7 MiB, 5 s | 45 MiB → 29 MiB |
+| Bun hoisted, no store, cache on the same volume (FLAM, 236k files) | 452 MiB, 97 s | 460 MiB, 148 s — no reduction, see below | 4.4 GiB → 4.5 GiB |
 | Bun global store / pnpm (FLAM) | 434 MiB, 62–113 s | 9 MiB, ~30 s | 5.1 GiB → 595 MiB |
 | `git worktree add` alone (FLAM checkout) | 368 MiB, 8 s | 9 MiB, 1 s | 3.6 GiB → 449 MiB |
 
-wt0 shares the tracked checkout in every row — that is the constant win.
-Where it does *not* help is the fourth row: a 236k-file hoisted
-`node_modules` pays the same ~2 KB/file clonefile metadata whether wt0
-clones it or Bun's own cache does, because neither operation is free per
-file. The fix is Bun's `isolated` linker with `globalStore = true` (fifth
-row), one `bunfig.toml` line, which the sixth row's checkout saving already
-assumes. Fixtures, instrument, and every raw number:
+wt0 shares the tracked checkout in every row — that is the constant win,
+and the last row is that win on its own. Where wt0 does *not* help is the
+fourth row: a 236k-file hoisted `node_modules` costs the same ~2 KB of
+filesystem metadata per file whether wt0 clones it or Bun's own cache does
+(Bun clones package files out of a same-volume cache itself, which is why
+its rows are already small). The fix there is Bun's `isolated` linker with
+`globalStore = true` — one `bunfig.toml` line, the fifth row — which turns
+236k files into 12k links. Fixtures, instrument, and every raw number:
 [flam-migration.md](docs/design-partners/flam-migration.md#what-most-users-pay-today-2026-09-02),
 [dependency-link-trees.md](docs/research/dependency-link-trees.md),
 [drift.md](docs/design-partners/drift.md).
