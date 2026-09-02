@@ -83,6 +83,20 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   where wt0 offers no reduction and the fix is Bun's global store) —
   with receipts in `docs/design-partners/flam-migration.md`'s new "What
   most users pay today" addendum.
+- **Pre-install vs. post-install, with and without Bun's global store — a
+  2×2, ten worktrees per cell.** `docs/design-partners/flam-migration.md`'s
+  new "The 2×2" section answers a maintainer follow-up question directly:
+  checkout-only and post-dev-install costs, native vs. `wt0 create` +
+  `wt0 prepare --apply`, both with FLAM's own `bunfig.toml`
+  (`globalStore = true`) and with a hoisted, no-store variant. The
+  checkout saving is constant (~380 MiB native vs. ~1.8 MiB wt0
+  regardless of store); the store's one `bunfig.toml` line is worth a
+  12x reduction for wt0's post-install marginal cost (89.1 → 7.13 MiB)
+  against 1.2x for native; ten usable worktrees go from 4.58 GiB down to
+  71.2 MiB stacking both. The no-store post-install result also revises
+  an earlier "no reduction" finding — flagged provisional pending an
+  independent re-run — and superseded three FLAM rows in the README's
+  "What a worktree costs you today" table.
 
 ## 0.1.16 — 2026-09-02
 

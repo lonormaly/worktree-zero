@@ -454,3 +454,105 @@ FLAM-sized 4,000-file checkout would take ~40 s), open as follow-up work;
 the macOS path clones the whole directory in one call and Linux reflinks
 run at 0.26 s here. M2 (time to a usable workspace) on these two
 filesystems is otherwise not yet measured.
+
+### The 2×2 — install × store, ten worktrees (post-D13) (2026-09-03)
+
+The maintainer's question, verbatim: "can you add also pre and post dev
+install? with and without Bun's native global store". One protocol, one
+wt0 binary (0.1.16, this branch, post-D13), so every cell is comparable:
+two full FLAM checkouts on the same isolated 24 GiB APFS sparse image
+(`hdiutil create -size 24g -type SPARSE -fs APFS`), cloned `--shared
+--no-checkout` from the local FLAM checkout (`origin/main` `d8a558c9`) so
+Git objects are shared and not re-fetched, ten worktrees per cell, physical
+`df -k` deltas only, Bun 1.3.14 (`packageManager` pin) with
+`BUN_INSTALL=$VOL/bun-home` so the install cache and the global store both
+live on the bench volume. One clone (`flam-hoisted`) got a one-line
+`bunfig.toml` override — `[install]\nlinker = "hoisted"` — **committed**
+locally (an uncommitted edit is invisible to `git worktree add`, which
+checks out the committed tree; this cost the first run of this measurement
+a wasted pass before the fix). The other clone (`flam-store`) kept FLAM's
+own `bunfig.toml` (`linker = "isolated"`, `globalStore = true`) unchanged.
+Native = `git worktree add` for the checkout-only column, then
+`bun install --frozen-lockfile` for the usable column, same worktree.
+wt0 = `wt0 create --require-cow` for checkout-only, then `wt0 prepare
+--apply` for usable, same worktree. Every tenth worktree was proven usable
+with `cd apps/web && bun -e "import('next/package.json')…"` → `16.3.1`, in
+all four series. Times are upper bounds on a busy laptop — another session
+in this team was running its own `bun install` concurrently for part of
+the "without store" row.
+
+| Store | Phase | Metric | Native | wt0 |
+| --- | --- | --- | ---: | ---: |
+| Without store (hoisted) | Pre-install (checkout only) | Worktree #1 | 380.3 MiB | 2.7 MiB |
+| Without store (hoisted) | Pre-install (checkout only) | Cumulative @10 | 3,799.6 MiB (3.71 GiB) | 18.0 MiB |
+| Without store (hoisted) | Pre-install (checkout only) | Marginal (mean #2–10) | 379.9 MiB | 1.71 MiB |
+| Without store (hoisted) | Pre-install (checkout only) | Mean wall time | 3.8 s | 2.4 s |
+| Without store (hoisted) | Post dev install (usable) | Worktree #1 | 469.4 MiB | 179.4 MiB |
+| Without store (hoisted) | Post dev install (usable) | Cumulative @10 | 4,694.4 MiB (4.58 GiB) | 981.4 MiB (0.96 GiB) |
+| Without store (hoisted) | Post dev install (usable) | Marginal (mean #2–10) | 469.4 MiB | 89.1 MiB |
+| Without store (hoisted) | Post dev install (usable) | Mean wall time (create+install) | 66.8 s | 108.2 s |
+| With Bun's global store | Pre-install (checkout only) | Worktree #1 | 380.2 MiB | 1.8 MiB |
+| With Bun's global store | Pre-install (checkout only) | Cumulative @10 | 3,800.8 MiB (3.71 GiB) | 18.1 MiB |
+| With Bun's global store | Pre-install (checkout only) | Marginal (mean #2–10) | 380.1 MiB | 1.81 MiB |
+| With Bun's global store | Pre-install (checkout only) | Mean wall time | 2.7 s | 1.4 s |
+| With Bun's global store | Post dev install (usable) | Worktree #1 | 386.4 MiB | 7.0 MiB |
+| With Bun's global store | Post dev install (usable) | Cumulative @10 | 3,857.7 MiB (3.77 GiB) | 71.2 MiB |
+| With Bun's global store | Post dev install (usable) | Marginal (mean #2–10) | 385.7 MiB | 7.13 MiB |
+| With Bun's global store | Post dev install (usable) | Mean wall time (create+prepare) | 7.9 s | 7.0 s |
+
+Four readings. **The checkout saving is constant**: `wt0 create`'s marginal
+cost lands at 1.71–1.81 MiB against native `git worktree add`'s ~380 MiB in
+both rows, because checkout never touches `node_modules` and doesn't care
+which `bunfig.toml` is active. **Without the store, native's post-install
+marginal (469.4 MiB for the 236,332-file hoisted tree) sits almost exactly
+at the ~2 KB/file metadata floor this document already measured (≈2,083
+bytes/file, 469.4 MiB ÷ 236,332 files); wt0 comes in well under that floor
+at 89.1 MiB (≈395 bytes/file)** — a real win in the exact scenario gap #7
+called "no reduction," most likely because D13's seed-from-checkout
+mechanism (built to fix the first-worktree cost) now also makes every
+worktree's clone cheaper than gap #7's per-file measurement, not only the
+first; this result should be treated as provisional pending an independent
+re-run, since it revises a previously published finding. **With the store
+on, both engines improve, but by very different amounts**: native's
+marginal falls 18% (469.4 → 385.7 MiB, Bun's own hoisted tree shrinking to
+mostly symlinks) while wt0's falls 92% (89.1 → 7.13 MiB) — so the one-line
+`bunfig.toml` change is worth a 12x reduction for wt0 against a 1.2x one
+for native, on the identical checkout and lockfile. **Stacking both
+optimizations** takes ten usable worktrees from 4.58 GiB (native, no
+store) to 71.2 MiB (wt0, store) — 66x — while the store alone on native
+barely moves the needle (4.58 GiB → 3.77 GiB), so wt0's checkout-and-seed
+sharing is doing most of the work even before the store is configured.
+
+Commands (native, without-store row; the other three series swap
+`git worktree add` for `wt0 create --require-cow` and/or point at
+`flam-store`):
+
+```bash
+hdiutil create -size 24g -type SPARSE -fs APFS -volname wt0bench2x2 vol
+hdiutil attach vol.sparseimage   # -> /Volumes/wt0bench2x2
+git clone --shared --no-checkout /path/to/flam /Volumes/wt0bench2x2/flam-hoisted
+cd /Volumes/wt0bench2x2/flam-hoisted && git checkout origin/main -q
+printf '[install]\nlinker = "hoisted"\n' > bunfig.toml
+git add bunfig.toml && git commit -m "bench: linker=hoisted, no global store"
+export BUN_INSTALL=/Volumes/wt0bench2x2/bun-home
+git worktree add -q ../native-hoisted-wt1 -b bench/1
+cd ../native-hoisted-wt1 && bun install --frozen-lockfile
+```
+
+wt0 dogfooding receipts for this session:
+
+```
+$ ./target/release/wt0 create claude/flam-2x2 \
+    --path /Users/shaisnir/Development/wt0-agent-2x2 \
+    --owner 2x2-agent --require-cow
+mode: cow-clone
+runtime: 01a063bb-dcec-7ad2-aad4-c8a4ed0a483e
+/Users/shaisnir/Development/wt0-agent-2x2
+```
+
+Clean create, no refusals. `wt0 remove` (`--force --delete-branch`) on
+every one of the 40 bench worktrees created for this measurement (20 per
+row) also completed without refusal; removal of the 236,332-file hoisted
+trees took roughly a minute each (many individual `unlink` calls, unlike
+the single `clonefile` call `create` uses), consistent with the "removing
+it took 65 s" receipt already recorded in gap #7 above.

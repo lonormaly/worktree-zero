@@ -34,19 +34,24 @@ free-space deltas only, 3 worktrees per row unless noted:
 | npm hoisted (Next app) | 388 MiB, 60–74 s | 4–5 MiB, 2–5 s | 3.8 GiB → 429 MiB |
 | Yarn classic (Next app) | 405 MiB, 7 s | ≈0–5 MiB, 3–4 s | 4.0 GiB → ≈430 MiB |
 | Bun hoisted, no store, cache on the same volume (Next app) | 4.5 MiB, 2 s | 2.7 MiB, 5 s | 45 MiB → 29 MiB |
-| Bun hoisted, no store, cache on the same volume (FLAM, 236k files) | 452 MiB, 97 s | 460 MiB, 148 s — no reduction, see below | 4.4 GiB → 4.5 GiB |
-| Bun global store / pnpm (FLAM) | 434 MiB, 62–113 s | 9 MiB, ~30 s | 5.1 GiB → 595 MiB |
-| `git worktree add` alone (FLAM checkout) | 368 MiB, 8 s | 9 MiB, 1 s | 3.6 GiB → 449 MiB |
+| Bun hoisted, no store, cache on the same volume (FLAM, 236k files) | 469 MiB, 67 s | 89 MiB, 108 s — see the caveat below | 4.58 GiB → 981 MiB |
+| Bun global store (FLAM) | 386 MiB, 8 s | 7.1 MiB, 7 s | 3.77 GiB → 71 MiB |
+| `git worktree add` alone (FLAM checkout) | 380 MiB, 3 s | 1.8 MiB, 2 s | 3.71 GiB → 18 MiB |
 
 wt0 shares the tracked checkout in every row — that is the constant win,
-and the last row is that win on its own. Where wt0 does *not* help is the
-fourth row: a 236k-file hoisted `node_modules` costs the same ~2 KB of
-filesystem metadata per file whether wt0 clones it or Bun's own cache does
-(Bun clones package files out of a same-volume cache itself, which is why
-its rows are already small). The fix there is Bun's `isolated` linker with
-`globalStore = true` — one `bunfig.toml` line, the fifth row — which turns
-236k files into 12k links. Fixtures, instrument, and every raw number:
-[flam-migration.md](docs/design-partners/flam-migration.md#what-most-users-pay-today-2026-09-02),
+and the last row is that win on its own. The fourth row (a 236k-file
+hoisted `node_modules`) originally showed no advantage for wt0, on the
+reasoning that a per-file clone costs the same ~2 KB of metadata per file
+as Bun's own same-volume-cache materialization; a later ten-worktree run
+(the 2×2 in flam-migration.md) found wt0's seed-from-checkout mechanism
+now costs well under that floor there too — a real result, but treated as
+provisional pending an independent re-run, since it revises a previously
+published finding. The reliable fix either way is still Bun's `isolated`
+linker with `globalStore = true` — one `bunfig.toml` line, the fifth row —
+which turns 236k files into 12k links and gives wt0 its largest margin.
+Fixtures, instrument, and every raw number:
+[flam-migration.md](docs/design-partners/flam-migration.md) (see "The 2×2"
+and "What most users pay today"),
 [dependency-link-trees.md](docs/research/dependency-link-trees.md),
 [drift.md](docs/design-partners/drift.md).
 
