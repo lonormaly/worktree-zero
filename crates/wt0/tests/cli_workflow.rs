@@ -271,7 +271,7 @@ fn migrate_apply_converts_a_clean_existing_worktree_and_is_idempotent() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn git_stdout(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .current_dir(repo)
@@ -907,6 +907,176 @@ fn seeding_clones_ignored_trees_from_the_base_checkout() {
     let receipt: serde_json::Value = serde_json::from_slice(&created.stdout).expect("bare JSON");
     assert!(receipt["seeded"].as_array().is_some_and(Vec::is_empty));
     assert!(!bare.join(".cache").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+// A node_modules seed is allowed only when it is provably cheap and sound: the
+// root tree, Bun, the same isolated global-store layout on both sides, a base
+// that really is a link tree, byte-identical lockfiles, and nothing holding the
+// base tree open. Every other shape keeps its refusal, with its own reason.
+#[cfg(unix)]
+#[test]
+fn seeding_clones_node_modules_only_when_the_bun_layout_matches() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-bunseed-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    let machine = root.join("machine-state");
+    // Stands in for Bun's machine-wide store: outside the repository, exactly
+    // where a real global-store link points.
+    let store = root.join("global-store/pkg@1.0.0");
+    fs::create_dir_all(&machine).expect("create machine-state fixture");
+    fs::create_dir_all(&repo).expect("create repository");
+    fs::create_dir_all(&store).expect("create global store fixture");
+    fs::write(store.join("index.js"), "module.exports = 1;\n").expect("write store package");
+
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    fs::write(
+        repo.join(".wt0-seed"),
+        "node_modules\napps/web/node_modules\n",
+    )
+    .expect("write seed policy");
+    fs::write(
+        repo.join("bunfig.toml"),
+        "[install]\nlinker = \"isolated\"\nglobalStore = true\n",
+    )
+    .expect("write bunfig");
+    fs::write(repo.join("bun.lock"), "{\"lockfileVersion\": 1}\n").expect("write lockfile");
+    fs::write(repo.join("package.json"), "{\"name\":\"fixture\"}\n").expect("write manifest");
+    // -f: a developer's global excludes file may ignore .gitignore itself.
+    git(&repo, &["add", "-f", "."]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    let trunk = git_stdout(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+
+    // The base's link tree, written as files rather than installed: `.bun`
+    // holds the symlinks into the store, and the tree above it is the layout
+    // an identical lockfile resolves to.
+    fs::create_dir_all(repo.join("node_modules/.bun")).expect("create the store link directory");
+    std::os::unix::fs::symlink(&store, repo.join("node_modules/.bun/pkg@1.0.0"))
+        .expect("link the store");
+    fs::create_dir_all(repo.join("node_modules/pkg")).expect("create the package directory");
+    fs::write(
+        repo.join("node_modules/pkg/index.js"),
+        "module.exports = 1;\n",
+    )
+    .expect("write the package");
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let create = |branch: &str, base: Option<&str>, path: &Path| -> serde_json::Value {
+        let mut command = Command::new(wt0);
+        command
+            .current_dir(&repo)
+            .env("WT0_MACHINE_STATE", &machine)
+            .args(["--json", "create", branch]);
+        if let Some(base) = base {
+            command.args(["--base", base]);
+        }
+        let created = command
+            .arg("--path")
+            .arg(path)
+            .output()
+            .expect("create worktree");
+        assert!(
+            created.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        serde_json::from_slice(&created.stdout).expect("create JSON")
+    };
+    let seed_of = |receipt: &serde_json::Value, path: &str| -> serde_json::Value {
+        receipt["seeded"]
+            .as_array()
+            .expect("seed receipts")
+            .iter()
+            .find(|seed| seed["path"] == path)
+            .unwrap_or_else(|| panic!("no seed receipt for {path}: {receipt}"))
+            .clone()
+    };
+
+    // Matching layouts on the same lockfile: the tree is cloned, links and all.
+    let matched = root.join("matched");
+    let receipt = create("agent/bun-matched", None, &matched);
+
+    // A nested workspace tree is only part of a layout; hoisting decides the
+    // rest, so only the root tree can be seeded.
+    let nested = seed_of(&receipt, "apps/web/node_modules");
+    assert_eq!(nested["status"], "refused", "{nested}");
+    assert!(
+        nested["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("only the root node_modules")),
+        "{nested}"
+    );
+
+    let modules = seed_of(&receipt, "node_modules");
+    if modules["status"] == "seeded" {
+        assert_eq!(
+            fs::read_to_string(matched.join("node_modules/pkg/index.js")).expect("seeded package"),
+            "module.exports = 1;\n"
+        );
+        let link = matched.join("node_modules/.bun/pkg@1.0.0");
+        assert!(link.is_symlink(), "expected the store link to be recreated");
+        assert_eq!(fs::read_link(&link).expect("read the store link"), store);
+        assert!(
+            modules["files"].as_u64().is_some_and(|files| files > 0),
+            "{modules}"
+        );
+        assert!(
+            modules["logical_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0),
+            "{modules}"
+        );
+    } else {
+        // No copy-on-write between the two locations (plain ext4, an overlay
+        // mount): the seed is skipped with a reason, never degraded to a copy.
+        assert_eq!(modules["status"], "skipped", "{modules}");
+        assert!(modules["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()));
+        assert!(!matched.join("node_modules").exists());
+    }
+
+    // A different lockfile resolves to a different store layout: refused, and
+    // the prepared environment handles it instead.
+    git(&repo, &["checkout", "-q", "-b", "lock-change"]);
+    fs::write(repo.join("bun.lock"), "{\"lockfileVersion\": 2}\n").expect("rewrite the lockfile");
+    git(&repo, &["commit", "-q", "-am", "change the lockfile"]);
+    git(&repo, &["checkout", "-q", trunk.as_str()]);
+    let changed = root.join("lock-changed");
+    let receipt = create("agent/bun-lock-change", Some("lock-change"), &changed);
+    let modules = seed_of(&receipt, "node_modules");
+    assert_eq!(modules["status"], "refused", "{modules}");
+    assert!(
+        modules["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("lockfile differs")),
+        "{modules}"
+    );
+    assert!(!changed.join("node_modules").exists());
+
+    // Without the base's bunfig the layouts are not provably the same.
+    fs::remove_file(repo.join("bunfig.toml")).expect("drop the base bunfig");
+    let unmatched = root.join("unmatched");
+    let receipt = create("agent/bun-unmatched", None, &unmatched);
+    let modules = seed_of(&receipt, "node_modules");
+    assert_eq!(modules["status"], "refused", "{modules}");
+    assert!(
+        modules["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("isolated global store")),
+        "{modules}"
+    );
+    assert!(!unmatched.join("node_modules").exists());
 
     let _ = fs::remove_dir_all(root);
 }

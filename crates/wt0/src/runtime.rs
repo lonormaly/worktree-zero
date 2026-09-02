@@ -1697,7 +1697,10 @@ fn node_modules_ignored(root: &Path) -> Result<bool> {
     Ok(status.success())
 }
 
-fn has_global_links(root: &Path) -> Result<bool> {
+/// Whether `root` was installed as a global-store link tree: `node_modules/.bun`
+/// exists and holds at least one symlink into Bun's machine-wide store. Shared
+/// with seeding, which will only clone a `node_modules` that has this shape.
+pub(crate) fn has_global_links(root: &Path) -> Result<bool> {
     let store = root.join("node_modules/.bun");
     if !store.exists() {
         return Ok(false);
@@ -1747,19 +1750,28 @@ fn bun_version_supported(version: &str) -> bool {
     matches!(parsed, (Some(major), Some(minor), Some(patch)) if (major, minor, patch) >= (1, 3, 14))
 }
 
+/// Whether `root`'s `bunfig.toml` asks Bun for the isolated global virtual
+/// store — `[install] linker = "isolated"` and `globalStore = true`. One parse,
+/// shared by the Bun report and by layout-matched `node_modules` seeding.
+pub(crate) fn bun_isolated_global_store(root: &Path) -> bool {
+    let Ok(config) = fs::read_to_string(root.join("bunfig.toml")) else {
+        return false;
+    };
+    config
+        .lines()
+        .any(|line| line.trim() == "linker = \"isolated\"")
+        && config
+            .lines()
+            .any(|line| line.trim() == "globalStore = true")
+}
+
 fn bun_report(root: &Path) -> Option<BunReport> {
     let lock = root.join("bun.lock");
     let manifest = root.join("bunfig.toml");
     if !lock.exists() && !manifest.exists() {
         return None;
     }
-    let config = fs::read_to_string(manifest).unwrap_or_default();
-    let configured = config
-        .lines()
-        .any(|line| line.trim() == "linker = \"isolated\"")
-        && config
-            .lines()
-            .any(|line| line.trim() == "globalStore = true");
+    let configured = bun_isolated_global_store(root);
     let version = Command::new("bun")
         .arg("--version")
         .current_dir(root)

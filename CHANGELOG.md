@@ -20,13 +20,26 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   from the base checkout before anything runs in it, so the first build
   starts warm. Tracked paths are refused, secrets are rejected by the
   policy, and a clone that cannot be copy-on-write is skipped with a reason
-  rather than copied. `node_modules` is refused by measurement: cloning a
-  live 230k-file tree took 168 s and reconciled into a junk layout; sealed
+  rather than copied. `node_modules` is refused by measurement — cloning a
+  live 230k-file tree took 168 s and reconciled into a junk layout — except
+  for the layout-matched Bun link tree described under Changed; sealed
   prepared environments remain the origin-as-store for dependencies.
   Receipts carry one entry per seed; `capabilities` reports `project_seed`;
   `--no-seed` / `WT0_SEED=0` opt out.
 
 ### Changed
+
+- **`node_modules` can be seeded when the layout is provably matched.** The
+  blanket refusal is now conditional: wt0 clones the root `node_modules` from
+  the base checkout only when it is a Bun isolated global-store link tree on
+  both sides — the seed is the root tree, Bun is the worktree's manager, base
+  and worktree `bunfig.toml` both set `linker = "isolated"` and
+  `globalStore = true`, the base's `node_modules/.bun` really holds store
+  symlinks, the lockfiles are byte-identical, and no live process holds the
+  base tree open. Then the clone is links, not packages, and the same lockfile
+  resolves to the same store paths. Every other shape keeps its refusal, each
+  with its own receipt reason; the 168 s / junk-layout measurement that
+  motivated the original refusal stands for hoisted trees.
 
 - **New baselines derive from the nearest existing one.** A new base commit
   no longer pays a full materialization: wt0 clones the closest existing

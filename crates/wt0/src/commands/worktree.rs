@@ -2395,12 +2395,88 @@ pub(crate) fn project_seed_policy(root: &Path) -> Result<Vec<PathBuf>> {
         .with_context(|| format!("invalid seed policy {}", path.display()))
 }
 
+/// The refusal every dependency tree gets when it is not a layout-matched Bun
+/// global-store link tree: the sealed prepared environment is the consistent,
+/// lockfile-keyed form of the same install, and is what `wt0 prepare` attaches.
+const DEPENDENCY_SEED_REFUSAL: &str = "dependency trees are attached from sealed prepared environments (wt0 prepare); seed caches, not node_modules";
+
+/// Why this `node_modules` seed is refused, or `None` when cloning it is
+/// provably cheap and sound.
+///
+/// Measured, not assumed: cloning a live 230,000-file hoisted `node_modules`
+/// took 168 s and, once the package manager reconciled, left a junk mix of the
+/// base's layout and the worktree's. Exactly one shape escapes that. Under
+/// Bun's isolated global store a `node_modules` is a *link tree*: the packages
+/// live in one machine-wide store and the tree is symlinks into it, so the
+/// clone is thousands of links instead of hundreds of thousands of files, and
+/// an identical lockfile resolves to the identical store paths — the base's
+/// links are already the links the worktree wants. Six conditions prove that,
+/// in order, each with its own receipt reason:
+///
+/// 1. the seed is the root `node_modules` (a nested workspace tree is only
+///    part of a layout, and hoisting decides the rest);
+/// 2. Bun is the worktree's package manager (no other manager has this shape);
+/// 3. base and worktree both ask for the isolated global store;
+/// 4. the base really was installed that way (`node_modules/.bun` link tree);
+/// 5. the lockfiles are byte-identical, so both resolve to the same store; and
+/// 6. no live process holds the base tree open, so it is not mid-install.
+fn node_modules_seed_refusal(base: &Path, target: &Path, relative: &Path) -> Option<String> {
+    if relative != Path::new("node_modules") {
+        return Some("only the root node_modules can be seeded".to_owned());
+    }
+    let bun = crate::runtime::detect_javascript_package_managers(target).as_slice() == ["bun"]
+        && (target.join("bun.lock").is_file() || target.join("bun.lockb").is_file());
+    if !bun {
+        return Some(DEPENDENCY_SEED_REFUSAL.to_owned());
+    }
+    if !crate::runtime::bun_isolated_global_store(base)
+        || !crate::runtime::bun_isolated_global_store(target)
+    {
+        return Some("base and worktree must both use Bun's isolated global store".to_owned());
+    }
+    if !crate::runtime::has_global_links(base).unwrap_or(false) {
+        return Some("base node_modules is not a global-store link tree".to_owned());
+    }
+    if !bun_lockfiles_match(base, target) {
+        return Some(
+            "lockfile differs from the base; prepared environments handle lockfile changes"
+                .to_owned(),
+        );
+    }
+    // An install in flight would be cloned half-written; a failed probe is
+    // treated as "in use" rather than waved through.
+    if !matches!(
+        crate::process::live_open_path(&base.join("node_modules")),
+        Ok(None)
+    ) {
+        return Some("base node_modules is in use".to_owned());
+    }
+    None
+}
+
+/// Whether the worktree's Bun lockfile is byte-for-byte the base's. `bun.lock`
+/// is the text lockfile and `bun.lockb` the older binary one; whichever the
+/// worktree carries is the one compared, and a base missing it never matches.
+fn bun_lockfiles_match(base: &Path, target: &Path) -> bool {
+    for name in ["bun.lock", "bun.lockb"] {
+        let lock = target.join(name);
+        if lock.is_file() {
+            return match (fs::read(&lock), fs::read(base.join(name))) {
+                (Ok(worktree), Ok(base)) => worktree == base,
+                _ => false,
+            };
+        }
+    }
+    false
+}
+
 /// Clone each seed path from the base checkout into `target` with
 /// copy-on-write. The base checkout is the store: what already exists there
 /// costs nothing to reuse, and the package manager or build tool then
 /// reconciles only what differs. One receipt per policy entry: `seeded`,
 /// `absent` (nothing to seed from), `refused` (not ignored in the new
-/// worktree, so it would shadow tracked content), or `skipped` (the clone
+/// worktree, so it would shadow tracked content, or a dependency tree that is
+/// not layout-matched — see `node_modules_seed_refusal`), or `skipped` (the clone
 /// failed — typically no copy-on-write between the two locations; a full
 /// copy is never substituted).
 fn seed_from_base(repo: &RepoContext, target: &Path) -> Vec<serde_json::Value> {
@@ -2424,24 +2500,16 @@ fn seed_from_base(repo: &RepoContext, target: &Path) -> Vec<serde_json::Value> {
                 "logical_bytes": bytes,
             })
         };
-        // Measured, not assumed: cloning a live 230k-file node_modules took
-        // 168 s and left a junk layout after the manager reconciled; the
-        // sealed prepared environment is the consistent, lockfile-keyed form
-        // of the same install and is what `wt0 prepare` attaches.
+        // A dependency tree is seeded only when it is provably cheap and sound
+        // to clone; see `node_modules_seed_refusal`.
         if relative
             .components()
             .any(|component| component.as_os_str() == "node_modules")
         {
-            receipts.push(receipt(
-                "refused",
-                Some(
-                    "dependency trees are attached from sealed prepared environments (wt0 prepare); seed caches, not node_modules"
-                        .to_owned(),
-                ),
-                0,
-                0,
-            ));
-            continue;
+            if let Some(reason) = node_modules_seed_refusal(&repo.top_level, target, &relative) {
+                receipts.push(receipt("refused", Some(reason), 0, 0));
+                continue;
+            }
         }
         if !source.exists() {
             receipts.push(receipt("absent", None, 0, 0));
