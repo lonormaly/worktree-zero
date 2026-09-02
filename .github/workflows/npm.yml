@@ -1,0 +1,57 @@
+name: Publish npm
+
+# Publish `wt0` and its six platform packages to npm from the assets of an
+# existing GitHub release — no laptop, no one-time password. Runs when a
+# release is published (the Release workflow's last step) and on demand for a
+# given version. Authenticates with the NPM_TOKEN repository secret: a
+# granular npm access token with publish rights and two-factor bypass, the
+# same arrangement ImmorTerm's repositories use. Re-runs are safe: a version
+# already on the registry is skipped, never rejected.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Released version to publish (e.g. 0.1.16); defaults to the workspace version"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Resolve the version
+        id: version
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          if [ -z "$version" ]; then
+            case "${{ github.event_name }}" in
+              release) version="${{ github.event.release.tag_name }}"; version="${version#v}" ;;
+              *) version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1) ;;
+            esac
+          fi
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Require the npm token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN is not set; add a granular npm token with publish rights and 2FA bypass as a repository secret" >&2
+            exit 1
+          fi
+      - name: Build and publish from the release assets
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm/publish.sh "${{ steps.version.outputs.version }}"
