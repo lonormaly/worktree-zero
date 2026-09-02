@@ -5,6 +5,15 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ## Unreleased
 
+### Changed
+
+- **New baselines derive from the nearest existing one.** A new base commit
+  no longer pays a full materialization: wt0 clones the closest existing
+  baseline with copy-on-write, refreshes only the paths that differ, and
+  proves the result against the commit (any doubt falls back to a full
+  checkout). On FLAM this took a new-base create from 386 MiB to 18 MiB
+  physical. Baselines record `derived-from`.
+
 ### Fixed
 
 - **Spotlight no longer blocks cleanup on macOS**: the open-path guard that
