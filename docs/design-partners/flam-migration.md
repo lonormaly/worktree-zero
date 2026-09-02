@@ -262,5 +262,22 @@ correctly; see the comment on that step). The job fails outright if wt0's
 marginal storage per worktree exceeds 10% of native's on either filesystem.
 The resulting table is not pasted here — it is published fresh to
 `$GITHUB_STEP_SUMMARY` on every run, so it can't go stale; see the
-`reflink-linux` and `windows` jobs' summaries for the current numbers. M2
-(time to a usable workspace) on these two filesystems is not yet measured.
+`reflink-linux` and `windows` jobs' summaries for the current numbers. The
+Linux step runs on every push and pull request; the ReFS step runs on
+pushes to `main` only, because of the finding below.
+
+First run (2026-09-02, run `33661351722`), recorded here as the receipt for
+the day the gate landed — the job summaries are the living numbers:
+
+| Filesystem | Native marginal per worktree | wt0 marginal | wt0 share | Mean create: native / wt0 |
+| --- | ---: | ---: | ---: | ---: |
+| Linux Btrfs (loopback) | 125.3 MiB | **1.9 MiB** | 1.5% | 0.28 s / 0.26 s |
+| Windows ReFS (diskpart) | 103.6 MiB | **9.8 MiB** | 9.5% | 0.89 s / **20.2 s** |
+
+Storage holds on both. Time does not on ReFS: `wt0 create` averaged 20 s
+for a 2,000-file tree — about 10 ms per file on the per-file block-clone
+path — against native Git's 0.9 s. That is a real Windows shortfall (a
+FLAM-sized 4,000-file checkout would take ~40 s), open as follow-up work;
+the macOS path clones the whole directory in one call and Linux reflinks
+run at 0.26 s here. M2 (time to a usable workspace) on these two
+filesystems is otherwise not yet measured.

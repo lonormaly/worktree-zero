@@ -144,7 +144,11 @@ jobs:
           TMP: R:\tmp
           TEMP: R:\tmp
         run: cargo test --all
+      # Main only: wt0 create runs ~20 s per worktree on ReFS today (a
+      # per-file clone cost under investigation), so this 4-minute step
+      # would set every PR's critical path. Linux measures on every run.
       - name: Measure M1 (marginal storage per worktree) on ReFS
+        if: github.event_name == 'push'
         shell: bash
         # Git Bash's `df` reaches the R: drive through an MSYS translation
         # layer we have not verified reports physical, clone-aware used
