@@ -21,6 +21,13 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Changed
 
+- **New baselines derive from the nearest existing one.** A new base commit
+  no longer pays a full materialization: wt0 clones the closest existing
+  baseline with copy-on-write, refreshes only the paths that differ, and
+  proves the result against the commit (any doubt falls back to a full
+  checkout). On FLAM this took a new-base create from 386 MiB to 18 MiB
+  physical. Baselines record `derived-from`.
+
 - **Every JavaScript package manager gets the same contract.** Bun without
   its global virtual store no longer refuses `prepare`/`run`/`migrate`: wt0
   recommends enabling the store (`doctor` reports the exact `bunfig.toml`

@@ -803,3 +803,130 @@ fn byte_sizes_parse_binary_units_and_reject_garbage() {
     assert!(parse_bytes("lots").is_err());
     assert!(parse_bytes("20X").is_err());
 }
+
+/// Every tracked path of `commit`, as (path, bytes) — the reference a
+/// baseline tree is compared against.
+fn tracked_contents(repo: &RepoContext, commit: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    let listing = std::process::Command::new("git")
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .args(["ls-tree", "-r", "-z", "--name-only", commit])
+        .output()?;
+    let mut files = Vec::new();
+    for raw in listing.stdout.split(|byte| *byte == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let path = String::from_utf8(raw.to_vec())?;
+        // As checked out: `--filters` applies the path's smudge filters,
+        // exactly like checkout-index does when a baseline is materialized.
+        let blob = std::process::Command::new("git")
+            .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+            .args(["cat-file", "--filters", &format!("{commit}:{path}")])
+            .current_dir(&repo.top_level)
+            .output()?;
+        files.push((path, blob.stdout));
+    }
+    Ok(files)
+}
+
+fn assert_tree_matches(tree: &Path, repo: &RepoContext, commit: &str) -> Result<()> {
+    let expected = tracked_contents(repo, commit)?;
+    for (path, bytes) in &expected {
+        let target = tree.join(path);
+        if target.is_symlink() {
+            continue;
+        }
+        assert_eq!(
+            &fs::read(&target)?,
+            bytes,
+            "content of {path} in baseline {commit}"
+        );
+    }
+    let mut present = Vec::new();
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                walk(&path, root, out)?;
+            } else {
+                out.push(
+                    path.strip_prefix(root)?
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+        Ok(())
+    }
+    walk(tree, tree, &mut present)?;
+    let mut expected_paths: Vec<String> = expected.into_iter().map(|(path, _)| path).collect();
+    expected_paths.sort();
+    present.sort();
+    assert_eq!(present, expected_paths, "path set of baseline {commit}");
+    Ok(())
+}
+
+// Gap #6: a new base commit must not pay a full materialization when a
+// nearby baseline exists — it is derived from the nearest one, and the
+// derived tree is proven identical to the commit (modified, added, deleted,
+// and nested paths alike).
+#[test]
+fn baselines_derive_from_the_nearest_existing_baseline() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let first = resolve_commit(&repo, "HEAD")?;
+    let first_tree = cow::ensure_baseline(&repo, &first, None)?;
+    assert_tree_matches(&first_tree, &repo, &first)?;
+
+    fs::write(fixture.repo.join("file.txt"), "changed\n")?;
+    fs::create_dir_all(fixture.repo.join("nested/deeper"))?;
+    fs::write(fixture.repo.join("nested/deeper/new.txt"), "added\n")?;
+    fs::remove_file(fixture.repo.join("file with spaces.txt"))?;
+    git(&fixture.repo, ["add", "-A"])?;
+    git(&fixture.repo, ["commit", "-q", "-m", "second"])?;
+    let second = resolve_commit(&repo, "HEAD")?;
+
+    let second_tree = cow::ensure_baseline(&repo, &second, None)?;
+    assert_tree_matches(&second_tree, &repo, &second)?;
+    let derived_from = second_tree.parent().unwrap().join("derived-from");
+    if cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+        assert_eq!(
+            fs::read_to_string(&derived_from)?,
+            first,
+            "second baseline must derive from the first"
+        );
+    } else {
+        // A plain filesystem (NTFS, ext4) cannot clone the parent; the full
+        // materialization is the correct result and must not claim derivation.
+        assert!(!derived_from.exists());
+    }
+    // The first baseline is untouched by the derivation.
+    assert_tree_matches(&first_tree, &repo, &first)?;
+    Ok(())
+}
+
+// The shortcut is proven, not trusted: a parent baseline that acquired a
+// stray file makes the derived tree fail verification, and the fallback
+// still produces an exact baseline.
+#[test]
+fn a_corrupt_parent_baseline_falls_back_to_a_full_materialization() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let first = resolve_commit(&repo, "HEAD")?;
+    let first_tree = cow::ensure_baseline(&repo, &first, None)?;
+    fs::write(first_tree.join("stray.txt"), "should never propagate\n")?;
+
+    fs::write(fixture.repo.join("file.txt"), "changed again\n")?;
+    git(&fixture.repo, ["add", "-A"])?;
+    git(&fixture.repo, ["commit", "-q", "-m", "third"])?;
+    let third = resolve_commit(&repo, "HEAD")?;
+
+    let third_tree = cow::ensure_baseline(&repo, &third, None)?;
+    assert_tree_matches(&third_tree, &repo, &third)?;
+    assert!(
+        !third_tree.parent().unwrap().join("derived-from").exists(),
+        "a tree that failed verification must not be recorded as derived"
+    );
+    Ok(())
+}
