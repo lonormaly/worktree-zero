@@ -5,6 +5,17 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ## 0.1.16 — 2026-09-02
 
+### Added
+
+- **Gate 7: M1 (marginal storage per worktree) measured in CI on Linux
+  Btrfs and Windows ReFS.** `tests/measure_m1.sh` builds a ~100 MiB fixture
+  repo and compares `git worktree add` against `wt0 create --require-cow`,
+  5 worktrees each, reading physical usage from the filesystem itself
+  (never `du`). Wired into the `reflink-linux` and `windows` CI jobs, which
+  now fail if wt0's marginal cost exceeds 10% of native's; the table is
+  published to each run's job summary. See `docs/design-partners/flam-migration.md`
+  ("Gate 7") for how this complements the hand-measured macOS numbers.
+
 ### Changed
 
 - **`node_modules` seeds behind an identical lockfile, for every package

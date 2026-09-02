@@ -295,7 +295,44 @@ worktree 0.14 s. Directory `clonefile` of the 230k-file Builders Stack
 `node_modules` took 12 s on the loaded laptop; removing it took 65 s.
 
 Not yet measured here: builds, tests, and dev servers inside the
-worktrees (gate 2), crash-recovery reaping (gate 5), Linux and Windows
-(gate 7). M3 (real-fleet reclaim, 12.2 GiB) and the booted-stack round trip
-are recorded above; M4/M5 are covered by the concurrency suite and the
-Team session's round trip; M6 waits on the adapter landing on FLAM `main`.
+worktrees (gate 2), crash-recovery reaping (gate 5). M3 (real-fleet reclaim,
+12.2 GiB) and the booted-stack round trip are recorded above; M4/M5 are
+covered by the concurrency suite and the Team session's round trip; M6
+waits on the adapter landing on FLAM `main`.
+
+### Gate 7 — M1 on Linux (Btrfs) and Windows (ReFS), in CI
+
+The macOS/APFS numbers above were measured by hand, once, on an isolated
+volume. The Linux and Windows numbers are not: they come from
+`tests/measure_m1.sh`, run on every CI build as a step in the
+`reflink-linux` job (the loopback Btrfs volume that job already mounts) and
+the `windows` job (the diskpart-created ReFS volume that job already
+formats) in [`ci.yml`](../../.github/workflows/ci.yml). Each run builds a
+~100 MiB, 2,000-file fixture repo on the volume under test, creates 5
+worktrees with native `git worktree add` and 5 with `wt0 create
+--require-cow`, and reads physical usage from the filesystem itself — `df
+-k --output=used` on Linux, a PowerShell `Get-PSDrive` query on Windows
+(Git Bash's `df` was not trusted to see through the ReFS/diskpart mount
+correctly; see the comment on that step). The job fails outright if wt0's
+marginal storage per worktree exceeds 10% of native's on either filesystem.
+The resulting table is not pasted here — it is published fresh to
+`$GITHUB_STEP_SUMMARY` on every run, so it can't go stale; see the
+`reflink-linux` and `windows` jobs' summaries for the current numbers. The
+Linux step runs on every push and pull request; the ReFS step runs on
+pushes to `main` only, because of the finding below.
+
+First run (2026-09-02, run `33661351722`), recorded here as the receipt for
+the day the gate landed — the job summaries are the living numbers:
+
+| Filesystem | Native marginal per worktree | wt0 marginal | wt0 share | Mean create: native / wt0 |
+| --- | ---: | ---: | ---: | ---: |
+| Linux Btrfs (loopback) | 125.3 MiB | **1.9 MiB** | 1.5% | 0.28 s / 0.26 s |
+| Windows ReFS (diskpart) | 103.6 MiB | **9.8 MiB** | 9.5% | 0.89 s / **20.2 s** |
+
+Storage holds on both. Time does not on ReFS: `wt0 create` averaged 20 s
+for a 2,000-file tree — about 10 ms per file on the per-file block-clone
+path — against native Git's 0.9 s. That is a real Windows shortfall (a
+FLAM-sized 4,000-file checkout would take ~40 s), open as follow-up work;
+the macOS path clones the whole directory in one call and Linux reflinks
+run at 0.26 s here. M2 (time to a usable workspace) on these two
+filesystems is otherwise not yet measured.

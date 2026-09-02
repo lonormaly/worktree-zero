@@ -119,6 +119,8 @@ jobs:
         env:
           TMPDIR: /mnt/wt0-btrfs
         run: WT0_BIN="$PWD/target/debug/wt0" bash tests/prepared_node_integration.sh npm
+      - name: Measure M1 (marginal storage per worktree) on Btrfs
+        run: WT0="$PWD/target/debug/wt0" VOLUME=/mnt/wt0-btrfs N=5 bash tests/measure_m1.sh
 
   windows:
     runs-on: windows-latest
@@ -147,6 +149,20 @@ jobs:
           TMP: R:\tmp
           TEMP: R:\tmp
         run: cargo test --all
+      # Main only: wt0 create runs ~20 s per worktree on ReFS today (a
+      # per-file clone cost under investigation), so this 4-minute step
+      # would set every PR's critical path. Linux measures on every run.
+      - name: Measure M1 (marginal storage per worktree) on ReFS
+        if: github.event_name == 'push'
+        shell: bash
+        # Git Bash's `df` reaches the R: drive through an MSYS translation
+        # layer we have not verified reports physical, clone-aware used
+        # bytes for a diskpart-created ReFS volume, so WT0_M1_PS_DRIVE routes
+        # tests/measure_m1.sh to `Get-PSDrive R | select Used` instead, which
+        # asks Windows for the volume's real usage directly.
+        env:
+          WT0_M1_PS_DRIVE: R
+        run: WT0="$PWD/target/debug/wt0.exe" VOLUME=/r/tmp N=5 bash tests/measure_m1.sh
 
   stress:
     # N agents arriving at once is the product's core scenario: many
