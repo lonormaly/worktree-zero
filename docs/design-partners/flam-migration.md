@@ -209,4 +209,38 @@ namespace, database, and generated root; a normal removal leaving no orphan
 
 ## After
 
-_To be filled by the same instruments once the migration lands._
+### M1 + M2 — 1, 4, and 10 usable worktrees on an isolated volume (2026-09-02)
+
+Instrument: a dedicated 16 GiB APFS sparse image (`hdiutil`), so every
+`df` delta is exact and unaffected by other sessions. FLAM at
+`origin/main` `104a675f`, cloned with `--shared` (Git objects excluded on
+both sides), Bun 1.3.14 with the isolated global store already warm, wt0
+0.1.15. Native = `git worktree add` + `bun install --frozen-lockfile`; wt0 =
+`wt0 create --require-cow` + `wt0 prepare --apply`. Each worktree was then
+proven usable the same way: the root package resolves, `next 16.3.1`
+resolves from `apps/web`, and `node_modules/.bun` holds the same 1,947
+global-store links as the base.
+
+| Worktrees | Native Git + Bun | wt0 + Bun | wt0 as share of native |
+| ---: | ---: | ---: | ---: |
+| 1 | 509 MiB | 517 MiB | 102% |
+| 4 | 2,039 MiB | 543 MiB | 27% |
+| 10 | 5,094 MiB | 595 MiB | 12% |
+
+Marginal cost per additional usable worktree: **native 509 MiB, wt0
+8.7 MiB** (98.3% less) — inside the ≤15–20 MiB bar the Team session set as
+the go/no-go threshold. The first wt0 worktree pays the one-time baseline
+plus the first seal and costs the same as a native one.
+
+**Time (M2), honestly: no advantage.** Per-worktree wall clock varied
+widely on both sides (native 8–90 s, mean 39 s; wt0 14–88 s, mean 40 s).
+With Bun's global store already warm, wt0's Bun path still runs
+`bun install --frozen-lockfile` in every worktree to verify and link, so
+create-plus-prepare is roughly a native install plus a fast clone. The
+storage promise is kept; a time promise is not made by these numbers.
+
+Not yet measured here: builds, tests, and dev servers inside the
+worktrees (gate 2), crash-recovery reaping (gate 5), Linux and Windows
+(gate 7). M3 (real-fleet reclaim, 12.2 GiB) and the booted-stack round trip
+are recorded above; M4/M5 are covered by the concurrency suite and the
+Team session's round trip; M6 waits on the adapter landing on FLAM `main`.
