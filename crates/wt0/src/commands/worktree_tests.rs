@@ -889,11 +889,18 @@ fn baselines_derive_from_the_nearest_existing_baseline() -> Result<()> {
 
     let second_tree = cow::ensure_baseline(&repo, &second, None)?;
     assert_tree_matches(&second_tree, &repo, &second)?;
-    let derived_from = fs::read_to_string(second_tree.parent().unwrap().join("derived-from"))?;
-    assert_eq!(
-        derived_from, first,
-        "second baseline must derive from the first"
-    );
+    let derived_from = second_tree.parent().unwrap().join("derived-from");
+    if cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+        assert_eq!(
+            fs::read_to_string(&derived_from)?,
+            first,
+            "second baseline must derive from the first"
+        );
+    } else {
+        // A plain filesystem (NTFS, ext4) cannot clone the parent; the full
+        // materialization is the correct result and must not claim derivation.
+        assert!(!derived_from.exists());
+    }
     // The first baseline is untouched by the derivation.
     assert_tree_matches(&first_tree, &repo, &first)?;
     Ok(())
