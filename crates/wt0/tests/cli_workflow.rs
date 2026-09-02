@@ -344,6 +344,35 @@ fn create_runs_the_post_create_hook_and_rolls_back_when_it_fails() {
         "unexpected mode {receipt}"
     );
 
+    // WT0_REPO_ROOT is the main checkout even when the command names a
+    // linked worktree from outside the repository — hooks archive into it.
+    let pre_remove = worktree.join(".wt0/hooks/pre-remove");
+    fs::write(
+        &pre_remove,
+        "#!/bin/sh\nprintf '%s' \"$WT0_REPO_ROOT\" > \"$WT0_REPO_ROOT/removed-root\"\n",
+    )
+    .expect("write pre-remove hook");
+    fs::set_permissions(&pre_remove, fs::Permissions::from_mode(0o755)).expect("mark executable");
+    git(&worktree, &["add", ".wt0/hooks/pre-remove"]);
+    git(&worktree, &["commit", "-q", "-m", "pre-remove hook"]);
+    let removed = Command::new(wt0)
+        .current_dir(&root)
+        .args(["remove", "--force"])
+        .arg(&worktree)
+        .output()
+        .expect("remove with hook");
+    assert!(
+        removed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let reported = fs::read_to_string(repo.join("removed-root")).expect("pre-remove side effect");
+    assert_eq!(
+        Path::new(&reported).canonicalize().ok(),
+        repo.canonicalize().ok(),
+        "pre-remove saw {reported}"
+    );
+
     fs::write(&hook, "#!/bin/sh\necho hook-boom >&2\nexit 9\n").expect("write failing hook");
     git(&repo, &["commit", "-aqm", "failing hook"]);
     let failing = root.join("failing");

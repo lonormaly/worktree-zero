@@ -239,8 +239,14 @@ pub struct WorktreeHeartbeat {
 
 #[derive(Debug)]
 pub(crate) struct RepoContext {
+    /// Top level of the checkout the command was given or run from — the
+    /// linked worktree itself when invoked inside one.
     pub(crate) top_level: PathBuf,
     pub(crate) common_git_dir: PathBuf,
+    /// The main working tree, whichever checkout the command started in.
+    /// Hooks receive it as `WT0_REPO_ROOT`; a bare repository has none and
+    /// reports `top_level`.
+    pub(crate) main_worktree: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -443,7 +449,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         ("WT0_MODE", mode.label().to_owned()),
         ("WT0_RUNTIME_ID", lease.runtime_id.clone()),
         ("WT0_EPHEMERAL", args.ephemeral.to_string()),
-        ("WT0_REPO_ROOT", repo.top_level.display().to_string()),
+        ("WT0_REPO_ROOT", repo.main_worktree.display().to_string()),
         ("WT0_SLOT", lease.slot.to_string()),
         ("WT0_PORT_BASE", lease.port_base.to_string()),
         ("WT0_GENERATED_ROOT", generated.root.display().to_string()),
@@ -1109,7 +1115,7 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     let removed_runtime_id = runtime_identity(&target).ok();
     let mut hook_env = vec![
         ("WT0_WORKTREE", target.display().to_string()),
-        ("WT0_REPO_ROOT", repo.top_level.display().to_string()),
+        ("WT0_REPO_ROOT", repo.main_worktree.display().to_string()),
     ];
     if let Some(branch) = &branch {
         let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
@@ -1653,7 +1659,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
             ("WT0_WORKTREE", entry.path.display().to_string()),
             ("WT0_BRANCH", short.to_owned()),
             ("WT0_SLUG", branch_slug(short)),
-            ("WT0_REPO_ROOT", repo.top_level.display().to_string()),
+            ("WT0_REPO_ROOT", repo.main_worktree.display().to_string()),
         ];
         hook_env.extend(lease_hook_env(repo, &entry.path));
         if let Err(error) =
@@ -1737,7 +1743,7 @@ fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
     for line in text.lines() {
         if line.is_empty() {
             if let Some(path) = path.take() {
-                let is_main = path == repo.top_level;
+                let is_main = path == repo.main_worktree;
                 entries.push(WorktreeEntry {
                     path,
                     branch: branch.take(),
@@ -1752,7 +1758,7 @@ fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
         }
     }
     if let Some(path) = path.take() {
-        let is_main = path == repo.top_level;
+        let is_main = path == repo.main_worktree;
         entries.push(WorktreeEntry {
             path,
             branch,
@@ -2735,10 +2741,36 @@ pub(crate) fn discover_repo(path: &Path) -> Result<RepoContext> {
         ["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
     .context("resolve Git common directory")?;
+    let top_level = PathBuf::from(top_level);
+    let main_worktree = main_worktree(path).unwrap_or_else(|| top_level.clone());
     Ok(RepoContext {
-        top_level: PathBuf::from(top_level),
+        top_level,
         common_git_dir: PathBuf::from(common),
+        main_worktree,
     })
+}
+
+/// The main working tree is always the first entry `git worktree list`
+/// prints; a bare repository's first entry carries a `bare` line instead.
+fn main_worktree(path: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let first = text.split("\n\n").next()?;
+    if first.lines().any(|line| line == "bare") {
+        return None;
+    }
+    first
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
 }
 
 fn git_path_output<const N: usize>(path: &Path, args: [&str; N]) -> Result<String> {
