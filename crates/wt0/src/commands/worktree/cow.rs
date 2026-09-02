@@ -110,14 +110,90 @@ pub(crate) fn clone_file(source: &Path, destination: &Path) -> Result<()> {
             destination.display()
         )
     })?;
+    preserve_modified_time(source, destination)?;
     copy_permissions(source, destination)
+}
+
+/// A baseline's index carries the modification times of its tree, and git
+/// trusts an entry whose mtime and size still match. Linux reflinks and ReFS
+/// block clones stamp the clone with "now"; keeping the source's time lets
+/// the adopted index stand without a hashing pass. APFS `clonefile` already
+/// preserves it.
+#[cfg(target_os = "macos")]
+fn preserve_modified_time(_source: &Path, _destination: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn preserve_modified_time(source: &Path, destination: &Path) -> Result<()> {
+    let modified = fs::metadata(source)?.modified()?;
+    // Unix sets times through ownership, so a read handle suffices even for
+    // a read-only file; Windows needs the handle opened for writing.
+    fs::File::options()
+        .read(true)
+        .write(cfg!(windows))
+        .open(destination)
+        .and_then(|file| file.set_modified(modified))
+        .with_context(|| format!("preserve modification time on {}", destination.display()))
 }
 
 /// Clone the contents of `source` into the existing directory `destination`:
 /// directories are recreated, files become CoW clones, and symlinks are
 /// recreated as symlinks. Equivalent to the former `cp -c -R source/. dest`
-/// without the platform-specific `cp` dependency.
+/// without the platform-specific `cp` dependency. On APFS the whole tree is
+/// cloned in one `clonefile` call, which is tens of times faster than
+/// cloning file by file.
 pub(crate) fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
+    if clone_tree_atomically(source, destination)? {
+        return Ok(());
+    }
+    clone_tree_entries(source, destination)
+}
+
+/// APFS clones a directory hierarchy atomically, metadata included. The clone
+/// lands in a scratch directory inside `destination` and its entries move up
+/// one level, so the destination's own entries (a linked worktree's `.git`
+/// file) survive. Returns `Ok(false)` when the filesystem cannot do this and
+/// the caller should clone entry by entry.
+#[cfg(target_os = "macos")]
+fn clone_tree_atomically(source: &Path, destination: &Path) -> Result<bool> {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int};
+    use std::os::unix::ffi::OsStrExt;
+
+    extern "C" {
+        fn clonefile(src: *const c_char, dst: *const c_char, flags: c_int) -> c_int;
+    }
+
+    let scratch = destination.join(format!(".wt0-clone-{}", Uuid::new_v4()));
+    let (Ok(from), Ok(to)) = (
+        CString::new(source.as_os_str().as_bytes()),
+        CString::new(scratch.as_os_str().as_bytes()),
+    ) else {
+        return Ok(false);
+    };
+    // SAFETY: both arguments are valid NUL-terminated paths that outlive the
+    // call; clonefile touches nothing else.
+    if unsafe { clonefile(from.as_ptr(), to.as_ptr(), 0) } != 0 {
+        let _ = fs::remove_dir_all(&scratch);
+        return Ok(false);
+    }
+    for entry in fs::read_dir(&scratch)? {
+        let entry = entry?;
+        let to = destination.join(entry.file_name());
+        fs::rename(entry.path(), &to)
+            .with_context(|| format!("move cloned entry into {}", to.display()))?;
+    }
+    fs::remove_dir(&scratch).with_context(|| format!("remove {}", scratch.display()))?;
+    Ok(true)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_tree_atomically(_source: &Path, _destination: &Path) -> Result<bool> {
+    Ok(false)
+}
+
+fn clone_tree_entries(source: &Path, destination: &Path) -> Result<()> {
     for entry in
         fs::read_dir(source).with_context(|| format!("read clone source {}", source.display()))?
     {
@@ -128,7 +204,7 @@ pub(crate) fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
         if kind.is_dir() {
             fs::create_dir(&to).with_context(|| format!("create directory {}", to.display()))?;
             copy_permissions(&from, &to)?;
-            clone_tree(&from, &to)?;
+            clone_tree_entries(&from, &to)?;
         } else if kind.is_symlink() {
             let target =
                 fs::read_link(&from).with_context(|| format!("read symlink {}", from.display()))?;
@@ -456,7 +532,7 @@ fn derive_baseline(
             .env("GIT_INDEX_FILE", &index)
             .arg(format!("--git-dir={}", repo.common_git_dir.display()))
             .arg(format!("--work-tree={}", destination.display()))
-            .args(["checkout-index", "--force", "-z", "--stdin"])
+            .args(["checkout-index", "--force", "--index", "-z", "--stdin"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -480,6 +556,8 @@ fn derive_baseline(
     // byte, and no untracked or ignored path may remain from the parent.
     // `status` refreshes the index first — plumbing `diff-index` would report
     // every file whose stat data is missing as modified without hashing it.
+    // The refreshed index stays beside the tree: worktrees adopt it so their
+    // own first `git status` never repeats this hashing pass.
     let status = Command::new("git")
         .env("GIT_INDEX_FILE", &index)
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))
@@ -493,8 +571,8 @@ fn derive_baseline(
         .current_dir(destination)
         .output()
         .context("verify derived baseline")?;
-    let _ = fs::remove_file(&index);
     if !status.status.success() {
+        let _ = fs::remove_file(&index);
         bail!(
             "verification of the derived tree failed: {}",
             String::from_utf8_lossy(&status.stderr)
@@ -513,6 +591,7 @@ fn derive_baseline(
         })
         .collect();
     if !mismatches.is_empty() {
+        let _ = fs::remove_file(&index);
         bail!(
             "derived tree does not match {commit}: {}",
             mismatches
@@ -543,13 +622,23 @@ fn materialize_baseline(repo: &RepoContext, commit: &str, destination: &Path) ->
         .env("GIT_INDEX_FILE", &index)
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))
         .arg(format!("--work-tree={}", destination.display()))
-        .args(["checkout-index", "--all", "--force"]);
+        // `--index` records each written file's stat data, so the index
+        // kept beside the tree lets worktrees skip their first hashing pass.
+        .args(["checkout-index", "--all", "--force", "--index"]);
     let result = run_command(
         &mut checkout,
         "materialize baseline with Git checkout-index",
     );
-    let _ = fs::remove_file(index);
+    if result.is_err() {
+        let _ = fs::remove_file(index);
+    }
     result
+}
+
+/// The stat-populated index a baseline was materialized with, when present.
+pub(crate) fn baseline_index(tree: &Path) -> Option<PathBuf> {
+    let index = tree.parent()?.join("index");
+    index.is_file().then_some(index)
 }
 
 pub(super) fn prune_baselines(

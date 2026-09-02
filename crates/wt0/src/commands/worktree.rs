@@ -901,7 +901,10 @@ fn add_cow_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str)
     }
 
     let populate_result = (|| -> Result<()> {
-        run_git_at(target, ["read-tree", "HEAD"]).context("initialize linked-worktree index")?;
+        if !adopt_baseline_index(repo, &baseline, target)? {
+            run_git_at(target, ["read-tree", "HEAD"])
+                .context("initialize linked-worktree index")?;
+        }
         cow::clone_tree(&baseline, target).context("clone cached baseline")?;
         ensure_clean(target).context("verify cloned worktree")?;
         fs::write(
@@ -916,6 +919,53 @@ fn add_cow_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str)
         return Err(error);
     }
     Ok(())
+}
+
+/// Start a cloned worktree from the baseline's stat-populated index instead
+/// of an empty `read-tree`, so neither wt0's verification nor the agent's
+/// first `git status` hashes every tracked file. Clones keep the baseline's
+/// modification times but not its inode numbers or change times, so the
+/// worktree compares only mtime and size (`core.checkStat=minimal`,
+/// `core.trustctime=false`) through per-worktree configuration — the main
+/// checkout keeps its own settings. False means the shortcut is unavailable
+/// and the caller initializes the index the ordinary way.
+fn adopt_baseline_index(repo: &RepoContext, baseline: &Path, target: &Path) -> Result<bool> {
+    let Some(index) = cow::baseline_index(baseline) else {
+        return Ok(false);
+    };
+    if !worktree_config_available(repo)? {
+        return Ok(false);
+    }
+    let output = git_output_at(target, ["rev-parse", "--absolute-git-dir"])?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let git_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    run_git_at(
+        target,
+        ["config", "--worktree", "core.checkStat", "minimal"],
+    )?;
+    run_git_at(target, ["config", "--worktree", "core.trustctime", "false"])?;
+    fs::copy(&index, git_dir.join("index")).context("adopt baseline index")?;
+    Ok(true)
+}
+
+/// Per-worktree configuration needs `extensions.worktreeConfig`, and git asks
+/// that `core.bare` and `core.worktree` move out of the shared config before
+/// it is enabled. Repositories that set either keep the ordinary path.
+fn worktree_config_available(repo: &RepoContext) -> Result<bool> {
+    for (key, forbidden) in [("core.bare", "true"), ("core.worktree", "")] {
+        let output = git_output_common(repo, ["config", "--get", key])?;
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if output.status.success() && (forbidden.is_empty() || value == forbidden) {
+            return Ok(false);
+        }
+    }
+    let enabled = git_output_common(repo, ["config", "--get", "extensions.worktreeConfig"])?;
+    if String::from_utf8_lossy(&enabled.stdout).trim() == "true" {
+        return Ok(true);
+    }
+    Ok(run_git_common(repo, ["config", "extensions.worktreeConfig", "true"]).is_ok())
 }
 
 fn add_git_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str) -> Result<()> {
@@ -1713,6 +1763,27 @@ fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
 }
 
 fn worktree_admin_dir(worktree: &Path) -> Result<PathBuf> {
+    // A linked worktree's `.git` file names its admin directory outright;
+    // reading it costs a syscall where spawning `git rev-parse` costs tens
+    // of milliseconds — per worktree, on every lease scan. Anything else
+    // (a main checkout, GIT_DIR, an unusual layout) still asks git.
+    let dot_git = worktree.join(".git");
+    if let Ok(contents) = fs::read_to_string(&dot_git) {
+        if let Some(gitdir) = contents.strip_prefix("gitdir:") {
+            let gitdir = gitdir.trim();
+            if !gitdir.is_empty() {
+                let path = Path::new(gitdir);
+                let admin = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    worktree.join(path)
+                };
+                if admin.is_dir() {
+                    return Ok(admin);
+                }
+            }
+        }
+    }
     Ok(PathBuf::from(git_path_output(
         worktree,
         ["rev-parse", "--absolute-git-dir"],

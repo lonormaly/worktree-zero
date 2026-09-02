@@ -1080,3 +1080,88 @@ fn seeding_clones_node_modules_only_when_the_bun_layout_matches() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+/// A cloned worktree starts from the baseline's stat-populated index and a
+/// per-worktree `core.checkStat=minimal`, so the first `git status` inside it
+/// is clean without hashing every file — and the main checkout's own
+/// configuration is left alone. On a filesystem without copy-on-write the
+/// worktree is a plain checkout and the shortcut does not apply.
+#[test]
+fn cloned_worktrees_adopt_the_baseline_index_and_stay_clean() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-baseline-index-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    let worktree = root.join("worktree");
+    fs::create_dir_all(repo.join("src")).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    for name in ["src/a.txt", "src/b.txt", "README.md"] {
+        fs::write(repo.join(name), format!("{name}\n")).expect("write fixture");
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "create", "index/adopt", "--path"])
+        .arg(&worktree)
+        .output()
+        .expect("create worktree");
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&created.stdout).expect("create JSON");
+
+    let status = git_stdout_any(&worktree, &["status", "--porcelain"]);
+    assert!(status.is_empty(), "fresh worktree is dirty:\n{status}");
+
+    if receipt["mode"] == "cow-clone" {
+        let commit = git_stdout_any(&repo, &["rev-parse", "HEAD"]);
+        assert!(
+            repo.join(".git/wt0/baselines")
+                .join(&commit)
+                .join("index")
+                .is_file(),
+            "baseline keeps its stat-populated index"
+        );
+        assert_eq!(
+            git_stdout_any(&worktree, &["config", "--worktree", "core.checkStat"]),
+            "minimal"
+        );
+        assert_eq!(
+            git_stdout_any(&worktree, &["config", "--worktree", "core.trustctime"]),
+            "false"
+        );
+    }
+    assert!(
+        git_stdout_any(&repo, &["config", "--get", "core.checkStat"]).is_empty(),
+        "the main checkout's stat check is untouched"
+    );
+
+    // The adopted index must still notice real edits.
+    fs::write(worktree.join("src/a.txt"), "edited\n").expect("edit file");
+    let status = git_stdout_any(&worktree, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "M src/a.txt");
+
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+/// `git` output on every platform; missing keys yield an empty string.
+fn git_stdout_any(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .expect("run git");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
