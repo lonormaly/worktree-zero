@@ -79,6 +79,7 @@ pub(crate) fn run_hook(root: &Path, event: HookEvent, env: &[(&str, String)]) ->
     let stderr_path = capture.join("stderr");
 
     let result = (|| -> Result<()> {
+        let started_spawn = Instant::now();
         let mut command = hook_command(&path);
         command
             .current_dir(root)
@@ -87,9 +88,24 @@ pub(crate) fn run_hook(root: &Path, event: HookEvent, env: &[(&str, String)]) ->
             .stdin(std::process::Stdio::null())
             .stdout(fs::File::create(&stdout_path)?)
             .stderr(fs::File::create(&stderr_path)?);
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("run {} hook {}", event.name(), path.display()))?;
+        // A hook written moments ago can still be held open by a child
+        // another thread forked in between (ETXTBSY); it clears as soon as
+        // that child execs, so a short retry beats failing the lifecycle.
+        let mut child = loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && started_spawn.elapsed() < Duration::from_secs(2) =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("run {} hook {}", event.name(), path.display()));
+                }
+            }
+        };
 
         let started = Instant::now();
         let status = loop {
