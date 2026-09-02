@@ -273,9 +273,32 @@ pub(super) fn materialize_baseline_at(
     let cache = temporary.join("cache");
     let temporary_tree = cache.join("tree");
     fs::create_dir_all(&temporary_tree)?;
-    if let Err(error) = materialize_baseline(repo, commit, &temporary_tree) {
-        let _ = fs::remove_dir_all(&temporary);
-        return Err(error);
+    // Prefer deriving from the nearest existing baseline: unchanged files
+    // then share blocks across commits instead of every new base paying a
+    // full materialization. Any doubt about the derived tree falls back to
+    // the plain checkout, so correctness never depends on the shortcut.
+    let derived_from = match nearest_baseline(&root, repo, commit) {
+        Some(parent) => match derive_baseline(repo, &root, &parent, commit, &temporary_tree) {
+            Ok(()) => Some(parent),
+            Err(error) => {
+                eprintln!(
+                    "wt0: could not derive baseline {commit} from {parent} ({error:#}); materializing in full"
+                );
+                let _ = fs::remove_dir_all(&temporary_tree);
+                fs::create_dir_all(&temporary_tree)?;
+                None
+            }
+        },
+        None => None,
+    };
+    if derived_from.is_none() {
+        if let Err(error) = materialize_baseline(repo, commit, &temporary_tree) {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+    }
+    if let Some(parent) = &derived_from {
+        fs::write(cache.join("derived-from"), parent)?;
     }
     fs::write(cache.join("ready"), commit)?;
 
@@ -291,6 +314,199 @@ pub(super) fn materialize_baseline_at(
     }
     let _ = fs::remove_dir_all(&temporary);
     Ok(final_tree)
+}
+
+/// How many most-recently-used baselines to consider as derivation parents.
+const NEAREST_BASELINE_CANDIDATES: usize = 16;
+
+/// The complete baseline in `root` whose tree differs from `commit` in the
+/// fewest paths, if any exists.
+fn nearest_baseline(root: &Path, repo: &RepoContext, commit: &str) -> Option<String> {
+    let entries = fs::read_dir(root).ok()?;
+    let mut candidates: Vec<(SystemTime, String)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if name.starts_with('.') || name == commit || !path.join("tree").is_dir() {
+                return None;
+            }
+            let ready = fs::metadata(path.join("ready")).ok()?;
+            Some((ready.modified().ok()?, name))
+        })
+        .collect();
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    candidates
+        .into_iter()
+        .take(NEAREST_BASELINE_CANDIDATES)
+        .filter_map(|(_, parent)| {
+            let distance = tree_diff(repo, &parent, commit).ok()?.len();
+            Some((distance, parent))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, parent)| parent)
+}
+
+/// Path-level changes between two commits' trees, as (status, path) with
+/// status one of A/D/M/T. Renames are reported as delete plus add.
+fn tree_diff(repo: &RepoContext, from: &str, to: &str) -> Result<Vec<(char, String)>> {
+    let output = Command::new("git")
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .args([
+            "diff-tree",
+            "-r",
+            "-z",
+            "--no-renames",
+            "--name-status",
+            from,
+            to,
+        ])
+        .output()
+        .context("diff baseline trees")?;
+    if !output.status.success() {
+        bail!("git diff-tree {from} {to} failed");
+    }
+    let mut changes = Vec::new();
+    let mut fields = output.stdout.split(|byte| *byte == 0);
+    while let Some(status) = fields.next() {
+        let status = String::from_utf8_lossy(status);
+        let Some(status) = status.trim().chars().next() else {
+            continue;
+        };
+        let Some(path) = fields.next() else { break };
+        changes.push((status, String::from_utf8_lossy(path).into_owned()));
+    }
+    Ok(changes)
+}
+
+/// Clone `parent`'s tree into `destination` with copy-on-write, apply the
+/// tree diff to `commit`, then prove the result is exactly `commit`'s tree:
+/// every tracked path matches and nothing else exists. Any mismatch is an
+/// error and the caller materializes in full instead.
+fn derive_baseline(
+    repo: &RepoContext,
+    root: &Path,
+    parent: &str,
+    commit: &str,
+    destination: &Path,
+) -> Result<()> {
+    let parent_tree = root.join(parent).join("tree");
+    clone_tree(&parent_tree, destination).context("clone parent baseline")?;
+
+    let changes = tree_diff(repo, parent, commit)?;
+    let index = destination
+        .parent()
+        .context("baseline destination has no parent")?
+        .join("index");
+    let mut read_tree = Command::new("git");
+    read_tree
+        .env("GIT_INDEX_FILE", &index)
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .args(["read-tree", commit]);
+    run_command(&mut read_tree, "initialize derived baseline index")?;
+
+    let mut refresh: Vec<u8> = Vec::new();
+    for (status, path) in &changes {
+        let target = destination.join(path);
+        // Remove first so a type change (file <-> symlink) never leaves the
+        // old kind behind; checkout-index then recreates A/M/T entries.
+        if target.is_symlink() || target.is_file() {
+            fs::remove_file(&target)
+                .with_context(|| format!("remove {} before refresh", target.display()))?;
+        } else if target.is_dir() {
+            fs::remove_dir_all(&target)
+                .with_context(|| format!("remove {} before refresh", target.display()))?;
+        }
+        match status {
+            'D' => {
+                let mut dir = target.parent();
+                while let Some(candidate) = dir {
+                    if candidate == destination || fs::remove_dir(candidate).is_err() {
+                        break;
+                    }
+                    dir = candidate.parent();
+                }
+            }
+            _ => {
+                refresh.extend_from_slice(path.as_bytes());
+                refresh.push(0);
+            }
+        }
+    }
+    if !refresh.is_empty() {
+        let mut checkout = Command::new("git");
+        checkout
+            .env("GIT_INDEX_FILE", &index)
+            .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+            .arg(format!("--work-tree={}", destination.display()))
+            .args(["checkout-index", "--force", "-z", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = checkout.spawn().context("refresh changed baseline paths")?;
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().context("checkout-index stdin")?;
+            stdin.write_all(&refresh)?;
+        }
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            let _ = fs::remove_file(&index);
+            bail!(
+                "checkout-index failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    // Proof, not trust: every tracked path must match the commit byte for
+    // byte, and no untracked or ignored path may remain from the parent.
+    // `status` refreshes the index first — plumbing `diff-index` would report
+    // every file whose stat data is missing as modified without hashing it.
+    let status = Command::new("git")
+        .env("GIT_INDEX_FILE", &index)
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .arg(format!("--work-tree={}", destination.display()))
+        .args([
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ])
+        .current_dir(destination)
+        .output()
+        .context("verify derived baseline")?;
+    let _ = fs::remove_file(&index);
+    if !status.status.success() {
+        bail!(
+            "verification of the derived tree failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+    // Porcelain's first column compares the index with the repository's
+    // HEAD, which is unrelated to `commit`; only the working-tree column and
+    // untracked/ignored entries describe the derived tree.
+    let mismatches: Vec<&str> = std::str::from_utf8(&status.stdout)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line.starts_with("??")
+                || line.starts_with("!!")
+                || line.chars().nth(1).is_some_and(|worktree| worktree != ' ')
+        })
+        .collect();
+    if !mismatches.is_empty() {
+        bail!(
+            "derived tree does not match {commit}: {}",
+            mismatches
+                .iter()
+                .take(5)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    Ok(())
 }
 
 fn materialize_baseline(repo: &RepoContext, commit: &str, destination: &Path) -> Result<()> {
