@@ -54,20 +54,42 @@ the clone plus per-file metadata — small for caches, but real: cloning is
 per file, so a tree of hundreds of thousands of files costs minutes and tens
 of MiB of inodes even at zero data.
 
-That is why **`node_modules` is refused as a seed**. Measured on a
-230,000-file live `node_modules`: 168 s to clone, and after the package
-manager reconciled, a 4.2 GB junk mix of the base's hoisted layout and the
-worktree's isolated one — worse than a cold install. Dependency trees come
-from sealed prepared environments (`wt0 prepare`), which are the base's
-install made consistent and keyed to the lockfile; that is the correct
-"origin as store" for dependencies, and it is attached automatically.
+That is why **`node_modules` is allowed only when it is layout-matched**.
+Measured on a 230,000-file live `node_modules`: 168 s to clone, and after the
+package manager reconciled, a 4.2 GB junk mix of the base's hoisted layout and
+the worktree's isolated one — worse than a cold install. One shape escapes
+that cost: under Bun's isolated global store a `node_modules` is a *link
+tree*, so the clone is links rather than packages and an identical lockfile
+resolves to identical store paths. Six conditions prove it, checked in order,
+each with its own receipt reason:
+
+1. the seed is the root `node_modules` — a nested workspace tree is only part
+   of a layout ("only the root node_modules can be seeded");
+2. Bun is the worktree's package manager (`bun.lock` or `bun.lockb`); any
+   other manager keeps the sealed-prepared-environment refusal;
+3. base and worktree both carry a `bunfig.toml` whose `[install]` section sets
+   `linker = "isolated"` and `globalStore = true` ("base and worktree must
+   both use Bun's isolated global store");
+4. the base really was installed that way — `node_modules/.bun` exists and
+   holds at least one store symlink ("base node_modules is not a global-store
+   link tree");
+5. the worktree's lockfile is byte-identical to the base's, so both resolve to
+   the same store ("lockfile differs from the base; prepared environments
+   handle lockfile changes"); and
+6. no live process holds the base's `node_modules` open, so it is not
+   mid-install ("base node_modules is in use").
+
+Every other dependency tree comes from a sealed prepared environment (`wt0
+prepare`), which is the base's install made consistent and keyed to the
+lockfile; that is the correct "origin as store" for dependencies, and it is
+attached automatically.
 
 The same rules as `.wt0-generated` apply: relative paths only; `.env*`,
 `.dev.vars`, and `secrets` are rejected by the policy. Per entry the create
 receipt reports `seeded`, `absent` (the base has nothing there), `refused`
-(tracked in the new worktree, or a dependency tree), or `skipped` with a
-reason (no copy-on-write between the two locations — a full copy is never
-substituted). Mutable state — databases, emulator persistence, build
+(tracked in the new worktree, or a dependency tree that is not layout-matched),
+or `skipped` with a reason (no copy-on-write between the two locations — a
+full copy is never substituted). Mutable state — databases, emulator persistence, build
 *output* — stays private per runtime and must not be seeded. `--no-seed`
 or `WT0_SEED=0` disables seeding for one create.
 
