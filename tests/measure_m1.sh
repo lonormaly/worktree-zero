@@ -29,8 +29,15 @@ if [ "$N" -lt 2 ]; then
   exit 1
 fi
 
-REPO="$VOLUME/measure-m1-repo"
-rm -rf "$REPO" "$VOLUME"/native-* "$VOLUME"/wt0-*
+# A dedicated subdirectory, not the volume root: `df`/`Get-PSDrive` still see
+# the whole volume, but confining our own paths here means the startup
+# cleanup below never has to touch (or fight over a file handle with) debris
+# another CI step left in $VOLUME — e.g. a temp directory a Rust test created
+# because TMPDIR/TMP pointed at this same volume.
+WORKDIR="$VOLUME/measure-m1"
+REPO="$WORKDIR/repo"
+rm -rf "$WORKDIR"
+mkdir -p "$WORKDIR"
 
 # ---- physical used-bytes reader -------------------------------------------
 # Linux (Btrfs): GNU `df -k --output=used`.
@@ -100,7 +107,7 @@ native_after_1=""
 i=1
 while [ "$i" -le "$N" ]; do
   t0=$(now_s)
-  ( cd "$REPO" && git worktree add -q -b "native/$i" "$VOLUME/native-$i" HEAD )
+  ( cd "$REPO" && git worktree add -q -b "native/$i" "$WORKDIR/native-$i" HEAD )
   t1=$(now_s)
   native_time_sum=$(awk -v a="$native_time_sum" -v b="$(elapsed_s "$t1" "$t0")" 'BEGIN{printf "%.4f", a+b}')
   if [ "$i" -eq 1 ]; then
@@ -119,7 +126,7 @@ wt0_after_1=""
 i=1
 while [ "$i" -le "$N" ]; do
   t0=$(now_s)
-  ( cd "$REPO" && "$WT0" create "bench/$i" --path "$VOLUME/wt0-$i" --require-cow >/dev/null )
+  ( cd "$REPO" && "$WT0" create "bench/$i" --path "$WORKDIR/wt0-$i" --require-cow >/dev/null )
   t1=$(now_s)
   wt0_time_sum=$(awk -v a="$wt0_time_sum" -v b="$(elapsed_s "$t1" "$t0")" 'BEGIN{printf "%.4f", a+b}')
   if [ "$i" -eq 1 ]; then
