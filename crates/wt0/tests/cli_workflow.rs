@@ -1357,7 +1357,9 @@ fn crashed_agent_runtime_is_reaped_and_its_resources_released() {
 
     let wt0 = env!("CARGO_BIN_EXE_wt0");
     let worktree = root.join("crashed");
-    let (runtime_id, slot, port_base) = spawn_and_crash_agent(
+    // Mode doesn't matter for this half: `gc --apply` (via `force_teardown`)
+    // already unmounts an overlay worktree itself before removing it.
+    let (runtime_id, slot, port_base, _mode) = spawn_and_crash_agent(
         wt0,
         &repo,
         &machine,
@@ -1476,7 +1478,7 @@ fn crashed_agent_runtime_is_reaped_and_its_resources_released() {
     // The slot and port window gc just freed go to the next runtime — which
     // doubles as the fixture for the rm -rf / prune path below.
     let worktree2 = root.join("orphaned");
-    let (runtime_id2, slot2, port_base2) = spawn_and_crash_agent(
+    let (runtime_id2, slot2, port_base2, mode2) = spawn_and_crash_agent(
         wt0,
         &repo,
         &machine,
@@ -1491,32 +1493,57 @@ fn crashed_agent_runtime_is_reaped_and_its_resources_released() {
         "the released port window must be reused"
     );
 
-    fs::remove_dir_all(&worktree2).expect("simulate rm -rf of the crashed checkout");
-    let pruned = run_wt0(wt0, &repo, &machine, &["--json", "prune"]);
-    let orphans = pruned["orphaned_runtimes"].as_array().expect("orphans");
-    let orphan = orphans
-        .iter()
-        .find(|orphan| orphan["runtime_id"] == runtime_id2.as_str())
-        .unwrap_or_else(|| panic!("no orphan for {runtime_id2}: {orphans:?}"));
-    assert_eq!(orphan["owner"], "crash-agent-2");
-    assert_eq!(orphan["slot"], slot2);
-    assert_eq!(orphan["port_base"], port_base2);
-    let generated_root2 = repo_real.join(".git/wt0/generated").join(&runtime_id2);
-    assert_eq!(
-        orphan["generated_root"],
-        generated_root2.to_string_lossy().as_ref()
-    );
+    if mode2 == "overlay" {
+        // On a filesystem without reflinks (plain ext4 — most Linux CI
+        // runners) wt0 falls back to a fuse-overlayfs mount for the
+        // worktree, and a mount point cannot be `rm -rf`'d out from under
+        // wt0 (EBUSY) — that is a filesystem property, not something a
+        // crash changes. The orphan / `rm -rf` recovery path below is
+        // exercised on the CoW and plain git-checkout runners instead; here
+        // just tear the mount down through wt0 so it does not outlive the
+        // fixture and trip the same EBUSY in the cleanup below.
+        let removed = Command::new(wt0)
+            .current_dir(&repo)
+            .env("WT0_MACHINE_STATE", &machine)
+            .args(["remove", "--force"])
+            .arg(&worktree2)
+            .output()
+            .expect("remove overlay worktree");
+        assert!(
+            removed.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&removed.stderr)
+        );
+    } else {
+        fs::remove_dir_all(&worktree2).expect("simulate rm -rf of the crashed checkout");
+        let pruned = run_wt0(wt0, &repo, &machine, &["--json", "prune"]);
+        let orphans = pruned["orphaned_runtimes"].as_array().expect("orphans");
+        let orphan = orphans
+            .iter()
+            .find(|orphan| orphan["runtime_id"] == runtime_id2.as_str())
+            .unwrap_or_else(|| panic!("no orphan for {runtime_id2}: {orphans:?}"));
+        assert_eq!(orphan["owner"], "crash-agent-2");
+        assert_eq!(orphan["slot"], slot2);
+        assert_eq!(orphan["port_base"], port_base2);
+        let generated_root2 = repo_real.join(".git/wt0/generated").join(&runtime_id2);
+        assert_eq!(
+            orphan["generated_root"],
+            generated_root2.to_string_lossy().as_ref()
+        );
 
-    let events = run_wt0(wt0, &repo, &machine, &["--json", "events"]);
-    let orphaned_event = events["events"]
-        .as_array()
-        .expect("events array")
-        .iter()
-        .find(|event| event["event"] == "orphaned" && event["runtime_id"] == runtime_id2.as_str());
-    assert!(
-        orphaned_event.is_some(),
-        "no orphaned event for {runtime_id2}"
-    );
+        let events = run_wt0(wt0, &repo, &machine, &["--json", "events"]);
+        let orphaned_event = events["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .find(|event| {
+                event["event"] == "orphaned" && event["runtime_id"] == runtime_id2.as_str()
+            });
+        assert!(
+            orphaned_event.is_some(),
+            "no orphaned event for {runtime_id2}"
+        );
+    }
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1525,8 +1552,11 @@ fn crashed_agent_runtime_is_reaped_and_its_resources_released() {
 /// published in the fleet, then SIGKILLs the whole process tree without
 /// letting anything clean up — an agent vanishing mid-run the way a crash or
 /// an OOM kill leaves it, not a graceful shutdown. Returns the runtime's
-/// identity, slot, and port window so the caller can assert on exactly what
-/// a crash is supposed to leave behind.
+/// identity, slot, port window, and populate mode so the caller can assert
+/// on exactly what a crash is supposed to leave behind (mode matters
+/// because an overlay-backed worktree, wt0's fallback where reflinks are
+/// unavailable — plain ext4, most Linux CI runners — is a mount point that
+/// cannot simply be deleted out from under it).
 #[cfg(unix)]
 fn spawn_and_crash_agent(
     wt0: &str,
@@ -1536,12 +1566,12 @@ fn spawn_and_crash_agent(
     branch: &str,
     owner: &str,
     worktree: &Path,
-) -> (String, u64, u64) {
+) -> (String, u64, u64, String) {
     let label = branch.replace('/', "-");
     let stdout = fs::File::create(log_dir.join(format!("{label}.stdout")))
         .expect("create captured stdout log");
-    let stderr = fs::File::create(log_dir.join(format!("{label}.stderr")))
-        .expect("create captured stderr log");
+    let stderr_path = log_dir.join(format!("{label}.stderr"));
+    let stderr = fs::File::create(&stderr_path).expect("create captured stderr log");
     let mut child = Command::new(wt0)
         .current_dir(repo)
         .env("WT0_MACHINE_STATE", machine)
@@ -1552,6 +1582,30 @@ fn spawn_and_crash_agent(
         .stderr(stderr)
         .spawn()
         .expect("spawn wt0 run");
+
+    // `wt0 run` prints "worktree: ..." to stderr right after its call to
+    // `create_worktree` returns — which is also where marking the worktree
+    // ephemeral happens, strictly before the agent command is spawned.
+    // That, not "some descendant process exists", is the correct signal to
+    // wait for: `create_worktree` itself spawns many short-lived `git`
+    // subprocesses on the way there, any one of which would satisfy a
+    // "some descendant exists" check well before ephemeral-marking is
+    // actually done, letting a kill race ahead of it and leave a worktree
+    // `gc --ephemeral` silently skips.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("wt0 run for {branch} exited with {status} before printing its startup line");
+        }
+        if fs::read_to_string(&stderr_path).is_ok_and(|captured| captured.contains("worktree: ")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "wt0 run for {branch} never printed its startup line within 30s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let runtime = loop {
@@ -1578,30 +1632,11 @@ fn spawn_and_crash_agent(
         .to_owned();
     let slot = runtime["slot"].as_u64().expect("slot");
     let port_base = runtime["port_base"].as_u64().expect("port_base");
-
-    // The lease that makes the fleet report "managed" is published before
-    // `wt0 run` marks the worktree ephemeral, prepares the generated
-    // runtime, and runs the post-create hook — all of which must finish
-    // before the agent command itself is spawned. Waiting for that spawned
-    // command to actually exist is the one signal that every step ahead of
-    // it, ephemeral marking included, is already done; killing any earlier
-    // risks a `gc --ephemeral` that silently skips an unmarked worktree.
-    let pid = child.id();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while descendant_pids(pid).is_empty() {
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("wt0 run for {branch} exited with {status} before spawning its command");
-        }
-        assert!(
-            Instant::now() < deadline,
-            "wt0 run for {branch} never spawned its command within 30s"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let mode = runtime["mode"].as_str().expect("mode").to_owned();
 
     kill_tree(&mut child);
 
-    (runtime_id, slot, port_base)
+    (runtime_id, slot, port_base, mode)
 }
 
 /// The one managed runtime for `branch` in a `fleet --json` receipt.
