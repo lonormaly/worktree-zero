@@ -95,6 +95,79 @@ impl GeneratedStorage {
     }
 }
 
+/// The native, machine-wide link-tree store a JavaScript package manager is
+/// actually using here, if any — see `docs/research/dependency-link-trees.md`:
+/// with a warm store the marginal cost per checkout is pnpm 6–7 MiB and Bun's
+/// global store 3 MiB, both under wt0's own dependency-metadata bar, while a
+/// manager with no such mode (npm, Yarn classic, Yarn Berry's default
+/// `node-modules` linker) pays the full hoisted-tree cost every checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeStore {
+    /// pnpm's content-addressable store — default behavior, nothing to opt into.
+    Pnpm,
+    /// Bun's isolated linker with `globalStore = true` in `bunfig.toml`.
+    BunGlobalStore,
+    /// Yarn Berry with `.yarnrc.yml: nodeLinker: pnpm` — pnpm's own shape.
+    YarnPnpmLinker,
+    /// Yarn Berry's default Plug'n'Play mode: no `node_modules` at all.
+    YarnPnp,
+    /// This manager has no native link-tree store active.
+    None { manager: String },
+}
+
+/// Classify `manager`'s dependency layout at `root`. `bun` is the already
+/// computed Bun report (its version check gates whether the global store is
+/// something `wt0 doctor` can rely on as ready); pnpm and Yarn's `pnpm`
+/// linker need no such gate — their store is either configured or it isn't.
+fn native_store(root: &Path, manager: &str, bun: Option<&BunReport>) -> NativeStore {
+    match manager {
+        "pnpm" => NativeStore::Pnpm,
+        "bun" if bun.is_some_and(|report| bun_global_store_ready(report, root)) => {
+            NativeStore::BunGlobalStore
+        }
+        "yarn" if yarn_uses_pnp(root) => NativeStore::YarnPnp,
+        "yarn" if yarn_uses_pnpm_linker(root) => NativeStore::YarnPnpmLinker,
+        other => NativeStore::None {
+            manager: other.to_owned(),
+        },
+    }
+}
+
+/// One precise, actionable recommendation per manager that has no native
+/// store active, citing the measured number so the reader can weigh it
+/// against `docs/research/dependency-link-trees.md`. `None` when a native
+/// store is already in use (pnpm, Bun's global store, Yarn's pnpm linker or
+/// PnP) — there is nothing to recommend.
+fn native_store_recommendation(root: &Path, store: &NativeStore) -> Option<String> {
+    let NativeStore::None { manager } = store else {
+        return None;
+    };
+    match manager.as_str() {
+        "bun" => Some(BUN_GLOBAL_STORE_ADVICE.to_owned()),
+        "yarn" if root.join(".yarnrc.yml").is_file() => Some(
+            "Yarn Berry is not using a link-tree store here: set `.yarnrc.yml: nodeLinker: pnpm` \
+             for pnpm's own store shape (pnpm-shaped, ~6–7 MiB measured marginal cost per \
+             checkout with a warm store) instead of a full node_modules per checkout"
+                .to_owned(),
+        ),
+        "yarn" => Some(
+            "Yarn classic has no native link-tree store; migrate to Yarn Berry with \
+             `.yarnrc.yml: nodeLinker: pnpm`, or to pnpm, for a shared store (~6–7 MiB \
+             measured marginal cost per checkout with a warm store)"
+                .to_owned(),
+        ),
+        "npm" => Some(
+            "npm has no machine-wide store: its `--install-strategy=linked` keeps a \
+             per-project `.store`, measured identical to hoisted (~389 MiB per checkout); \
+             wt0 seeds node_modules from the base checkout behind an identical lockfile, but \
+             a shared store across worktrees means pnpm (`corepack use pnpm@latest`) or Bun \
+             with `globalStore = true`"
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
 pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let requested = args.path.unwrap_or(std::env::current_dir()?);
     let root = git_root(&requested)?;
@@ -102,13 +175,12 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let generated = generated_storage(&root)?;
     let bun = bun_report(&root);
     let javascript_manager = javascript_package_manager(&root)?;
+    let store = javascript_manager
+        .as_deref()
+        .map(|manager| native_store(&root, manager, bun.as_ref()));
     // A materialized tree is only "stale" when Bun's global store should have
     // linked it; under the prepared-environment fallback it is the layout.
-    let stale = if javascript_manager.as_deref() == Some("bun")
-        && bun
-            .as_ref()
-            .is_some_and(|report| bun_global_store_ready(report, &root))
-    {
+    let stale = if matches!(store, Some(NativeStore::BunGlobalStore)) {
         dependencies.bun_backups + dependencies.materialized_root_entries
     } else {
         0
@@ -127,36 +199,35 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let dependency_adapter_shipped = javascript_manager
         .as_deref()
         .is_none_or(|manager| matches!(manager, "bun" | "npm" | "pnpm" | "yarn"));
-    let manager_ready = match javascript_manager.as_deref() {
+    // pnpm and Yarn's pnpm linker need no prepared environment either: their
+    // native store already resolves whatever `node_modules` links to, the
+    // same way Bun's global store does once its links are ready.
+    let manager_ready = match &store {
         None => true,
-        Some("bun")
-            if bun
-                .as_ref()
-                .is_some_and(|report| bun_global_store_ready(report, &root)) =>
-        {
-            bun_links_ready
+        Some(NativeStore::BunGlobalStore) => bun_links_ready,
+        Some(NativeStore::YarnPnp) => true,
+        Some(NativeStore::Pnpm) | Some(NativeStore::YarnPnpmLinker) => {
+            root.join("node_modules").is_dir()
         }
-        Some("yarn") if yarn_uses_pnp(&root) => true,
-        Some(_) => root.join("node_modules").is_dir() && prepared_attached,
+        Some(NativeStore::None { .. }) => root.join("node_modules").is_dir() && prepared_attached,
     };
-    let mut recommendations: Vec<String> = match javascript_manager.as_deref() {
-        Some("bun")
-            if !bun
-                .as_ref()
-                .is_some_and(|report| bun_global_store_ready(report, &root)) =>
-        {
-            vec![BUN_GLOBAL_STORE_ADVICE.to_owned()]
-        }
-        _ => Vec::new(),
-    };
+    let mut recommendations: Vec<String> = store
+        .as_ref()
+        .and_then(|store| native_store_recommendation(&root, store))
+        .into_iter()
+        .collect();
     // Every worktree that materializes a dependency tree — seeded, attached,
     // or installed — pays filesystem metadata per file, whatever the bytes
-    // share. Say what this tree costs before anyone relies on it.
+    // share. Say what this tree costs before anyone relies on it — but not
+    // for a native link-tree store: a pnpm or Yarn-pnpm tree's entries are
+    // hardlinks and symlinks into a shared store, not wt0 clones, so entry
+    // count does not predict their physical cost (docs/research/dependency-link-trees.md).
     let modules = root.join("node_modules");
-    let modules_files = if modules.is_dir() && !bun_links_ready {
-        worktree::tree_files(&modules)
-    } else {
-        0
+    let modules_files = match &store {
+        Some(NativeStore::Pnpm | NativeStore::YarnPnpmLinker | NativeStore::YarnPnp) => 0,
+        Some(NativeStore::BunGlobalStore) if bun_links_ready => 0,
+        _ if modules.is_dir() => worktree::tree_files(&modules),
+        _ => 0,
     };
     let modules_metadata = modules_files * worktree::CLONED_FILE_METADATA_BYTES;
     if modules_metadata > DEPENDENCY_METADATA_ADVICE_BYTES {
@@ -177,18 +248,18 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let cow_available = worktree::discover_repo(&root)
         .and_then(|repo| worktree::cow::clone_supported(&repo.common_git_dir, &root))
         .unwrap_or(false);
-    let dependency_sharing = match javascript_manager.as_deref() {
+    let dependency_sharing = match &store {
         None => "none-detected".to_owned(),
-        Some("yarn") if yarn_uses_pnp(&root) => "native (Yarn PnP)".to_owned(),
-        Some("bun")
-            if bun
-                .as_ref()
-                .is_some_and(|report| bun_global_store_ready(report, &root)) =>
-        {
-            "native store (Bun global virtual store)".to_owned()
+        Some(NativeStore::YarnPnp) => "native (Yarn PnP)".to_owned(),
+        Some(NativeStore::BunGlobalStore) => "native store (Bun global virtual store)".to_owned(),
+        Some(NativeStore::Pnpm) => "native store (pnpm content-addressable store)".to_owned(),
+        Some(NativeStore::YarnPnpmLinker) => "native store (Yarn nodeLinker: pnpm)".to_owned(),
+        Some(NativeStore::None { manager }) if prepared_attached => {
+            format!("prepared environment ({manager})")
         }
-        Some(manager) if prepared_attached => format!("prepared environment ({manager})"),
-        Some(manager) => format!("not yet prepared ({manager}; run wt0 prepare --apply)"),
+        Some(NativeStore::None { manager }) => {
+            format!("not yet prepared ({manager}; run wt0 prepare --apply)")
+        }
     };
     let policy_paths = worktree::project_generated_policy(&root)
         .map(|paths| paths.len())
@@ -1345,9 +1416,23 @@ fn package_manager_version(manager: &str) -> Result<String> {
 fn yarn_uses_pnp(root: &Path) -> bool {
     root.join(".pnp.cjs").is_file()
         || root.join(".pnp.js").is_file()
-        || fs::read_to_string(root.join(".yarnrc.yml"))
-            .ok()
-            .is_some_and(|config| config.lines().any(|line| line.trim() == "nodeLinker: pnp"))
+        || yarn_node_linker(root).as_deref() == Some("pnp")
+}
+
+/// `.yarnrc.yml`'s `nodeLinker` value, if the file exists and sets one.
+fn yarn_node_linker(root: &Path) -> Option<String> {
+    let config = fs::read_to_string(root.join(".yarnrc.yml")).ok()?;
+    config.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("nodeLinker:")
+            .map(|value| value.trim().to_owned())
+    })
+}
+
+/// Whether `.yarnrc.yml` selects Yarn Berry's `nodeLinker: pnpm` — pnpm's own
+/// content-addressable-store shape, not the default PnP layout.
+fn yarn_uses_pnpm_linker(root: &Path) -> bool {
+    yarn_node_linker(root).as_deref() == Some("pnpm")
 }
 
 fn newest_manager_environment(
@@ -1787,6 +1872,21 @@ pub(crate) fn bun_isolated_global_store(root: &Path) -> bool {
         && config
             .lines()
             .any(|line| line.trim() == "globalStore = true")
+}
+
+/// The active native link-tree store at `root`, if any — pnpm's store
+/// (default, unconditional), Bun's isolated linker with `globalStore = true`,
+/// or Yarn Berry's `nodeLinker: pnpm`. Unlike `wt0 doctor`'s [`NativeStore`]
+/// classification this gates on configuration alone, no Bun-version check:
+/// the seed gate only needs to know a native install would be cheaper than
+/// cloning the base's tree, not whether wt0 can rely on it as "ready".
+pub(crate) fn native_link_tree_store(root: &Path, manager: &str) -> Option<&'static str> {
+    match manager {
+        "pnpm" => Some("pnpm content-addressable store"),
+        "bun" if bun_isolated_global_store(root) => Some("Bun global virtual store"),
+        "yarn" if yarn_uses_pnpm_linker(root) => Some("Yarn nodeLinker: pnpm"),
+        _ => None,
+    }
 }
 
 fn bun_report(root: &Path) -> Option<BunReport> {

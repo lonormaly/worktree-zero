@@ -2491,7 +2491,7 @@ pub(crate) const CLONED_FILE_METADATA_BYTES: u64 = 2048;
 /// with a byte-identical lockfile, `npm install` after seeding touched three
 /// paths and wrote nothing, and Bun recreated only what was not seeded. With
 /// a different lockfile the reconcile leaves a mix of the base's layout and
-/// the worktree's, so the lockfile is the proof. Four conditions, in order,
+/// the worktree's, so the lockfile is the proof. Five conditions, in order,
 /// each with its own receipt reason:
 ///
 /// 1. the seed is the root `node_modules` (a nested workspace tree is only
@@ -2499,8 +2499,15 @@ pub(crate) const CLONED_FILE_METADATA_BYTES: u64 = 2048;
 /// 2. the worktree carries the manager's lockfile and it is byte-identical
 ///    to the base's, so both resolve to the same tree;
 /// 3. for Bun, base and worktree ask for the same linker layout (a global
-///    store link tree and a hoisted tree are different shapes); and
-/// 4. no live process holds the base tree open, so it is not mid-install.
+///    store link tree and a hoisted tree are different shapes);
+/// 4. the base's manager has no active native link-tree store (pnpm always,
+///    Bun's global store, Yarn's `nodeLinker: pnpm`) — cloning a hardlink
+///    tree turns hardlinks into wt0 clones that pay the full ~2 KB/file
+///    metadata cost, and a native warm install measured cheaper than that
+///    clone (docs/research/dependency-link-trees.md: Bun's global store 3 MiB
+///    native vs. 9 MiB wt0-seeded, docs/design-partners/flam-migration.md gap
+///    #7); and
+/// 5. no live process holds the base tree open, so it is not mid-install.
 ///
 /// What this does not judge is size: the receipt reports the file count, and
 /// `wt0 doctor` states what that count costs per worktree.
@@ -2516,12 +2523,21 @@ fn node_modules_seed_refusal(base: &Path, target: &Path, relative: &Path) -> Opt
             DEPENDENCY_SEED_REFUSAL.to_owned()
         });
     }
-    let bun = crate::runtime::detect_javascript_package_managers(target).as_slice() == ["bun"];
-    if bun
+    let managers = crate::runtime::detect_javascript_package_managers(target);
+    let manager = match managers.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    };
+    if manager == Some("bun")
         && crate::runtime::bun_isolated_global_store(base)
             != crate::runtime::bun_isolated_global_store(target)
     {
         return Some("base and worktree must use the same Bun linker layout".to_owned());
+    }
+    if let Some(store) =
+        manager.and_then(|manager| crate::runtime::native_link_tree_store(base, manager))
+    {
+        return Some(format!("native store is cheaper: {store}"));
     }
     // An install in flight would be cloned half-written; a failed probe is
     // treated as "in use" rather than waved through.
