@@ -3,6 +3,37 @@
 All notable changes to Worktree Zero. Versions follow semantic versioning;
 pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
+## Unreleased
+
+### Changed
+
+- **`wt0 doctor` names every manager's native link-tree store, and seeding
+  defers to one that is active.** pnpm's content-addressable store and
+  Yarn Berry's `nodeLinker: pnpm` are now reported alongside Bun's global
+  store as `native store (...)`, need no prepared environment, and are
+  exempted from the `node_modules` entry-count advice — their entries are
+  hardlinks and symlinks into a shared store, not materialized copies
+  (measured marginal cost per checkout with a warm store: pnpm 6–7 MiB,
+  Bun's global store 3 MiB; `docs/research/dependency-link-trees.md`).
+  Managers with no such mode get one precise recommendation instead: Yarn
+  Berry's default `node-modules` linker and Yarn classic are pointed at
+  `nodeLinker: pnpm`; npm is told plainly it has no machine-wide store
+  (`--install-strategy=linked` measured identical to hoisted, ~389 MiB per
+  checkout) and to use pnpm or Bun instead. The `node_modules` seed gate now
+  refuses to clone a tree covered by an active native store — cloning would
+  turn its hardlinks into wt0 clones paying the full ~2 KB/file metadata
+  cost, and the native install measured cheaper than that clone (Bun: 3 MiB
+  native vs. 9 MiB wt0-seeded, `docs/design-partners/flam-migration.md` gap
+  #7) — with reason `native store is cheaper: <store>`. `wt0 migrate` and
+  `wt0 prepare` now agree with `doctor`: a pnpm or Yarn-pnpm-linker
+  `node_modules` is never sealed into a wt0-owned prepared environment —
+  `migrate` treats its dependencies as already migrated, and `prepare
+  --apply` instead runs the manager's own frozen install directly against
+  its shared store (only when `node_modules` is missing or a small local
+  marker shows the lockfile changed), reporting
+  `native store (pnpm): installed from the shared store; nothing to seal`
+  and writing no `.wt0-environment.json`.
+
 ## 0.1.16 — 2026-09-02
 
 ### Added

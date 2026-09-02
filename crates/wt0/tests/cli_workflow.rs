@@ -940,13 +940,15 @@ fn seeding_clones_ignored_trees_from_the_base_checkout() {
     let _ = fs::remove_dir_all(root);
 }
 
-// A node_modules seed is allowed only when it is provably cheap and sound: the
-// root tree, Bun, the same isolated global-store layout on both sides, a base
-// that really is a link tree, byte-identical lockfiles, and nothing holding the
-// base tree open. Every other shape keeps its refusal, with its own reason.
+// A Bun node_modules seed is always refused, each shape with its own precise
+// reason: a mismatched lockfile, a base and worktree asking for different
+// Bun linker layouts, or — when the layout does match — Bun's own global
+// store, which measured cheaper than cloning it (docs/research/dependency-link-trees.md:
+// 3 MiB native vs. docs/design-partners/flam-migration.md gap #7's 9 MiB
+// wt0-seeded). See `node_modules_seed_refusal`'s "native store is cheaper".
 #[cfg(unix)]
 #[test]
-fn seeding_clones_node_modules_only_when_the_bun_layout_matches() {
+fn seeding_always_refuses_bun_node_modules_with_a_precise_reason() {
     let root = std::env::temp_dir().join(format!(
         "worktree-zero-bunseed-{}-{}",
         std::process::id(),
@@ -1031,7 +1033,10 @@ fn seeding_clones_node_modules_only_when_the_bun_layout_matches() {
             .clone()
     };
 
-    // Matching layouts on the same lockfile: the tree is cloned, links and all.
+    // Matching layouts on the same lockfile: Bun's own global store is
+    // cheaper than cloning it, so the seed is refused rather than cloned —
+    // cloning would turn its hardlinks into wt0 clones that pay the full
+    // per-file metadata cost the native install already avoids.
     let matched = root.join("matched");
     let receipt = create("agent/bun-matched", None, &matched);
 
@@ -1047,33 +1052,14 @@ fn seeding_clones_node_modules_only_when_the_bun_layout_matches() {
     );
 
     let modules = seed_of(&receipt, "node_modules");
-    if modules["status"] == "seeded" {
-        assert_eq!(
-            fs::read_to_string(matched.join("node_modules/pkg/index.js")).expect("seeded package"),
-            "module.exports = 1;\n"
-        );
-        let link = matched.join("node_modules/.bun/pkg@1.0.0");
-        assert!(link.is_symlink(), "expected the store link to be recreated");
-        assert_eq!(fs::read_link(&link).expect("read the store link"), store);
-        assert!(
-            modules["files"].as_u64().is_some_and(|files| files > 0),
-            "{modules}"
-        );
-        assert!(
-            modules["logical_bytes"]
-                .as_u64()
-                .is_some_and(|bytes| bytes > 0),
-            "{modules}"
-        );
-    } else {
-        // No copy-on-write between the two locations (plain ext4, an overlay
-        // mount): the seed is skipped with a reason, never degraded to a copy.
-        assert_eq!(modules["status"], "skipped", "{modules}");
-        assert!(modules["reason"]
+    assert_eq!(modules["status"], "refused", "{modules}");
+    assert!(
+        modules["reason"]
             .as_str()
-            .is_some_and(|reason| !reason.is_empty()));
-        assert!(!matched.join("node_modules").exists());
-    }
+            .is_some_and(|reason| reason.contains("native store is cheaper")),
+        "{modules}"
+    );
+    assert!(!matched.join("node_modules").exists());
 
     // A different lockfile resolves to a different store layout: refused, and
     // the prepared environment handles it instead.
@@ -1226,6 +1212,231 @@ fn seeding_clones_any_node_modules_behind_an_identical_lockfile() {
         .find(|item| item.contains("10500 files"))
         .unwrap_or_else(|| panic!("no metadata advice in {doctor}"));
     assert!(advice.contains("20 MiB of filesystem metadata"), "{advice}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// pnpm's content-addressable store is default behavior, nothing to opt
+/// into: `wt0 doctor` reports it as a native store and does not warn about
+/// `node_modules`'s entry count (its entries are hardlinks and symlinks into
+/// the store, not wt0 clones), and the seed gate refuses to clone the tree
+/// because the native store is already cheaper than a clone
+/// (docs/research/dependency-link-trees.md: 6–7 MiB marginal cost per
+/// checkout with a warm store).
+#[test]
+fn pnpm_native_store_is_reported_by_doctor_and_exempted_from_seeding() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-pnpm-native-store-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    fs::write(repo.join(".wt0-seed"), "node_modules\n").expect("write seed policy");
+    fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").expect("write lockfile");
+    fs::write(repo.join("package.json"), "{\"name\":\"fixture\"}\n").expect("write manifest");
+    // Stands in for pnpm's own shape: `.modules.yaml` is the marker pnpm
+    // writes into a store-backed `node_modules`; a real install symlinks the
+    // package directory from `.pnpm`, but the fixture only needs what
+    // doctor and the seed gate key off (the lockfile and the manifest).
+    fs::create_dir_all(repo.join("node_modules/pkg")).expect("create the package directory");
+    fs::write(
+        repo.join("node_modules/.modules.yaml"),
+        "hoistPattern:\n  - '*'\n",
+    )
+    .expect("write pnpm modules marker");
+    fs::write(
+        repo.join("node_modules/pkg/index.js"),
+        "module.exports = 1;\n",
+    )
+    .expect("write the package");
+    git(
+        &repo,
+        &[
+            "add",
+            "-f",
+            ".gitignore",
+            ".wt0-seed",
+            "pnpm-lock.yaml",
+            "package.json",
+        ],
+    );
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    // Doctor exits non-zero when not "ready"; the report is still the JSON
+    // on stdout, so it is parsed regardless of exit status.
+    let doctor = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "doctor"])
+        .output()
+        .expect("doctor");
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)
+        .unwrap_or_else(|_| panic!("doctor JSON: {}", String::from_utf8_lossy(&doctor.stderr)));
+    assert!(
+        doctor["promise"]["dependency_sharing"]
+            .as_str()
+            .is_some_and(|sharing| sharing.starts_with("native store (pnpm")),
+        "{doctor}"
+    );
+    assert!(
+        doctor["dependencies"]["recommendations"]
+            .as_array()
+            .expect("recommendations")
+            .iter()
+            .filter_map(|item| item.as_str())
+            .all(|item| !item.contains("node_modules holds")),
+        "{doctor}"
+    );
+
+    let worktree = root.join("worktree");
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "create", "agent/pnpm-native", "--path"])
+        .arg(&worktree)
+        .output()
+        .expect("create worktree");
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&created.stdout).expect("create JSON");
+    let modules = receipt["seeded"]
+        .as_array()
+        .expect("seed receipts")
+        .iter()
+        .find(|seed| seed["path"] == "node_modules")
+        .unwrap_or_else(|| panic!("no seed receipt for node_modules: {receipt}"))
+        .clone();
+    assert_eq!(modules["status"], "refused", "{modules}");
+    assert!(
+        modules["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("native store is cheaper")),
+        "{modules}"
+    );
+    assert!(!worktree.join("node_modules").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Yarn Berry's default `node-modules` linker materializes a full tree with
+/// no cross-checkout sharing; `wt0 doctor` recommends switching to
+/// `nodeLinker: pnpm` for pnpm's own store shape, citing the measured
+/// marginal cost (docs/research/dependency-link-trees.md).
+#[test]
+fn yarn_berry_node_modules_linker_recommends_the_pnpm_linker() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-yarn-node-modules-linker-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    fs::write(repo.join("yarn.lock"), "# yarn lockfile v1\n").expect("write lockfile");
+    fs::write(repo.join(".yarnrc.yml"), "nodeLinker: node-modules\n").expect("write yarnrc");
+    fs::write(repo.join("package.json"), "{\"name\":\"fixture\"}\n").expect("write manifest");
+    git(
+        &repo,
+        &[
+            "add",
+            "-f",
+            ".gitignore",
+            "yarn.lock",
+            ".yarnrc.yml",
+            "package.json",
+        ],
+    );
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let doctor = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "doctor"])
+        .output()
+        .expect("doctor");
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)
+        .unwrap_or_else(|_| panic!("doctor JSON: {}", String::from_utf8_lossy(&doctor.stderr)));
+    assert!(
+        doctor["dependencies"]["recommendations"]
+            .as_array()
+            .expect("recommendations")
+            .iter()
+            .filter_map(|item| item.as_str())
+            .any(|item| item.contains("nodeLinker: pnpm")),
+        "{doctor}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// npm has no machine-wide store — `--install-strategy=linked` only
+/// restructures one project's own tree — so `wt0 doctor` says so plainly and
+/// points at pnpm or Bun's global store instead of implying npm has an
+/// equivalent (docs/research/dependency-link-trees.md).
+#[test]
+fn npm_recommendation_states_it_has_no_machine_wide_store() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-npm-no-store-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    fs::write(repo.join("package-lock.json"), "{\"lockfileVersion\": 3}\n")
+        .expect("write lockfile");
+    fs::write(repo.join("package.json"), "{\"name\":\"fixture\"}\n").expect("write manifest");
+    git(
+        &repo,
+        &[
+            "add",
+            "-f",
+            ".gitignore",
+            "package-lock.json",
+            "package.json",
+        ],
+    );
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let doctor = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "doctor"])
+        .output()
+        .expect("doctor");
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)
+        .unwrap_or_else(|_| panic!("doctor JSON: {}", String::from_utf8_lossy(&doctor.stderr)));
+    assert!(
+        doctor["dependencies"]["recommendations"]
+            .as_array()
+            .expect("recommendations")
+            .iter()
+            .filter_map(|item| item.as_str())
+            .any(|item| item.contains("no machine-wide store")),
+        "{doctor}"
+    );
 
     let _ = fs::remove_dir_all(root);
 }

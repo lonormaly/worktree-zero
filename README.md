@@ -77,9 +77,11 @@ manager's store is still recommended — it is the smallest footprint, and it
 shares across repositories, which a per-repository seal cannot. A checked-in
 `.wt0-seed` additionally clones the base checkout's build caches
 (`.nx/cache`, `.next/cache`) — and its `node_modules`, when the lockfile is
-identical — into every new worktree, so the first build starts warm and a
-plain `npm install` finds nothing to do (measured: three paths touched,
-0 MiB written). `wt0 run` applies the same ownership rule to Cargo
+identical and no cheaper native store (pnpm, Bun's global store, Yarn's
+`nodeLinker: pnpm`) is already active for it — into every new worktree, so
+the first build starts warm and a plain `npm install` finds nothing to do
+(measured: three paths touched, 0 MiB written). `wt0 run` applies the same
+ownership rule to Cargo
 target directories, Nx workspace state, and Wrangler local persistence.
 
 ### 2. Identity: collision-free by construction
