@@ -1,6 +1,6 @@
 {
   "name": "worktree-zero",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "Create, prepare, measure, migrate, and safely remove thin coding-agent worktrees.",
   "author": {
     "name": "Worktree Zero contributors",

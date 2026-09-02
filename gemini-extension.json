@@ -1,6 +1,6 @@
 {
   "name": "worktree-zero",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "Thin, safe copy-on-write worktrees for coding agents: create, prepare, measure, migrate, and clean up with one guarded lifecycle.",
   "contextFileName": "GEMINI.md",
   "mcpServers": {

@@ -1,0 +1,9 @@
+[mcp_servers.immorterm]
+command = "/Users/shaisnir/.immorterm/bin/immorterm-ai"
+args = [
+    "mcp",
+    "serve",
+]
+
+[mcp_servers.immorterm-memory]
+url = "http://127.0.0.1:8765/mcp/claude-code/lonormaly-worktree-zero"
