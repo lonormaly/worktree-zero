@@ -54,9 +54,21 @@ mod imp {
             .collect())
     }
 
+    /// Content indexers open files read-only for a while after any tree
+    /// appears and hold no state in it; a fresh checkout would otherwise be
+    /// un-reapable for a minute on macOS. Nothing else is exempt: an agent,
+    /// an editor, or a dev server keeps its refusal.
+    const SYSTEM_INDEXERS: &[&str] = &[
+        "mdworker",
+        "mdworker_shared",
+        "mds",
+        "mds_stores",
+        "fseventsd",
+    ];
+
     pub(super) fn live_open_path(root: &Path) -> Result<Option<String>> {
         let output = Command::new("lsof")
-            .args(["-Fn", "+D"])
+            .args(["-Fcn", "+D"])
             .arg(root)
             .output()
             .context("lsof is required for safe cleanup and migration")?;
@@ -64,11 +76,18 @@ mod imp {
             bail!("lsof failed while checking open worktree paths");
         }
         let root_text = root.to_string_lossy();
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| line.strip_prefix('n'))
-            .find(|path| *path == root_text || path.starts_with(&format!("{root_text}/")))
-            .map(str::to_owned))
+        let mut command = String::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(name) = line.strip_prefix('c') {
+                command = name.to_owned();
+            } else if let Some(path) = line.strip_prefix('n') {
+                let inside = path == root_text || path.starts_with(&format!("{root_text}/"));
+                if inside && !SYSTEM_INDEXERS.contains(&command.as_str()) {
+                    return Ok(Some(path.to_owned()));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 
