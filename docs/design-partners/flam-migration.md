@@ -239,6 +239,61 @@ With Bun's global store already warm, wt0's Bun path still runs
 create-plus-prepare is roughly a native install plus a fast clone. The
 storage promise is kept; a time promise is not made by these numbers.
 
+### Gap #7 — what a fresh worktree costs once its dependencies are usable (2026-09-02)
+
+Same instrument (dedicated APFS sparse images, exact `df` deltas), Bun
+1.3.14, wt0 at `main` after PR #51. Every run below happened on a busy
+laptop (load average above 100 from other sessions), so **storage numbers
+are exact and times are upper bounds**.
+
+**FLAM with Bun's isolated global store — the fair native baseline.** The
+M1 table above kept Bun's store on the laptop's main volume, so native
+`bun install` had to copy across volumes. Re-run with the store on the same
+volume as the worktrees:
+
+| Per additional usable worktree | Storage | Time |
+| --- | ---: | ---: |
+| Native `git worktree add` + `bun install`, store on the same volume | **+434 MiB** | 62–113 s |
+| wt0 create with seeded `node_modules` (12,669 links) + `prepare --apply` | **+9 MiB** | 6–12 s create + 17–21 s prepare |
+
+The 434 MiB is not `node_modules` — under the global store that is already
+cheap natively. It is FLAM's 368 MiB tracked checkout (226 MiB of it under
+`ops/brand/assets`) plus link metadata. That checkout is what wt0 shares.
+`apps/web` resolved `next 16.3.1` in every seeded worktree.
+
+**Seeding a hoisted `node_modules` from the base checkout** (the "origin as
+virtual store" question — no global store involved). Each worktree cloned
+the base's `node_modules` in one directory `clonefile`, then ran the
+package manager's ordinary install exactly as an agent would:
+
+| Layout | Native install per worktree | Seed clone | Raw install after seeding | Paths the install rewrote |
+| --- | ---: | ---: | ---: | ---: |
+| npm, Next app, 11,687 files | +389 MiB, 60–74 s | **+4–5 MiB** | **+0 MiB, 2–5 s** | 3 (its hidden lockfile and metadata) |
+| Bun hoisted (`linker = "hoisted"`), FLAM, 236,332 files, 10 workspace trees | +4,234 MiB, 616 s (cache across volumes; upper bound) | **+471 MiB** | +58 MiB, 8–42 s | 751 (the unseeded workspace `node_modules` and `.bin` shims) |
+
+Two readings. First, seeding works for any manager when the lockfile is
+byte-identical to the base's: npm's reconcile touched three paths and wrote
+nothing; Bun's recreated only what was not seeded. Second, the cost of a
+seeded — or attached, or natively installed — `node_modules` is set by its
+**file count, not its bytes**: APFS spends roughly 2 KB of metadata per
+cloned inode, so 236k files cost ~470 MiB per worktree no matter how the
+bytes are shared, while 11.7k files cost 5 MiB and a 12.7k-link global-store
+tree 9 MiB. Copy-on-write shares blocks, not inodes. That is why the ≤15–20
+MiB bar is met by link-tree layouts (Bun's global store, pnpm) and by small
+hoisted trees, and cannot be met by a 236k-file hoisted tree through any
+per-worktree materialization — the recommendation to enable the native
+virtual store stands on that number.
+
+**Create itself.** Profiling the same runs found `wt0 create` spending its
+time outside the clone: the baseline was cloned file by file (4.5 s where
+one directory `clonefile` takes 0.07 s), the fresh index carried no stat
+data so the verifying `git status` — and the agent's first — hashed all
+368 MiB (15 s), and every lease scan spawned `git rev-parse` per registered
+worktree. With all three removed (PR #51), create on FLAM with 19 worktrees
+registered measured **0.8–1.4 s** and the first `git status` inside the
+worktree 0.14 s. Directory `clonefile` of the 230k-file Builders Stack
+`node_modules` took 12 s on the loaded laptop; removing it took 65 s.
+
 Not yet measured here: builds, tests, and dev servers inside the
 worktrees (gate 2), crash-recovery reaping (gate 5), Linux and Windows
 (gate 7). M3 (real-fleet reclaim, 12.2 GiB) and the booted-stack round trip
