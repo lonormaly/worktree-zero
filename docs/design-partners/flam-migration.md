@@ -186,6 +186,27 @@ first. Still to prove, by the FLAM Team session: a booted stack round trip
 (`tilt_up.sh` → hook-driven `tilt_down.sh` + k3s retirement with ImmorTerm
 annotations), then M1–M6.
 
+### M3 (partial) — real-fleet reclaim through wt0's guarded path (2026-09-02)
+
+The 12 `discard` decisions were executed with `wt0 remove` (0.1.14) after an
+independent verification of every claim: all 12 branches merged (9 ancestors
+of `main`, 3 patch-equivalent with zero unmerged commits), no live process,
+no `.immorterm` content beyond the tracked `project.json`. Every dirty diff
+and untracked file was first saved as a named receipt under FLAM's
+`scratchpad/wt0-discard-receipts/` (an explicit, visible patch — never
+`git stash`), then the checkout was restored to clean so wt0's own guards
+decided the removal. Result: **12 removed, 0 refused, 12.2 GiB returned**
+(volume free space 21 → 35 GiB; per-worktree `df` deltas carry ±0.5 GiB of
+noise from other sessions writing to the 99%-full volume). The one worktree
+that had ever booted a FLAM runtime had its k3s namespace deleted and its
+database retired by exact runtime id afterwards. The 12 `keep` rows and the
+main checkout were not touched.
+
+The Team session's booted-stack round trip on `wt0/adapter` (FLAM #283)
+additionally proved acceptance items 2, 3, and 5: unique ids, ports,
+namespace, database, and generated root; a normal removal leaving no orphan
+(database retired with its 3,600 s grace); dirty and live cases refusing.
+
 ## After
 
 _To be filled by the same instruments once the migration lands._
