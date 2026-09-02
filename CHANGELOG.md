@@ -5,6 +5,19 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ## Unreleased
 
+### Added
+
+- **Drift benchmark: does an install after `wt0 create` stay a delta, or
+  rewrite the tree?** `docs/design-partners/drift.md` measures npm, Bun
+  (hoisted and isolated+globalStore), and pnpm adding/removing a package,
+  plus a seeded `.next/cache` rebuild and a source-only edit, all on an
+  isolated APFS sparse image. Verdict: delta-only in every scenario — no
+  manager rewrote its shared tree — with one gap found: an attached
+  prepared environment (npm, no native store) silently drifts to "not
+  ready" in `wt0 doctor` after an in-worktree install, and `wt0 prepare
+  --apply` correctly refuses to re-seal over the resulting dirty diff but
+  doesn't yet say why or how to fix it.
+
 ### Changed
 
 - **`wt0 doctor` names every manager's native link-tree store, and seeding
