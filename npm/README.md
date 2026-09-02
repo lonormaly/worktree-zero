@@ -27,9 +27,14 @@ the Cargo workspace version being released.
 Publishing is automated: the `Publish npm` workflow (`.github/workflows/npm.yml`)
 runs when a GitHub release is published and can be dispatched for any released
 version (`gh workflow run "Publish npm" -f version=0.1.16`). It authenticates
-with the `NPM_TOKEN` repository secret — a granular npm access token with
-publish rights to `wt0` / `wt0-*` and two-factor bypass — and skips versions
-already on the registry, so re-runs are safe. Manual fallback, from a logged-in
+with npm Trusted Publishing (GitHub OIDC) — no token, nothing that bypasses
+two-factor auth — and skips versions already on the registry, so re-runs are
+safe. One-time setup: npm only lets a trusted publisher be configured on a
+package that already exists, so the first version of `wt0` and each `wt0-*`
+platform package is published once from a logged-in laptop (`npm/publish.sh
+<version>`, one OTP prompt per package); then, on npmjs.com, each package's
+Settings → Trusted Publisher: user `lonormaly`, repository `worktree-zero`,
+workflow `npm.yml`. Manual fallback, from a logged-in
 laptop:
 
 ```bash
