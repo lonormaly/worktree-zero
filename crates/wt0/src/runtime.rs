@@ -289,6 +289,27 @@ pub(crate) fn dependency_classification(root: &Path) -> Result<Option<&'static s
     ))
 }
 
+/// `wt0` run with no subcommand at all: the same plain-language report
+/// `wt0 doctor` prints, for the current directory — except outside a Git
+/// repository, where `doctor`'s own "not inside a Git worktree" error would
+/// be the first thing a newcomer (human or agent) ever sees from this tool.
+/// Here that case gets a short, friendly redirect instead, and a distinct
+/// exit code (2) so a script can tell "not a repo" apart from "repo not
+/// ready" (exit 1, from `doctor` below).
+pub fn doctor_or_intro(json_output: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    if git_root(&cwd).is_err() {
+        println!("{WT0_TITLE}");
+        println!(
+            "Each agent gets its own fast, disposable copy of your repository (a \"worktree\") to work in."
+        );
+        println!();
+        println!("Run this inside a Git repository, or: wt0 faq");
+        std::process::exit(2);
+    }
+    doctor(Doctor { path: None }, json_output)
+}
+
 pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let requested = args.path.unwrap_or(std::env::current_dir()?);
     let root = git_root(&requested)?;
@@ -538,7 +559,11 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     } else {
         // The steps above are the message; a second "Error:" line under
         // them only repeats it. Exit code stays non-zero for scripts.
-        eprintln!("wt0: not ready — {} steps above", steps.len());
+        eprintln!(
+            "wt0: {} thing{} to do before this repository is fully ready — see above",
+            steps.len(),
+            if steps.len() == 1 { "" } else { "s" }
+        );
         std::process::exit(1)
     }
 }
@@ -561,9 +586,20 @@ struct DoctorPrintArgs<'a> {
     not_shipped: Option<String>,
 }
 
+/// wt0's own title line, shared by the doctor report and the short message
+/// printed when `wt0` (no arguments) is run outside a Git repository — see
+/// `main.rs`'s no-subcommand handling.
+pub(crate) const WT0_TITLE: &str =
+    "wt0 — Worktree Zero · cheap, isolated Git worktrees for coding agents";
+
 /// The one-screen before/after report: what this repository costs today,
-/// what it costs with wt0, and the exact steps that close the gap. Numbers
-/// come from `estimate_cost`; see its doc comment for the sources.
+/// what it costs with wt0, and the exact, plain-language steps that close
+/// the gap. Written for a reader who has never heard of wt0 — a human or an
+/// agent — so no wt0-internal term (seed, link-tree store, generated state,
+/// slug, lease, …) appears without its plain meaning on the same line.
+/// Numbers come from `estimate_cost`; see its doc comment for the sources.
+/// The machine-readable `--json` report (built in `doctor` above) is
+/// unaffected by anything in this function.
 fn print_doctor_report(args: DoctorPrintArgs) {
     let DoctorPrintArgs {
         root,
@@ -583,172 +619,447 @@ fn print_doctor_report(args: DoctorPrintArgs) {
         not_shipped,
     } = args;
 
-    println!("Worktree Zero doctor — {}\n", root.display());
+    println!("{WT0_TITLE}\n");
+    println!("  Each agent gets its own copy of your repository (a \"worktree\") in about a second, sharing");
+    println!("  files with your main checkout instead of copying them. Below: what a worktree costs in this");
+    println!("  repository today, what changes with wt0, and what to do next.\n");
 
-    let manager_segment = manager_summary(javascript_manager, store)
+    println!("📦 This repository  {}", root.display());
+    let manager_segment = plain_manager_summary(javascript_manager, store)
         .map(|summary| format!(" · {summary}"))
         .unwrap_or_default();
     let modules_segment = if node_modules_files > 0 {
-        format!(" · node_modules {} files", format_count(node_modules_files))
+        format!(" ({} files)", format_count(node_modules_files))
     } else {
         String::new()
     };
     println!(
-        "  📦 repository    {} tracked in {} files{manager_segment}{modules_segment}",
+        "   {} of tracked files ({} files){manager_segment}{modules_segment}",
         human_bytes(tracked.bytes),
         format_count(tracked.files)
     );
-    println!(
-        "  🖥️ filesystem    {} · copy-on-write {}",
-        filesystem_display_name(),
-        if cow_available { "✅" } else { "❌" }
-    );
-    println!(
-        "  🛠️ tooling       {}",
-        if tooling_names.is_empty() {
-            "none detected".to_owned()
-        } else {
-            tooling_names.join(" · ")
-        }
-    );
+    if !tooling_names.is_empty() {
+        println!("   {}", tooling_names.join(" · "));
+    }
+    // Two lines, not one: `filesystem_display_name()` returns "this
+    // filesystem" on Linux (longer than "APFS"/"ReFS/Dev Drive"), which
+    // pushed the single-line version past 100 columns in CI.
+    println!("   Filesystem: {}", filesystem_display_name());
+    if cow_available {
+        println!("   Copy-on-write available ✅ — worktrees share files at no extra disk cost.");
+    } else {
+        println!(
+            "   No copy-on-write here ❌ — each worktree copies the full checkout instead of sharing it."
+        );
+    }
     println!();
 
-    println!("  💾 what a worktree costs here                 today                      with wt0");
+    println!("💾 What one agent's worktree costs");
     println!(
-        "     one worktree, ready to work                 ≈ {:<12}              ≈ {}",
-        human_bytes(estimate.today_one_bytes),
-        human_bytes(estimate.wt0_one_bytes)
+        "                                       today ({})      with wt0",
+        today_recipe(javascript_manager)
     );
+    let (today_one, wt0_one) = format_cost_pair(estimate.today_one_bytes, estimate.wt0_one_bytes);
     println!(
-        "     ten agents                                   ≈ {:<12}              ≈ {}",
-        human_bytes(estimate.today_ten_bytes),
-        human_bytes(estimate.wt0_ten_bytes)
+        "   one worktree, ready to work          ≈ {today_one:<12}                ≈ {wt0_one}"
+    );
+    let (today_ten, wt0_ten) = format_cost_pair(estimate.today_ten_bytes, estimate.wt0_ten_bytes);
+    println!(
+        "   ten agents                           ≈ {today_ten:<12}                ≈ {wt0_ten}"
     );
     if let Some(with_store) = estimate.with_native_store_each_bytes {
         println!(
-            "     with a native link-tree store (one config line)                       ≈ {each} each  ← recommended",
-            each = human_bytes(with_store)
+            "   with {} on (step 1 below)                                ≈ {} each",
+            shared_store_label(javascript_manager),
+            human_bytes_rounded(with_store)
         );
     }
     println!(
-        "     ≈ estimated from this repo's file counts and the per-file costs measured on FLAM (docs/design-partners/flam-migration.md); basis: {}",
-        estimate.basis
+        "   Estimates: this repository's file counts × per-file costs measured on a 236,000-file"
     );
+    println!("   monorepo. `wt0 faq costs` explains.");
     println!();
 
     println!(
-        "  ⚡ speed         {}",
+        "⚡ Speed   {}",
         if cow_available {
-            "create ≈ 1–2 s (one whole-tree clonefile), first git status instant (adopted index)"
+            "a worktree is ready in ≈ 1–2 s, and `git status` inside it is instant."
         } else {
-            "no copy-on-write on this volume — create falls back to a plain git checkout"
+            "without copy-on-write, `wt0 create` falls back to a plain checkout — every file is copied."
         }
     );
-    println!("  🔌 ports         every worktree gets a 100-port window (WT0_PORT_BASE) and a slug (WT0_SLUG)");
-    print_tilt_line(tilt);
-    print_generated_line(generated_total, policy_paths);
-    print_seed_line(root, seed_paths);
+    println!(
+        "🔌 Ports   each worktree gets its own 100-port range and a short name, so agents never collide."
+    );
     println!();
 
-    if steps.is_empty() {
-        println!("  ✅ ready");
-    } else {
-        println!(
-            "  ❌ not ready — {} step{}",
-            steps.len(),
-            if steps.len() == 1 { "" } else { "s" }
-        );
-        for step in steps {
-            println!(
-                "     {}. {}  {}   {}",
-                step["order"].as_u64().unwrap_or(0),
-                step["title"].as_str().unwrap_or(""),
-                step["command_or_config"].as_str().unwrap_or(""),
-                step["payoff"].as_str().unwrap_or("")
-            );
+    print_tilt_info_line(tilt);
+    print_build_output_line(generated_total, policy_paths);
+    println!();
+
+    let mut blocks = plain_steps(
+        steps,
+        tracked,
+        javascript_manager,
+        node_modules_files,
+        generated_total,
+    );
+    if seed_paths == 0 {
+        let preview = seed_preview(root);
+        if !preview.is_empty() {
+            blocks.push(seed_step_block(&preview));
         }
     }
+
+    if blocks.is_empty() {
+        println!("✅ Nothing to fix — start with: wt0 create <branch> --owner <you-or-agent-id>");
+    } else {
+        println!("🚀 What to do next");
+        for (index, block) in blocks.iter().enumerate() {
+            println!("   {}. {}", index + 1, block[0]);
+            for line in &block[1..] {
+                println!("{line}");
+            }
+        }
+        println!();
+        println!(
+            "   Then:  wt0 create <branch> --owner <you-or-agent-id>   ·   wt0 fleet   ·   wt0 remove <path>"
+        );
+    }
+    println!("   More:  wt0 faq   ·   https://github.com/lonormaly/worktree-zero#faq");
+
     if stale > 0 {
-        println!("  action: run a reviewed Worktree Zero dependency repair before agent work");
+        println!();
+        println!(
+            "⚠️  This worktree has leftover files from switching to a shared package store — run `wt0 prepare --apply` to clean them up before agents rely on it."
+        );
     }
     if let Some(manager) = not_shipped {
+        println!();
         println!(
-            "  action: {manager} adapter is detected but not shipped yet; refusing a false ready result"
+            "⚠️  This repository uses {manager}, which wt0 doesn't share dependencies for yet — the numbers above don't apply until wt0 adds support."
         );
     }
 }
 
-fn print_tilt_line(tilt: &tooling::TiltReport) {
+/// What "today" (no wt0) costs, in the cost table's header — the real
+/// command a developer or CI would actually run, so the "today" column has
+/// a concrete recipe instead of an abstract label.
+fn today_recipe(manager: Option<&str>) -> String {
+    match manager {
+        Some(manager) => format!("git worktree add + {manager} install"),
+        None => "git worktree add".to_owned(),
+    }
+}
+
+/// Plain name for whichever manager-specific shared package store `doctor`
+/// is about to recommend turning on, for the cost table's "with X on" row.
+fn shared_store_label(manager: Option<&str>) -> &'static str {
+    match manager {
+        Some("bun") => "Bun's shared package store",
+        Some("yarn") => "Yarn's shared package store",
+        Some("pnpm") => "pnpm's shared package store",
+        _ => "a shared package store",
+    }
+}
+
+/// Plain-language version of what `dependency_facts` detected — a manager
+/// name and whether it already shares packages, with no "hoisted"/"global
+/// store"/"PnP" jargon left unexplained.
+fn plain_manager_summary(manager: Option<&str>, store: &Option<NativeStore>) -> Option<String> {
+    let manager = manager?;
+    let label = match manager {
+        "bun" => "Bun",
+        "npm" => "npm",
+        "yarn" => "Yarn",
+        "pnpm" => "pnpm",
+        other => other,
+    };
+    Some(match store {
+        Some(NativeStore::BunGlobalStore | NativeStore::Pnpm | NativeStore::YarnPnpmLinker) => {
+            format!("{label} with a shared package store")
+        }
+        Some(NativeStore::YarnPnp) => format!("{label} using Plug'n'Play (no node_modules folder)"),
+        _ => format!("{label} with a plain node_modules folder"),
+    })
+}
+
+/// `human_bytes` rounded to whole MiB (or one decimal of GiB) — decimals
+/// like "138.6 MiB" read as false precision in a plain-language report; the
+/// exact figure is still in `--json`.
+fn human_bytes_rounded(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    if bytes as f64 >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB)
+    } else {
+        format!("{:.0} MiB", bytes as f64 / MIB)
+    }
+}
+
+/// A "today" and "with wt0" figure for the same row, always in the same
+/// unit (chosen from the larger of the two) so the two numbers in a row are
+/// directly comparable at a glance.
+fn format_cost_pair(today: u64, wt0: u64) -> (String, String) {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    if today.max(wt0) as f64 >= GIB {
+        (
+            format!("{:.1} GiB", today as f64 / GIB),
+            format!("{:.1} GiB", wt0 as f64 / GIB),
+        )
+    } else {
+        (
+            format!("{:.0} MiB", today as f64 / MIB),
+            format!("{:.0} MiB", wt0 as f64 / MIB),
+        )
+    }
+}
+
+fn print_tilt_info_line(tilt: &tooling::TiltReport) {
     if !tilt.detected {
         println!(
-            "  🎛️ tilt          not used — for several agents each with a booted dev stack, Tilt + wt0 gives every worktree its own ports and hostnames (`wt0 init tilt` starts one)"
+            "🎛️ Tilt    Not used — for several agents each running a dev stack, Tilt gives every worktree"
         );
+        println!("           its own ports and hostnames (`wt0 init tilt` starts one).");
     } else if tilt.derives_from_wt0 {
-        println!("  🎛️ tilt          derives ports and hostnames from wt0 ✅");
+        println!("🎛️ Tilt    Already gives each worktree its own ports and hostnames ✅");
     } else {
-        let ports = if tilt.literal_ports.is_empty() {
-            String::new()
-        } else {
-            format!("port {}", tilt.literal_ports.join(", "))
-        };
-        let hosts = if tilt.literal_hosts.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "{}{} hostname{}",
-                if ports.is_empty() { "" } else { " and " },
-                tilt.literal_hosts.len(),
-                if tilt.literal_hosts.len() == 1 {
-                    ""
-                } else {
-                    "s"
+        let ports = tilt.literal_ports.len();
+        let hosts = tilt.literal_hosts.len();
+        println!(
+            "🎛️ Tilt    your Tiltfile hard-codes {ports} port{} and {hosts} hostname{} — two agents",
+            if ports == 1 { "" } else { "s" },
+            if hosts == 1 { "" } else { "s" }
+        );
+        println!("           running Tilt at once will collide.");
+    }
+}
+
+fn print_build_output_line(generated_total: u64, policy_paths: usize) {
+    if generated_total == 0 {
+        println!("🧹 Build output   none found here.");
+    } else if policy_paths > 0 {
+        println!(
+            "🧹 Build output   {} of ignored build files, {policy_paths} folder(s) already reviewed in",
+            human_bytes(generated_total)
+        );
+        println!(
+            "                  .wt0-generated — `wt0 gc` can reclaim this once a worktree is idle."
+        );
+    } else {
+        println!(
+            "🧹 Build output   {} of ignored build files (.nx, dist, …). wt0 never deletes files it has",
+            human_bytes_rounded(generated_total)
+        );
+        println!(
+            "                  not been told are disposable, so a short list of those folders is needed"
+        );
+        println!("                  before `wt0 gc` can reclaim this space.");
+    }
+}
+
+/// Renders `doctor_steps`'s JSON list into plain-language "what to do next"
+/// blocks — dispatched by each step's `title` (stable, since `doctor_steps`
+/// isn't changed by this function) rather than re-deriving which steps
+/// apply, so the `--json` step list stays the single source of truth for
+/// *whether* a step exists and this only changes how it reads in text.
+fn plain_steps(
+    steps: &[Value],
+    tracked: &TrackedStats,
+    javascript_manager: Option<&str>,
+    node_modules_files: u64,
+    generated_total: u64,
+) -> Vec<Vec<String>> {
+    steps
+        .iter()
+        .map(|step| {
+            let title = step["title"].as_str().unwrap_or("");
+            let command = step["command_or_config"].as_str().unwrap_or("");
+            match title {
+                "bunfig.toml" => native_store_block_bun(tracked, node_modules_files),
+                ".yarnrc.yml" => native_store_block_yarn(tracked, node_modules_files),
+                "package manager" if javascript_manager == Some("npm") => {
+                    native_store_block_npm(tracked, node_modules_files)
                 }
-            )
-        };
-        println!("  🎛️ tilt          Tiltfile pins {ports}{hosts} → two agents collide");
-        println!(
-            "                   fix: TILT_PORT=\"${{WT0_PORT_BASE}}\", route names \"<role>-${{WT0_SLUG}}\" — `wt0 init tilt` writes it"
-        );
-    }
+                "package manager" => native_store_block_other(
+                    javascript_manager.unwrap_or("this package manager"),
+                    tracked,
+                    node_modules_files,
+                ),
+                "dependencies" => prepare_block(),
+                "generated state" if command.contains("wt0 init generated") => {
+                    generated_missing_policy_block(generated_total)
+                }
+                "generated state" => generated_over_budget_block(generated_total),
+                "tilt" => tilt_fix_block(),
+                _ => fallback_block(step),
+            }
+        })
+        .collect()
 }
 
-fn print_generated_line(generated_total: u64, policy_paths: usize) {
-    if policy_paths > 0 {
-        println!(
-            "  🧹 generated     {} reclaimable via {policy_paths} reviewed path(s) in .wt0-generated",
-            human_bytes(generated_total)
-        );
-    } else {
-        println!(
-            "  🧹 generated     {} of build output with no .wt0-generated policy → gc cannot reclaim it — `wt0 init generated` proposes one",
-            human_bytes(generated_total)
-        );
-    }
+/// Last-resort rendering for a step `plain_steps` doesn't recognize by
+/// title — prints the JSON step's own fields rather than silently dropping
+/// a step a future `doctor_steps` change might add.
+fn fallback_block(step: &Value) -> Vec<String> {
+    vec![
+        format!(
+            "{}: {}",
+            step["title"].as_str().unwrap_or("next step"),
+            step["command_or_config"].as_str().unwrap_or("")
+        ),
+        format!("      → {}", step["payoff"].as_str().unwrap_or("")),
+    ]
 }
 
-fn print_seed_line(root: &Path, seed_paths: usize) {
-    if seed_paths > 0 {
-        println!("  📚 seeds         {seed_paths} path(s) in .wt0-seed");
-        return;
-    }
-    let preview = seed_preview(root);
-    if preview.is_empty() {
-        println!("  📚 seeds         no .wt0-seed");
+/// The exact before/after bytes `doctor_steps`'s native-store step already
+/// computes, recomputed here from the same inputs so the plain-language
+/// block's numbers always match the `--json` payoff without parsing it.
+fn native_store_savings(tracked: &TrackedStats, node_modules_files: u64) -> (u64, u64) {
+    let before = node_modules_files * worktree::CLONED_FILE_METADATA_BYTES;
+    let checkout_marginal = tracked.files * TRACKED_FILE_CLONE_METADATA_BYTES;
+    let after = NATIVE_STORE_WT0_MARGINAL_BYTES.saturating_sub(checkout_marginal);
+    (before, after)
+}
+
+fn native_store_block_bun(tracked: &TrackedStats, node_modules_files: u64) -> Vec<String> {
+    let (before, after) = native_store_savings(tracked, node_modules_files);
+    vec![
+        "Turn on Bun's shared package store — packages live in one place and every worktree links to"
+            .to_owned(),
+        "      them. Add to bunfig.toml:".to_owned(),
+        "          [install]".to_owned(),
+        "          linker = \"isolated\"".to_owned(),
+        "          globalStore = true        (needs Bun 1.3.14 or newer)".to_owned(),
+        format!(
+            "      → node_modules per worktree: {} → {}, and installs get faster.",
+            human_bytes_rounded(before),
+            human_bytes_rounded(after)
+        ),
+    ]
+}
+
+fn native_store_block_yarn(tracked: &TrackedStats, node_modules_files: u64) -> Vec<String> {
+    let (before, after) = native_store_savings(tracked, node_modules_files);
+    vec![
+        "Turn on Yarn's shared package store — packages live in one place and every worktree just links"
+            .to_owned(),
+        "      to them. Add to .yarnrc.yml:".to_owned(),
+        "          nodeLinker: pnpm".to_owned(),
+        format!(
+            "      → node_modules per worktree: {} → {}, and installs get faster.",
+            human_bytes_rounded(before),
+            human_bytes_rounded(after)
+        ),
+    ]
+}
+
+fn native_store_block_npm(tracked: &TrackedStats, node_modules_files: u64) -> Vec<String> {
+    let (before, after) = native_store_savings(tracked, node_modules_files);
+    vec![
+        "Switch to a package manager with a shared package store — npm copies every package into every"
+            .to_owned(),
+        "      worktree's node_modules folder from scratch. Run: corepack use pnpm@latest".to_owned(),
+        "      (or switch to Bun and turn on its shared store).".to_owned(),
+        format!(
+            "      → node_modules per worktree: {} → {} once you're on a shared store.",
+            human_bytes_rounded(before),
+            human_bytes_rounded(after)
+        ),
+    ]
+}
+
+fn native_store_block_other(
+    manager: &str,
+    tracked: &TrackedStats,
+    node_modules_files: u64,
+) -> Vec<String> {
+    let (before, after) = native_store_savings(tracked, node_modules_files);
+    vec![
+        format!(
+            "Switch {manager} to a package manager with a shared package store, so packages are stored"
+        ),
+        "      once on this machine and each worktree gets links to them instead of a full copy."
+            .to_owned(),
+        format!(
+            "      → node_modules per worktree: {} → {} once you're on a shared store.",
+            human_bytes_rounded(before),
+            human_bytes_rounded(after)
+        ),
+    ]
+}
+
+fn prepare_block() -> Vec<String> {
+    vec![
+        "Seal this worktree's dependencies so future worktrees can share them instead of installing"
+            .to_owned(),
+        "      from scratch. Run: wt0 prepare --apply".to_owned(),
+        "      → the next `wt0 create` in this repository starts with dependencies already in place."
+            .to_owned(),
+    ]
+}
+
+fn generated_missing_policy_block(generated_total: u64) -> Vec<String> {
+    let payoff = if generated_total > 0 {
+        format!(
+            "      → `wt0 gc` can then reclaim {} from abandoned worktrees.",
+            human_bytes_rounded(generated_total)
+        )
     } else {
-        println!(
-            "  📚 seeds         no .wt0-seed — `wt0 init seed` proposes {}",
-            preview
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(" and ")
-        );
-    }
+        "      → `wt0 gc` can then review build output here safely.".to_owned()
+    };
+    vec![
+        "Tell wt0 which build folders are disposable (things like .nx, .next, dist — safe to delete"
+            .to_owned(),
+        "      once a worktree is done). Run: wt0 init generated --apply, then review the".to_owned(),
+        "      .wt0-generated file it writes.".to_owned(),
+        payoff,
+    ]
+}
+
+fn generated_over_budget_block(generated_total: u64) -> Vec<String> {
+    vec![
+        format!(
+            "The reviewed build output here ({}) is over wt0's default {} safety cap.",
+            human_bytes_rounded(generated_total),
+            human_bytes_rounded(DEFAULT_GENERATED_BUDGET_BYTES)
+        ),
+        "      Trim what's listed in .wt0-generated, or run `wt0 gc --apply` to reclaim some of it now."
+            .to_owned(),
+    ]
+}
+
+fn tilt_fix_block() -> Vec<String> {
+    vec![
+        "Give this repository's Tilt setup its own ports and hostnames per worktree, so two agents"
+            .to_owned(),
+        "      running Tilt at the same time don't collide. Run: wt0 init tilt (dry run; add --apply"
+            .to_owned(),
+        "      to write it).".to_owned(),
+        "      → every worktree's Tilt UI, ports, and *.localhost routes become collision-free."
+            .to_owned(),
+    ]
+}
+
+fn seed_step_block(preview: &[PathBuf]) -> Vec<String> {
+    let names = preview
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" and ");
+    vec![
+        "Start every worktree with a warm build cache instead of a cold one. Run: wt0 init seed --apply"
+            .to_owned(),
+        format!(
+            "      → copies {names} from your main checkout into each new worktree, free (copy-on-write)."
+        ),
+    ]
 }
 
 /// A cheap, best-effort preview of what `wt0 init seed` would propose — the
 /// full candidate scan lives in `init::propose_seed`; this only decides
-/// whether `doctor`'s one-line teaser has something to name.
+/// whether the "what to do next" list has a seed suggestion to add.
 fn seed_preview(root: &Path) -> Vec<PathBuf> {
     let mut preview = Vec::new();
     for candidate in [".next/cache", ".nx/cache", ".turbo"] {
@@ -760,24 +1071,6 @@ fn seed_preview(root: &Path) -> Vec<PathBuf> {
         }
     }
     preview
-}
-
-fn manager_summary(manager: Option<&str>, store: &Option<NativeStore>) -> Option<String> {
-    let manager = manager?;
-    let label = match manager {
-        "bun" => "Bun",
-        "npm" => "npm",
-        "yarn" => "Yarn",
-        "pnpm" => "pnpm",
-        other => other,
-    };
-    Some(match store {
-        Some(NativeStore::BunGlobalStore) => format!("{label}, global store"),
-        Some(NativeStore::Pnpm) => format!("{label}, content-addressable store"),
-        Some(NativeStore::YarnPnpmLinker) => format!("{label}, nodeLinker: pnpm"),
-        Some(NativeStore::YarnPnp) => format!("{label}, PnP"),
-        _ => format!("{label}, hoisted (no global store)"),
-    })
 }
 
 fn filesystem_display_name() -> &'static str {
@@ -2859,7 +3152,7 @@ fn javascript_package_manager(root: &Path) -> Result<Option<String>> {
     Ok(detected.first().map(|manager| (*manager).to_owned()))
 }
 
-fn git_root(requested: &Path) -> Result<PathBuf> {
+pub(crate) fn git_root(requested: &Path) -> Result<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(requested)

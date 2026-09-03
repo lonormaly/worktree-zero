@@ -378,6 +378,236 @@ fn doctor_before_after_report_adds_estimate_tooling_and_steps() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// `wt0` (no subcommand) and `wt0 doctor`'s plain-language report (D15):
+/// every wt0-internal term the maintainer flagged as unreadable jargon
+/// ("hoisted (no global store)", "native link-tree store", "generated
+/// state", "seed —") is gone from the human report, replaced by a numbered
+/// "what to do next" list a newcomer — human or agent — can act on without
+/// reading any documentation. `--json` (asserted above) is untouched.
+#[test]
+fn doctor_report_is_plain_language_for_a_bun_repo_with_a_pinned_tilt_port() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-plain-doctor-bun-tilt-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    fs::write(repo.join("bun.lock"), "{}\n").expect("write lockfile");
+    fs::write(repo.join("package.json"), "{\"name\":\"fixture\"}\n").expect("write manifest");
+    fs::create_dir_all(repo.join("node_modules/pkg")).expect("create node_modules");
+    fs::write(repo.join("node_modules/pkg/index.js"), "1\n").expect("write package file");
+    fs::write(
+        repo.join("Tiltfile"),
+        "k8s_resource('web', port_forwards='10350:3000')\n",
+    )
+    .expect("write Tiltfile");
+    git(
+        &repo,
+        &[
+            "add",
+            "-f",
+            ".gitignore",
+            "bun.lock",
+            "package.json",
+            "Tiltfile",
+        ],
+    );
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    // No subcommand at all — Part 2's default behavior — reuses the exact
+    // same report and exit code as `wt0 doctor`.
+    let report = Command::new(wt0)
+        .current_dir(&repo)
+        .output()
+        .expect("wt0 with no subcommand");
+    assert_eq!(report.status.code(), Some(1), "{report:?}");
+    let text = String::from_utf8(report.stdout).expect("UTF-8 report");
+
+    // No internal term without its plain meaning on the same line — the
+    // exact phrases the maintainer named as unreadable must not reappear.
+    for jargon in [
+        "hoisted (no global store)",
+        "native link-tree store",
+        "🧹 generated",
+        "📚 seeds",
+        "no .wt0-seed",
+        "❌ not ready",
+        "Worktree Zero doctor —",
+    ] {
+        assert!(
+            !text.contains(jargon),
+            "found jargon {jargon:?} in:\n{text}"
+        );
+    }
+
+    // Plain-language landmarks from the target shape must be present.
+    assert!(text.contains("wt0 — Worktree Zero"), "{text}");
+    assert!(text.contains("📦 This repository"), "{text}");
+    assert!(
+        text.contains("💾 What one agent's worktree costs"),
+        "{text}"
+    );
+    assert!(text.contains("🚀 What to do next"), "{text}");
+    assert!(
+        text.contains("Turn on Bun's shared package store"),
+        "{text}"
+    );
+    assert!(text.contains("two agents"), "{text}");
+    assert!(text.contains("wt0 faq"), "{text}");
+
+    // Every physical line stays within the agreed terminal width — except
+    // the repository path line, whose width is the caller's own filesystem
+    // path, not wt0's wording (this fixture's temp path is deliberately
+    // long; a real repository path is usually much shorter, as it is for
+    // Laor and FLAM in the maintainer's own runs).
+    for line in text.lines() {
+        if line.starts_with("📦 This repository") {
+            continue;
+        }
+        assert!(
+            line.chars().count() <= 100,
+            "line exceeds 100 columns ({}): {line:?}",
+            line.chars().count()
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A repository with nothing to fix (a native package-manager store already
+/// active, a reviewed `.wt0-generated` policy, no Tilt setup) gets the
+/// short "nothing to fix" form instead of an empty numbered list.
+#[test]
+fn doctor_report_says_nothing_to_fix_for_a_clean_pnpm_repo() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-plain-doctor-clean-pnpm-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").expect("write lockfile");
+    fs::write(repo.join("package.json"), "{\"name\":\"fixture\"}\n").expect("write manifest");
+    // Nothing here is actually disposable yet; the policy only needs one
+    // reviewed entry for `doctor` to stop proposing one.
+    fs::write(repo.join(".wt0-generated"), "dist\n").expect("write generated policy");
+    git(
+        &repo,
+        &[
+            "add",
+            "-f",
+            ".gitignore",
+            "pnpm-lock.yaml",
+            "package.json",
+            ".wt0-generated",
+        ],
+    );
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    // pnpm's own store resolves node_modules on its own — `dependency_facts`
+    // only needs the directory to exist, not a real install.
+    fs::create_dir_all(repo.join("node_modules")).expect("create node_modules");
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let report = Command::new(wt0)
+        .current_dir(&repo)
+        .output()
+        .expect("wt0 doctor");
+    assert!(
+        report.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let text = String::from_utf8(report.stdout).expect("UTF-8 report");
+    assert!(
+        text.contains("✅ Nothing to fix — start with: wt0 create"),
+        "{text}"
+    );
+    assert!(!text.contains("🚀 What to do next"), "{text}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// `wt0` (no subcommand) outside any Git repository: a short, friendly
+/// redirect instead of doctor's usual "not inside a Git worktree" error —
+/// Part 2's specified exit code 2, distinct from doctor's own exit 1.
+#[test]
+fn wt0_outside_a_git_repository_prints_the_intro_and_exits_2() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-plain-doctor-non-git-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create plain directory");
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let report = Command::new(wt0)
+        .current_dir(&root)
+        .output()
+        .expect("wt0 outside a git repository");
+    assert_eq!(report.status.code(), Some(2), "{report:?}");
+    let text = String::from_utf8(report.stdout).expect("UTF-8 report");
+    assert!(text.contains("wt0 — Worktree Zero"), "{text}");
+    assert!(
+        text.contains("Run this inside a Git repository, or: wt0 faq"),
+        "{text}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// `wt0 faq` prints the full embedded FAQ; a topic argument filters to
+/// matching questions only, and an unmatched topic says so instead of
+/// silently printing nothing or the full list.
+#[test]
+fn wt0_faq_prints_and_filters_by_topic() {
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+
+    let full = Command::new(wt0).arg("faq").output().expect("wt0 faq");
+    assert!(full.status.success());
+    let full_text = String::from_utf8(full.stdout).expect("UTF-8 faq");
+    assert!(full_text.contains("What is a worktree"), "{full_text}");
+    assert!(full_text.contains("Windows?"), "{full_text}");
+
+    let costs = Command::new(wt0)
+        .args(["faq", "costs"])
+        .output()
+        .expect("wt0 faq costs");
+    assert!(costs.status.success());
+    let costs_text = String::from_utf8(costs.stdout).expect("UTF-8 faq costs");
+    assert!(costs_text.contains("cost"), "{costs_text}");
+    assert!(!costs_text.contains("Windows?"), "{costs_text}");
+
+    let unmatched = Command::new(wt0)
+        .args(["faq", "xyzzy"])
+        .output()
+        .expect("wt0 faq xyzzy");
+    assert!(unmatched.status.success());
+    let unmatched_text = String::from_utf8(unmatched.stdout).expect("UTF-8 faq xyzzy");
+    assert!(
+        unmatched_text.contains("no question mentions"),
+        "{unmatched_text}"
+    );
+}
+
 /// `wt0 init generated|seed|tilt`: dry run by default, writes only with
 /// `--apply`, and never overwrites an existing file without `--force`.
 #[test]

@@ -4,18 +4,44 @@
 what it changes, with identities that never collide and cleanup that cannot
 destroy work.**
 
-`wt0` is one command between your agent fleet and Git:
+Each agent gets its own copy of your repository (a "worktree") in about a
+second, sharing files with your main checkout instead of copying them.
+
+### Install
+
+```bash
+brew tap lonormaly/wt0
+brew install wt0                   # macOS and Linux, prebuilt + checksummed
+npm i -g worktree-zero             # installs the `wt0` command; or: npx worktree-zero doctor
+```
+
+### First command
+
+```bash
+wt0
+```
+
+Run with no arguments inside a Git repository, `wt0` reports what a
+worktree costs in this repository today, what changes with wt0, and exactly
+what to do next — the same report `wt0 doctor` prints (see "First run"
+below for a real example). `wt0 faq` answers common questions in plain
+language.
+
+From there, `wt0` is one command between your agent fleet and Git:
 
 ```bash
 wt0 run agent/fix-checkout -- codex exec "fix the checkout bug"
 ```
 
 That call creates a real linked worktree whose unchanged files are
-copy-on-write clones of one canonical baseline, prepares dependencies from
-shared immutable stores, hands the runtime identities no other agent collides
-with (a slot, a machine-unique port window, a Compose project name), runs the
-command under a heartbeat lease, and leaves behind ownership evidence so the
-whole runtime can be reclaimed safely later — even after a crash.
+copy-on-write clones — files that share disk space with one canonical copy
+of your checkout until one of them is edited — prepares dependencies from
+shared immutable stores, hands the runtime identities no other agent
+collides with (a slot — a small per-worktree index; a machine-unique port
+window; a Compose project name), runs the command under a heartbeat lease
+(a claim on the worktree the agent renews every 30 seconds, so wt0 can tell
+a live agent from an abandoned one), and leaves behind ownership evidence so
+the whole runtime can be reclaimed safely later — even after a crash.
 
 > Status: design-partner phase with checksummed macOS, Linux, and
 > experimental Windows releases (ReFS/Dev Drive block-clone CoW, plain NTFS
@@ -66,9 +92,10 @@ and "Verification — hoisted node_modules per-worktree cost"),
 - A seeded `.next/cache` survives an edit and rebuild 4× faster and 85%
   smaller than a cold one — 622 ms/4.3 MiB versus 2.5 s/28.5 MiB
   ([drift.md](docs/design-partners/drift.md)).
-- The first worktree of a base commit always pays a one-time baseline —
-  517 MiB, measured on FLAM with a warm store — before any later worktree of
-  that commit clones for single-digit MiB
+- The first worktree of a base commit always pays a one-time baseline (wt0's
+  single shared, canonical copy of that commit's checkout, that every later
+  worktree clones from) — 517 MiB, measured on FLAM with a warm store —
+  before any later worktree of that commit clones for single-digit MiB
   ([flam-migration.md](docs/design-partners/flam-migration.md)).
 
 ## The problem
@@ -93,8 +120,9 @@ Zero runtime cost about 10 MiB — a **97% reduction in marginal storage** —
 and the fourth worktree still passed the repository's real test suite.
 
 That first-worktree row (-2.0%, essentially parity with native) predates
-deriving the baseline and the first prepared environment from the base
-checkout instead of a second physical copy of it
+deriving the baseline (the shared, canonical checkout described above) and
+the first prepared environment (a sealed, shareable copy of installed
+dependencies) from the base checkout instead of a second physical copy of it
 ([`flam-migration.md`](docs/design-partners/flam-migration.md#after---d13---the-first-worktree-2026-09-02)):
 measured on FLAM, the first worktree of a base commit now costs 15.7 MiB
 against a native 509 MiB.
@@ -233,14 +261,6 @@ and portable skill are the same implementation:
   paths are exercised — asserting disjoint slots, disjoint port windows,
   single-owner contended creates, and a corruption-free registry.
 
-### Install
-
-```bash
-brew tap lonormaly/wt0
-brew install wt0                   # macOS and Linux, prebuilt + checksummed
-npm i -g worktree-zero             # installs the `wt0` command; or: npx worktree-zero doctor
-```
-
 ### Install for an agent
 
 ```bash
@@ -268,34 +288,61 @@ cleanup or weaken a refusal.
 
 ### First run
 
-`wt0 doctor` is the one command that answers whether the promise holds here —
-a before/after cost table, the tooling it detected, and the exact steps that
-close the gap. A real run against a design partner's repository, example:
+Running `wt0` with no arguments (or `wt0 doctor`) answers whether the
+promise holds here in plain language a newcomer — human or agent — can act
+on without reading any of this document: what a worktree costs in this
+repository today, what changes with wt0, and exactly what to do next. A
+real run against a design partner's repository, example:
 
 ```text
-Worktree Zero doctor — /path/to/your-repo
+wt0 — Worktree Zero · cheap, isolated Git worktrees for coding agents
 
-  📦 repository    1.6 MiB tracked in 316 files · Bun, hoisted (no global store) · node_modules 70,124 files
-  🖥️ filesystem    APFS · copy-on-write ✅
-  🛠️ tooling       Nx · Tilt · Portless · docker-compose
+  Each agent gets its own copy of your repository (a "worktree") in about a second, sharing
+  files with your main checkout instead of copying them. Below: what a worktree costs in this
+  repository today, what changes with wt0, and what to do next.
 
-  💾 what a worktree costs here                 today                      with wt0
-     one worktree, ready to work                 ≈ 138.6 MiB                 ≈ 26.9 MiB
-     ten agents                                   ≈ 1.35 GiB                  ≈ 295.6 MiB
-     with a native link-tree store (one config line)                       ≈ 7.0 MiB each  ← recommended
-     ≈ estimated from this repo's file counts and the per-file costs measured on FLAM (docs/design-partners/flam-migration.md); basis: estimated
+📦 This repository  /path/to/your-repo
+   1.6 MiB of tracked files (316 files) · Bun with a plain node_modules folder (70,124 files)
+   Nx · Tilt · Portless · docker-compose
+   Filesystem: APFS — copy-on-write available ✅ (worktrees share files at no extra disk cost)
 
-  ⚡ speed         create ≈ 1–2 s (one whole-tree clonefile), first git status instant (adopted index)
-  🔌 ports         every worktree gets a 100-port window (WT0_PORT_BASE) and a slug (WT0_SLUG)
-  🎛️ tilt          Tiltfile pins port 1355, 8765, … and 8 hostnames → two agents collide
-                   fix: TILT_PORT="${WT0_PORT_BASE}", route names "<role>-${WT0_SLUG}" — `wt0 init tilt` writes it
-  🧹 generated     981.7 MiB of build output with no .wt0-generated policy → gc cannot reclaim it — `wt0 init generated` proposes one
-  📚 seeds         no .wt0-seed — `wt0 init seed` proposes .nx/cache
+💾 What one agent's worktree costs
+                                       today (git worktree add + bun install)      with wt0
+   one worktree, ready to work          ≈ 139 MiB                     ≈ 27 MiB
+   ten agents                           ≈ 1.4 GiB                     ≈ 0.3 GiB
+   with Bun's shared package store on (step 1 below)                                ≈ 7 MiB each
+   Estimates: this repository's file counts × per-file costs measured on a 236,000-file
+   monorepo. `wt0 faq costs` explains.
 
-  ❌ not ready — 3 steps
-     1. bunfig.toml  [install] linker = "isolated", globalStore = true  (Bun ≥ 1.3.14)   26.8 MiB → 6.9 MiB per worktree
-     2. generated state  wt0 init generated   then review .wt0-generated   gc can reclaim 981.7 MiB
-     3. tilt  wt0 init tilt   ports and hostnames from WT0_PORT_BASE / WT0_SLUG
+⚡ Speed   a worktree is ready in ≈ 1–2 s, and `git status` inside it is instant.
+🔌 Ports   each worktree gets its own 100-port range and a short name, so agents never collide.
+
+🎛️ Tilt    your Tiltfile hard-codes 9 ports and 8 hostnames — two agents
+           running Tilt at once will collide.
+🧹 Build output   982 MiB of ignored build files (.nx, dist, …). wt0 never deletes files it has
+                  not been told are disposable, so a short list of those folders is needed
+                  before `wt0 gc` can reclaim this space.
+
+🚀 What to do next
+   1. Turn on Bun's shared package store — packages live in one place and every worktree links to
+      them. Add to bunfig.toml:
+          [install]
+          linker = "isolated"
+          globalStore = true        (needs Bun 1.3.14 or newer)
+      → node_modules per worktree: 27 MiB → 7 MiB, and installs get faster.
+   2. Tell wt0 which build folders are disposable (things like .nx, .next, dist — safe to delete
+      once a worktree is done). Run: wt0 init generated --apply, then review the
+      .wt0-generated file it writes.
+      → `wt0 gc` can then reclaim 982 MiB from abandoned worktrees.
+   3. Give this repository's Tilt setup its own ports and hostnames per worktree, so two agents
+      running Tilt at the same time don't collide. Run: wt0 init tilt (dry run; add --apply
+      to write it).
+      → every worktree's Tilt UI, ports, and *.localhost routes become collision-free.
+   4. Start every worktree with a warm build cache instead of a cold one. Run: wt0 init seed --apply
+      → copies .nx/cache from your main checkout into each new worktree, free (copy-on-write).
+
+   Then:  wt0 create <branch> --owner <you-or-agent-id>   ·   wt0 fleet   ·   wt0 remove <path>
+   More:  wt0 faq   ·   https://github.com/lonormaly/worktree-zero#faq
 ```
 
 `wt0 init` writes the setup `doctor` just recommended, instead of you (or an
@@ -423,6 +470,13 @@ Worktree Zero is not stable until a new agent integration can:
 
 ## FAQ
 
+The full FAQ — every question below plus the ones newcomers ask most
+("What is a worktree?", "What does 'shared package store' mean?", "What
+does wt0 delete, and when?", "Do I need Tilt/Bun/a shared store at all?",
+and more) — lives in [`docs/faq.md`](docs/faq.md), the same text
+`wt0 faq` prints (`wt0 faq costs`, `wt0 faq ports`, `wt0 faq safety`,
+`wt0 faq tilt` filter it by topic). The short version:
+
 - **`npx wt0` says 404.** The npm package is `worktree-zero` — the registry
   refuses the bare name `wt0` as too similar to existing short packages —
   but the installed command is still `wt0`. Use `npx worktree-zero …` or
@@ -432,77 +486,32 @@ Worktree Zero is not stable until a new agent integration can:
   it anywhere. Editors that skip dot-directories in their file tree need to
   be pointed at it explicitly.
 - **What does a worktree cost?** The checkout is a copy-on-write clone — a
-  few MiB regardless of checkout size (see the table above). Dependencies
-  cost what the manager's layout costs: a link tree (pnpm, Bun
-  `globalStore`) ~3–7 MiB; a seeded or attached hoisted tree about 400 B of
-  filesystem metadata per file for wt0's own whole-directory clone, against
-  ~2 KB per file for a native per-file install — measured on a 236k-file
-  tree at 89 MiB marginal per worktree, 179 MiB for the one-time first seal
-  (`docs/design-partners/flam-migration.md`'s "Verification — hoisted
-  node_modules per-worktree cost"). The first worktree of a base commit
-  costs about the same as the second
-  ([D13](docs/design-partners/flam-migration.md#after---d13---the-first-worktree-2026-09-02)).
-- **Why is Bun's global store (or pnpm) still recommended if wt0 shares
-  files?** Copy-on-write shares blocks, not inodes: a 236k-file hoisted
-  `node_modules` still needs 236k inodes per worktree. A link tree makes it
-  ~12k symlinks instead. wt0 detects the mode, and `doctor` prints the one
-  config line that closes the gap.
-- **Will an agent's `npm install` inside a worktree break the sharing?** No —
-  measured: adding a package writes the package (~5 MiB for lodash), never
-  the tree; a seeded `.next/cache` survives an edit and rebuild 4× faster
-  and 85% smaller than a cold one
-  ([drift.md](docs/design-partners/drift.md)).
-- **Will it delete my work?** `gc` and `remove` refuse dirty trees, unmerged
-  branches, unowned worktrees, detached commits, and unknown ignored state,
-  and a live process blocks removal outright; `--force` is explicit, and a
-  `pre-remove` hook can veto even that. Removal never touches `.immorterm`
-  or user data.
-- **What are slots, port windows, `WT0_SLUG`?** A slot is a small index per
-  live worktree; a port window is 100 ports (20000+) claimed machine-wide
-  with a bind probe; the slug is a URL-safe branch label. Hooks and
-  `wt0 run` see them as `WT0_SLOT`, `WT0_PORT_BASE`, `WT0_SLUG` — use them
-  for dev-server ports and portless hostnames (FLAM and Builders Stack
-  derive their Tilt port and hostnames from them; see the
-  [Tilt integration](integrations/tilt/README.md)).
-- **What happens when an agent crashes?** The lease stops refreshing;
-  `wt0 gc --idle` reaps the worktree, frees its slot and ports, and retires
-  its generated state; an `rm -rf` is recovered by `wt0 prune` as an orphan
-  with its runtime id
-  ([orphans](docs/lifecycle.md#orphans-a-checkout-that-vanished-outside-wt0)).
+  few MiB regardless of checkout size (see the table above and `wt0 doctor`
+  for this repository's own numbers). Installed dependencies cost what your
+  package manager's layout costs — see `wt0 faq costs` for the full
+  breakdown.
+- **Will it delete my work?** No — `gc` and `remove` refuse dirty trees,
+  unmerged branches, worktrees they don't own, and any ignored file they
+  don't recognize as safe build output; a live process blocks removal
+  outright. See `wt0 faq safety` for exactly what's refused and what's
+  reclaimed.
+- **What happens when an agent crashes?** Its lease (a claim it renews every
+  30 seconds) goes stale; `wt0 gc --idle` reaps the worktree and frees
+  its port range, and `wt0 prune` recovers a worktree that vanished outside
+  wt0 entirely (`rm -rf`, a wiped volume) as a tracked orphan.
 - **How do I clean up old worktrees?** `wt0 fleet --idle 7d` shows what's
-  been sitting idle at least that long, with its merged/dirty/live status so
-  you can tell what's actually safe to drop. `wt0 gc --idle 7d` reaps
-  worktrees idle that long (dry run by default; `--apply` to remove). Add
-  `--merged` for "merged and forgotten": `wt0 gc --merged --idle 0s` reaps
-  every merged, clean, non-live worktree regardless of age, and
-  `wt0 gc --merged --idle 7d` combines both — merged *and* idle a week.
-  `wt0 remove --merged [--idle <duration>] [--owner <id>]` does the same
-  removal immediately, printing one receipt per worktree. `--owner <id>`
-  narrows any of these to one agent's runtimes. See
-  [Garbage collection](docs/lifecycle.md#garbage-collection).
+  idle, merged, dirty, and live so you know what's safe to drop; `wt0 gc
+  --merged --idle 0s` reaps everything already merged and forgotten,
+  regardless of age; `wt0 remove --merged` does the same removal
+  immediately. See `wt0 faq cleanup` for every selector.
+- **Is `doctor`'s "what to do next" list a blocker?** No — `wt0 create`
+  works regardless. Its exit code reflects only whether dependencies are
+  shared and build output is within a safe size budget; the list is a
+  broader wish-list on top of that.
 - **Windows?** ReFS/Dev Drive gives copy-on-write, and the storage numbers
   hold (9.8 MiB per worktree in CI). `wt0 create` is slower there today
-  (per-file cloning; the CI receipt shows the current number). NTFS falls
-  back to a plain checkout and says so.
-- **Is `doctor` "not ready" a blocker?** No — `create` works regardless;
-  `ready`/the exit code mean dependencies are shared and generated state is
-  within budget. `doctor`'s "❌ not ready — N steps" header is a broader
-  worklist — it also counts a Tilt setup that doesn't yet derive ports from
-  wt0, which does not block `ready`. `create` prints the next step when
-  dependencies or generated state aren't there yet, and `wt0 init` writes
-  every step's fix.
-- **What's an owner?** A free-form label — an agent id, a person, a CI job —
-  passed as `--owner` or `$WT0_OWNER`, stored in the runtime's lease, shown
-  by `wt0 fleet`, and exported to lifecycle hooks as `WT0_OWNER`. Projects
-  stamp it into external resources: FLAM's `.wt0/hooks/post-create` records
-  it alongside the runtime id so a tenant database or namespace can be traced
-  back to who created it.
-- **Does wt0 create databases?** No. wt0 gives every runtime an id, a slug,
-  and a port window — nothing project-specific. A project's own
-  `post-create` hook creates a per-runtime database or namespace from those
-  identities (FLAM's does: `createdb`/tenant provisioning keyed by
-  `WT0_RUNTIME_ID`), and `pre-remove` retires it. See
-  [project lifecycle hooks](docs/lifecycle.md#project-lifecycle-hooks).
+  (files are cloned one at a time). Plain NTFS falls back to an ordinary
+  checkout and says so.
 - **What is simgit?** The copy-on-write engine wt0 started from, included
   under its MIT license with history; wt0 adds everything around it (see
   [Origins](#origins) below).
