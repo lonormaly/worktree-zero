@@ -1128,11 +1128,12 @@ fn seeding_clones_any_node_modules_behind_an_identical_lockfile() {
     );
     git(&repo, &["commit", "-q", "-m", "no lockfile yet"]);
 
-    // Enough small files that the tree's metadata cost passes the 20 MiB
-    // bar doctor speaks up at (~2 KB per file).
+    // Enough small files that wt0's own clone cost passes the 20 MiB bar
+    // doctor speaks up at (~400 B/file, settled in
+    // docs/design-partners/flam-migration.md's "Verification" section).
     let package = repo.join("node_modules/pkg");
     fs::create_dir_all(&package).expect("create the package directory");
-    for i in 0..10_500 {
+    for i in 0..53_000 {
         fs::write(package.join(format!("f{i}.js")), "1\n").expect("write a package file");
     }
 
@@ -1184,7 +1185,7 @@ fn seeding_clones_any_node_modules_behind_an_identical_lockfile() {
     let receipt = create("agent/matched", None, &matched);
     let modules = seed_of(&receipt, "node_modules");
     if modules["status"] == "seeded" {
-        assert_eq!(modules["files"], 10_500, "{modules}");
+        assert_eq!(modules["files"], 53_000, "{modules}");
         assert_eq!(
             fs::read_to_string(matched.join("node_modules/pkg/f7.js")).expect("seeded file"),
             "1\n"
@@ -1209,9 +1210,19 @@ fn seeding_clones_any_node_modules_behind_an_identical_lockfile() {
         .expect("recommendations")
         .iter()
         .filter_map(|item| item.as_str())
-        .find(|item| item.contains("10500 files"))
+        .find(|item| item.contains("53000 files"))
         .unwrap_or_else(|| panic!("no metadata advice in {doctor}"));
-    assert!(advice.contains("20 MiB of filesystem metadata"), "{advice}");
+    // The 20 MiB bar is wt0's own clone cost (~400 B/file); the native-install
+    // figure (~2 KB/file) is shown alongside it for context, not the trigger.
+    assert!(
+        advice.contains("a native install pays about") && advice.contains("(~2 KB/file measured)"),
+        "{advice}"
+    );
+    assert!(
+        advice.contains("a wt0 seed or attach about") && advice.contains("(~400 B/file)"),
+        "{advice}"
+    );
+    assert!(advice.contains("under 20 MiB"), "{advice}");
 
     let _ = fs::remove_dir_all(root);
 }

@@ -357,9 +357,10 @@ Worktree Zero is not stable until a new agent integration can:
 - **What does a worktree cost?** The checkout is a copy-on-write clone — a
   few MiB regardless of checkout size (see the table above). Dependencies
   cost what the manager's layout costs: a link tree (pnpm, Bun
-  `globalStore`) ~3–7 MiB; a seeded hoisted tree about 2 KB of filesystem
-  metadata per file. The first worktree of a base commit costs about the
-  same as the second
+  `globalStore`) ~3–7 MiB; a seeded or attached hoisted tree about 400 B of
+  filesystem metadata per file — measured on a 236k-file tree at 89 MiB
+  marginal per worktree, 179 MiB for the one-time first seal. The first
+  worktree of a base commit costs about the same as the second
   ([D13](docs/design-partners/flam-migration.md#after---d13---the-first-worktree-2026-09-02)).
 - **Why is Bun's global store (or pnpm) still recommended if wt0 shares
   files?** Copy-on-write shares blocks, not inodes: a 236k-file hoisted

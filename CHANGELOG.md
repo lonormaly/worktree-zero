@@ -135,6 +135,28 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   surfaced as a contradictory pair of lines. The verdict's shortfalls also
   now include "generated state exceeds the default budget (...)" when that
   is the only reason `ready` is `no`, instead of misreporting `holds`.
+- **`doctor`'s per-file metadata advice was calibrated against the wrong
+  clone.** `CLONED_FILE_METADATA_BYTES` (2 KB/file) was measured against a
+  file-by-file clone script, not wt0's own whole-directory `clonefile` —
+  independently re-verified this session at ≈400 B/file (two measurements
+  within 1% of each other; see
+  `docs/design-partners/flam-migration.md`, "Verification — hoisted
+  node_modules per-worktree cost"). It is now
+  `NATIVE_INSTALL_FILE_METADATA_BYTES = 2048` (context: what a plain
+  install costs) and `CLONED_FILE_METADATA_BYTES = 400` (what wt0's own
+  clone costs — the number the 20 MiB advice bar is about). `doctor`'s
+  `node_modules` advice now states both: "a native install pays about
+  X MiB ... (~2 KB/file measured), a wt0 seed or attach about Y MiB
+  (~400 B/file)".
+- **The clone path is no longer silent.** `cow::clone_tree` now returns
+  which mechanism it used — one atomic whole-directory clone, or the
+  entry-by-entry fallback — instead of discarding it: a silent fallback
+  from the cheap path to the expensive one is exactly what made an earlier
+  measurement land 5x higher than the settled number. `wt0 create`'s
+  receipt gains `"clone": "directory" | "per-file"` for the baseline clone
+  and for each `.wt0-seed` entry; `wt0 prepare`'s receipt gains the same
+  field for the attach/seal step. `WT0_TRACE=1` prints every clone's
+  mechanism to stderr as it happens.
 
 ### Fixed
 

@@ -64,6 +64,11 @@ struct DependencyStorage {
 struct PreparedEnvironment {
     key: String,
     action: String,
+    /// How this call's dependency tree was cloned, when it cloned one at
+    /// all: `None` for a cache hit that needed no clone, or an install with
+    /// no compatible parent and no base seed (the manager's own work, not
+    /// wt0's).
+    clone_kind: Option<worktree::cow::CloneKind>,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -310,11 +315,17 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
         _ if modules.is_dir() => worktree::tree_files(&modules),
         _ => 0,
     };
-    let modules_metadata = modules_files * worktree::CLONED_FILE_METADATA_BYTES;
-    if modules_metadata > DEPENDENCY_METADATA_ADVICE_BYTES {
+    // wt0's own clone (seed or attach) is the number the 20 MiB bar is about;
+    // the native-install number is context for why it matters at all — see
+    // `worktree::CLONED_FILE_METADATA_BYTES` and
+    // `worktree::NATIVE_INSTALL_FILE_METADATA_BYTES`.
+    let wt0_metadata = modules_files * worktree::CLONED_FILE_METADATA_BYTES;
+    let native_metadata = modules_files * worktree::NATIVE_INSTALL_FILE_METADATA_BYTES;
+    if wt0_metadata > DEPENDENCY_METADATA_ADVICE_BYTES {
         recommendations.push(format!(
-            "node_modules holds {modules_files} files; every worktree that materializes it pays about {} of filesystem metadata (measured ~2 KB per file on APFS) — a link-tree layout (Bun's global store, pnpm) keeps a tree this size under 20 MiB",
-            format_mib(modules_metadata)
+            "node_modules holds {modules_files} files; a native install pays about {} of filesystem metadata per worktree (~2 KB/file measured), a wt0 seed or attach about {} (~400 B/file) — a link-tree layout (Bun's global store, pnpm) keeps a tree this size under 20 MiB",
+            format_mib(native_metadata),
+            format_mib(wt0_metadata)
         ));
     }
     let dependency_ready = dependency_adapter_shipped
@@ -823,12 +834,15 @@ pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
         NativeStore::YarnPnp => {
             emit_prepare(
                 json_output,
-                &root,
-                false,
-                0,
-                None,
-                None,
-                "Yarn Plug'n'Play or zero-install is already repository-native; no node_modules environment is needed",
+                PrepareReceipt {
+                    root: &root,
+                    applied: false,
+                    bytes: 0,
+                    environment_key: None,
+                    physical_delta: None,
+                    message: "Yarn Plug'n'Play or zero-install is already repository-native; no node_modules environment is needed",
+                    clone_kind: None,
+                },
             )?;
             Ok(())
         }
@@ -902,12 +916,15 @@ fn prepare_bun(root: &Path, apply: bool, json_output: bool) -> Result<()> {
     if !apply {
         emit_prepare(
             json_output,
-            root,
-            false,
-            stale,
-            environment_key.as_deref(),
-            None,
-            "dry run; repeat with --apply after reviewing the exact target",
+            PrepareReceipt {
+                root,
+                applied: false,
+                bytes: stale,
+                environment_key: environment_key.as_deref(),
+                physical_delta: None,
+                message: "dry run; repeat with --apply after reviewing the exact target",
+                clone_kind: None,
+            },
         )?;
         return Ok(());
     }
@@ -939,17 +956,22 @@ fn prepare_bun(root: &Path, apply: bool, json_output: bool) -> Result<()> {
     }
     emit_prepare(
         json_output,
-        root,
-        true,
-        stale,
-        prepared
-            .as_ref()
-            .map(|environment| environment.key.as_str()),
-        Some(i128::from(physical_after) - i128::from(physical_before)),
-        prepared
-            .as_ref()
-            .map(|environment| environment.action.as_str())
-            .unwrap_or("stale dependency layout retired after verification"),
+        PrepareReceipt {
+            root,
+            applied: true,
+            bytes: stale,
+            environment_key: prepared
+                .as_ref()
+                .map(|environment| environment.key.as_str()),
+            physical_delta: Some(i128::from(physical_after) - i128::from(physical_before)),
+            message: prepared
+                .as_ref()
+                .map(|environment| environment.action.as_str())
+                .unwrap_or("stale dependency layout retired after verification"),
+            clone_kind: prepared
+                .as_ref()
+                .and_then(|environment| environment.clone_kind),
+        },
     )
 }
 
@@ -971,12 +993,15 @@ fn prepare_node_environment(
     if !apply {
         emit_prepare(
             json_output,
-            root,
-            false,
-            bytes_to_replace,
-            Some(&key),
-            None,
-            "dry run; repeat with --apply after reviewing the exact target",
+            PrepareReceipt {
+                root,
+                applied: false,
+                bytes: bytes_to_replace,
+                environment_key: Some(&key),
+                physical_delta: None,
+                message: "dry run; repeat with --apply after reviewing the exact target",
+                clone_kind: None,
+            },
         )?;
         return Ok(());
     }
@@ -996,12 +1021,15 @@ fn prepare_node_environment(
     let physical_after = filesystem_free_bytes(root)?;
     emit_prepare(
         json_output,
-        root,
-        true,
-        bytes_to_replace,
-        Some(&prepared.key),
-        Some(i128::from(physical_after) - i128::from(physical_before)),
-        &prepared.action,
+        PrepareReceipt {
+            root,
+            applied: true,
+            bytes: bytes_to_replace,
+            environment_key: Some(&prepared.key),
+            physical_delta: Some(i128::from(physical_after) - i128::from(physical_before)),
+            message: &prepared.action,
+            clone_kind: prepared.clone_kind,
+        },
     )
 }
 
@@ -1027,26 +1055,32 @@ fn prepare_native_store(root: &Path, manager: &str, apply: bool, json_output: bo
     if !stale {
         emit_prepare(
             json_output,
-            root,
-            false,
-            0,
-            None,
-            None,
-            &format!(
-                "native store ({manager}): already installed from the shared store; nothing to seal"
-            ),
+            PrepareReceipt {
+                root,
+                applied: false,
+                bytes: 0,
+                environment_key: None,
+                physical_delta: None,
+                message: &format!(
+                    "native store ({manager}): already installed from the shared store; nothing to seal"
+                ),
+                clone_kind: None,
+            },
         )?;
         return Ok(());
     }
     if !apply {
         emit_prepare(
             json_output,
-            root,
-            false,
-            0,
-            None,
-            None,
-            "dry run; repeat with --apply after reviewing the exact target",
+            PrepareReceipt {
+                root,
+                applied: false,
+                bytes: 0,
+                environment_key: None,
+                physical_delta: None,
+                message: "dry run; repeat with --apply after reviewing the exact target",
+                clone_kind: None,
+            },
         )?;
         return Ok(());
     }
@@ -1066,12 +1100,17 @@ fn prepare_native_store(root: &Path, manager: &str, apply: bool, json_output: bo
     let physical_after = filesystem_free_bytes(root)?;
     emit_prepare(
         json_output,
-        root,
-        true,
-        0,
-        None,
-        Some(i128::from(physical_after) - i128::from(physical_before)),
-        &format!("native store ({manager}): installed from the shared store; nothing to seal"),
+        PrepareReceipt {
+            root,
+            applied: true,
+            bytes: 0,
+            environment_key: None,
+            physical_delta: Some(i128::from(physical_after) - i128::from(physical_before)),
+            message: &format!(
+                "native store ({manager}): installed from the shared store; nothing to seal"
+            ),
+            clone_kind: None,
+        },
     )
 }
 
@@ -1091,12 +1130,15 @@ fn prepare_portable_node_environment(
             return Ok(PreparedEnvironment {
                 key: key.to_owned(),
                 action: "prepared environment already attached".to_owned(),
+                clone_kind: None,
             });
         }
-        attach_portable_node_environment(root, &exact_modules, manager, key, version, false)?;
+        let clone_kind =
+            attach_portable_node_environment(root, &exact_modules, manager, key, version, false)?;
         return Ok(PreparedEnvironment {
             key: key.to_owned(),
             action: "attached exact prepared environment".to_owned(),
+            clone_kind: Some(clone_kind),
         });
     }
     if exact.exists() {
@@ -1109,25 +1151,28 @@ fn prepare_portable_node_environment(
     let platform_identity = platform_identity()?;
     let parent = newest_manager_environment(&family, manager, version, &platform_identity)?;
     let mut derived_from_base = false;
-    if let Some(parent) = &parent {
-        attach_portable_node_environment(
+    let clone_kind = if let Some(parent) = &parent {
+        Some(attach_portable_node_environment(
             root,
             &parent.join("node_modules"),
             manager,
             key,
             version,
             true,
-        )?;
+        )?)
     } else {
-        derived_from_base = seed_node_modules_from_base(root, manager)?;
+        let seed_kind = seed_node_modules_from_base(root, manager)?;
+        derived_from_base = seed_kind.is_some();
         run_package_manager_install(root, manager, version)?;
         write_prepared_marker_for(root, manager, key, version)?;
-    }
+        seed_kind
+    };
     validate_environment_links(root, &root.join("node_modules"))?;
     publish_manager_environment(root, &family, manager, key, version, &platform_identity)?;
     Ok(PreparedEnvironment {
         key: key.to_owned(),
         action: prepared_environment_action(parent.is_some(), derived_from_base),
+        clone_kind,
     })
 }
 
@@ -1159,32 +1204,37 @@ fn prepared_environment_action(has_parent: bool, derived_from_base: bool) -> Str
 /// copy-on-write between the two locations) falls back to the ordinary
 /// from-scratch install, exactly as `wt0 create`'s seed-from-base policy
 /// does for the same reason.
-fn seed_node_modules_from_base(root: &Path, manager: &str) -> Result<bool> {
+fn seed_node_modules_from_base(
+    root: &Path,
+    manager: &str,
+) -> Result<Option<worktree::cow::CloneKind>> {
     let repo = match worktree::discover_repo(root) {
         Ok(repo) => repo,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(None),
     };
     let base = &repo.main_worktree;
     if base.as_path() == root || !worktree::base_node_modules_seed_for_prepare(base, root, manager)
     {
-        return Ok(false);
+        return Ok(None);
     }
     let modules = root.join("node_modules");
     if modules.exists() {
-        return Ok(false);
+        return Ok(None);
     }
-    let seeded = (|| -> Result<()> {
+    let seeded = (|| -> Result<worktree::cow::CloneKind> {
         fs::create_dir(&modules).context("create node_modules for the base-checkout seed")?;
         worktree::cow::clone_tree(&base.join("node_modules"), &modules)
     })();
-    if let Err(error) = seeded {
-        eprintln!(
-            "wt0: could not seed node_modules from the base checkout ({error:#}); installing fresh"
-        );
-        let _ = fs::remove_dir_all(&modules);
-        return Ok(false);
+    match seeded {
+        Ok(clone_kind) => Ok(Some(clone_kind)),
+        Err(error) => {
+            eprintln!(
+                "wt0: could not seed node_modules from the base checkout ({error:#}); installing fresh"
+            );
+            let _ = fs::remove_dir_all(&modules);
+            Ok(None)
+        }
     }
-    Ok(true)
 }
 
 fn attach_portable_node_environment(
@@ -1194,7 +1244,7 @@ fn attach_portable_node_environment(
     key: &str,
     version: &str,
     reconcile: bool,
-) -> Result<()> {
+) -> Result<worktree::cow::CloneKind> {
     let modules = root.join("node_modules");
     let parent = root.parent().context("worktree root has no parent")?;
     let rollback = parent.join(format!(".wt0-environment-rollback-{}", Uuid::now_v7()));
@@ -1202,29 +1252,34 @@ fn attach_portable_node_environment(
     if had_modules {
         fs::rename(&modules, &rollback).context("move dependency tree into exact rollback")?;
     }
-    let attempt = (|| -> Result<()> {
+    let attempt = (|| -> Result<worktree::cow::CloneKind> {
         fs::create_dir(&modules).context("create private prepared-environment view")?;
-        worktree::cow::clone_tree(source_modules, &modules)
+        let clone_kind = worktree::cow::clone_tree(source_modules, &modules)
             .context("attach copy-on-write prepared environment")?;
         if reconcile {
             run_package_manager_install(root, manager, version)?;
         }
         write_prepared_marker_for(root, manager, key, version)?;
-        validate_environment_links(root, &modules)
+        validate_environment_links(root, &modules)?;
+        Ok(clone_kind)
     })();
-    if let Err(error) = attempt {
-        if modules.exists() {
-            fs::remove_dir_all(&modules).context("remove failed prepared-environment view")?;
+    match attempt {
+        Ok(clone_kind) => {
+            if had_modules {
+                fs::remove_dir_all(&rollback).context("retire verified dependency rollback")?;
+            }
+            Ok(clone_kind)
         }
-        if had_modules {
-            fs::rename(&rollback, &modules).context("restore dependency rollback")?;
+        Err(error) => {
+            if modules.exists() {
+                fs::remove_dir_all(&modules).context("remove failed prepared-environment view")?;
+            }
+            if had_modules {
+                fs::rename(&rollback, &modules).context("restore dependency rollback")?;
+            }
+            Err(error.context("prepared-environment attach failed; original tree restored"))
         }
-        return Err(error.context("prepared-environment attach failed; original tree restored"));
     }
-    if had_modules {
-        fs::remove_dir_all(&rollback).context("retire verified dependency rollback")?;
-    }
-    Ok(())
 }
 
 fn run_package_manager_install(root: &Path, manager: &str, version: &str) -> Result<()> {
@@ -1302,15 +1357,33 @@ fn repair_dependency_layout(root: &Path, before: &DependencyStorage) -> Result<(
     }
 }
 
-fn emit_prepare(
-    json_output: bool,
-    root: &Path,
+/// Everything one `wt0 prepare` outcome reports, bundled so `emit_prepare`
+/// doesn't grow another positional bool or `Option` every time it learns to
+/// report one more thing (see `clone_kind`, added alongside the clone-path
+/// visibility work).
+struct PrepareReceipt<'a> {
+    root: &'a Path,
     applied: bool,
     bytes: u64,
-    environment_key: Option<&str>,
+    environment_key: Option<&'a str>,
     physical_delta: Option<i128>,
-    message: &str,
-) -> Result<()> {
+    message: &'a str,
+    /// How this call's dependency tree was cloned, if it cloned one at all —
+    /// `None` when nothing was cloned this call (a dry run, a cache hit, a
+    /// native-store install, or a from-scratch install with no base seed).
+    clone_kind: Option<worktree::cow::CloneKind>,
+}
+
+fn emit_prepare(json_output: bool, receipt: PrepareReceipt) -> Result<()> {
+    let PrepareReceipt {
+        root,
+        applied,
+        bytes,
+        environment_key,
+        physical_delta,
+        message,
+        clone_kind,
+    } = receipt;
     if json_output {
         println!(
             "{}",
@@ -1322,6 +1395,7 @@ fn emit_prepare(
                 "environment_key": environment_key,
                 "physical_free_space_delta_bytes": physical_delta,
                 "message": message,
+                "clone": clone_kind.map(worktree::cow::CloneKind::label),
             }))?
         );
     } else {
@@ -1332,6 +1406,9 @@ fn emit_prepare(
         }
         if let Some(delta) = physical_delta {
             println!("  filesystem free-space delta: {delta} bytes");
+        }
+        if let Some(kind) = clone_kind {
+            println!("  clone: {}", kind.label());
         }
         println!("  {message}");
     }
@@ -1356,12 +1433,14 @@ fn prepare_bun_environment(
             return Ok(PreparedEnvironment {
                 key: key.to_owned(),
                 action: "prepared environment already attached".to_owned(),
+                clone_kind: None,
             });
         }
-        attach_prepared_environment(root, &exact_modules, key, bun_version)?;
+        let clone_kind = attach_prepared_environment(root, &exact_modules, key, bun_version)?;
         return Ok(PreparedEnvironment {
             key: key.to_owned(),
             action: "attached exact prepared environment".to_owned(),
+            clone_kind: Some(clone_kind),
         });
     }
 
@@ -1375,22 +1454,31 @@ fn prepare_bun_environment(
     let modules = root.join("node_modules");
     let parent = newest_prepared_environment(&family, bun_version, &platform_identity)?;
     let mut derived_from_base = false;
-    if let Some(parent) = &parent {
-        attach_prepared_environment(root, &parent.join("node_modules"), key, bun_version)?;
+    let clone_kind = if let Some(parent) = &parent {
+        Some(attach_prepared_environment(
+            root,
+            &parent.join("node_modules"),
+            key,
+            bun_version,
+        )?)
     } else if modules.is_dir() {
         replace_dependency_tree(root)?;
         write_prepared_marker(root, key, bun_version)?;
+        None
     } else {
-        derived_from_base = seed_node_modules_from_base(root, "bun")?;
+        let seed_kind = seed_node_modules_from_base(root, "bun")?;
+        derived_from_base = seed_kind.is_some();
         run_bun_install(root)?;
         write_prepared_marker(root, key, bun_version)?;
-    }
+        seed_kind
+    };
     validate_environment_links(root, &modules)?;
     publish_prepared_environment(root, &family, key, bun_version, &platform_identity)?;
 
     Ok(PreparedEnvironment {
         key: key.to_owned(),
         action: prepared_environment_action(parent.is_some(), derived_from_base),
+        clone_kind,
     })
 }
 
@@ -1859,7 +1947,7 @@ fn attach_prepared_environment(
     source_modules: &Path,
     key: &str,
     bun_version: &str,
-) -> Result<()> {
+) -> Result<worktree::cow::CloneKind> {
     let modules = root.join("node_modules");
     let parent = root.parent().context("worktree root has no parent")?;
     let rollback = parent.join(format!(".wt0-environment-rollback-{}", Uuid::now_v7()));
@@ -1867,27 +1955,32 @@ fn attach_prepared_environment(
     if had_modules {
         fs::rename(&modules, &rollback).context("move dependency tree into exact rollback")?;
     }
-    let attempt = (|| -> Result<()> {
+    let attempt = (|| -> Result<worktree::cow::CloneKind> {
         fs::create_dir(&modules).context("create private prepared-environment view")?;
-        worktree::cow::clone_tree(source_modules, &modules)
+        let clone_kind = worktree::cow::clone_tree(source_modules, &modules)
             .context("attach copy-on-write prepared environment")?;
         run_bun_install(root)?;
         write_prepared_marker(root, key, bun_version)?;
-        validate_environment_links(root, &modules)
+        validate_environment_links(root, &modules)?;
+        Ok(clone_kind)
     })();
-    if let Err(error) = attempt {
-        if modules.exists() {
-            fs::remove_dir_all(&modules).context("remove failed prepared-environment view")?;
+    match attempt {
+        Ok(clone_kind) => {
+            if had_modules {
+                fs::remove_dir_all(&rollback).context("retire verified dependency rollback")?;
+            }
+            Ok(clone_kind)
         }
-        if had_modules {
-            fs::rename(&rollback, &modules).context("restore dependency rollback")?;
+        Err(error) => {
+            if modules.exists() {
+                fs::remove_dir_all(&modules).context("remove failed prepared-environment view")?;
+            }
+            if had_modules {
+                fs::rename(&rollback, &modules).context("restore dependency rollback")?;
+            }
+            Err(error.context("prepared-environment attach failed; original tree restored"))
         }
-        return Err(error.context("prepared-environment attach failed; original tree restored"));
     }
-    if had_modules {
-        fs::remove_dir_all(&rollback).context("retire verified dependency rollback")?;
-    }
-    Ok(())
 }
 
 fn run_bun_install(root: &Path) -> Result<()> {
