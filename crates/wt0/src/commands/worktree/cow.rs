@@ -304,10 +304,17 @@ fn walk_and_prepare(
     Ok(())
 }
 
-/// Upper bound on file-clone worker threads. Cloning is a kernel round trip,
-/// not CPU work, so a modest fixed pool hides that latency without spawning
-/// one thread per file or oversubscribing the machine.
-const CLONE_WORKERS: usize = 8;
+/// Upper bound on file-clone worker threads. Each clone spends almost all of
+/// its time blocked in a kernel round trip (`DeviceIoControl` on Windows, an
+/// `ioctl` on Linux) rather than burning CPU, so — unlike a compute-bound
+/// pool — capping this at the core count leaves real concurrency on the
+/// table: measured on a 2-vCPU GitHub-hosted Windows runner, capping workers
+/// at `available_parallelism()` (2) only cut the per-file clone phase from
+/// ~6.5s to ~3.7s for 2002 files, far short of what a kernel-latency-bound
+/// workload should get from more threads in flight. This ceiling is instead
+/// a flat number well past any plausible core count, so oversubscription is
+/// bounded but not by CPU count.
+const CLONE_WORKERS: usize = 64;
 
 /// Clone every (source, destination) pair in `files` with a bounded pool of
 /// worker threads pulling from a shared queue. Any single failure fails the
@@ -316,9 +323,7 @@ fn clone_files_concurrently(files: &[(PathBuf, PathBuf)]) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
-    let workers = CLONE_WORKERS
-        .min(files.len())
-        .min(thread::available_parallelism().map_or(1, |n| n.get()));
+    let workers = CLONE_WORKERS.min(files.len());
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
