@@ -192,6 +192,153 @@ fn gc_retains_unmerged_branches_without_force() -> Result<()> {
 }
 
 #[test]
+fn delete_local_branch_keeps_an_unmerged_branch_and_names_the_current_checkout() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let current_branch = git_path_output(
+        &fixture.repo,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )?;
+
+    git(&fixture.repo, ["checkout", "-q", "-b", "agent/unmerged"])?;
+    fs::write(fixture.repo.join("agent.txt"), "result\n")?;
+    git(&fixture.repo, ["add", "agent.txt"])?;
+    git(&fixture.repo, ["commit", "-q", "-m", "agent result"])?;
+    git(&fixture.repo, ["checkout", "-q", &current_branch])?;
+
+    let error = delete_local_branch(&repo, "refs/heads/agent/unmerged", false, None)
+        .expect_err("a branch with a real commit of its own must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("is not merged into {current_branch}")),
+        "{message}"
+    );
+    assert!(message.contains("it is kept"), "{message}");
+    assert!(branch_exists(&repo, "agent/unmerged")?);
+    Ok(())
+}
+
+/// A worktree can be created from a base ahead of whatever the main checkout
+/// happens to be on — an agent's `--base` picks a newer commit while the
+/// main checkout sits on an older branch. Deleting that worktree's branch
+/// while it never grew a commit of its own would otherwise hit git's "not
+/// fully merged" refusal even though nothing is lost.
+#[test]
+fn delete_local_branch_deletes_a_branch_that_never_moved_past_its_base() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let current_branch = git_path_output(
+        &fixture.repo,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )?;
+
+    git(&fixture.repo, ["checkout", "-q", "-b", "ahead"])?;
+    fs::write(fixture.repo.join("ahead.txt"), "progress\n")?;
+    git(&fixture.repo, ["add", "ahead.txt"])?;
+    git(&fixture.repo, ["commit", "-q", "-m", "progress"])?;
+    let base = resolve_commit(&repo, "ahead")?;
+    git(&fixture.repo, ["branch", "agent/idle", &base])?;
+    git(&fixture.repo, ["checkout", "-q", &current_branch])?;
+
+    delete_local_branch(&repo, "refs/heads/agent/idle", false, Some(&base))?;
+    assert!(!branch_exists(&repo, "agent/idle")?);
+    Ok(())
+}
+
+/// Work that landed on the remote's default branch by another route (a
+/// squash-merge, a push from elsewhere) is safe to delete locally even
+/// before the main checkout's own branch catches up.
+#[test]
+fn delete_local_branch_deletes_a_branch_already_contained_by_origins_default() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let current_branch = git_path_output(
+        &fixture.repo,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )?;
+    let original = resolve_commit(&repo, "HEAD")?;
+
+    let bare = fixture.root.join("origin.git");
+    fs::create_dir_all(&bare)?;
+    git(&bare, ["init", "-q", "--bare"])?;
+    git(
+        &fixture.repo,
+        ["remote", "add", "origin", bare.to_str().unwrap()],
+    )?;
+    git(
+        &fixture.repo,
+        [
+            "push",
+            "-q",
+            "origin",
+            &format!("{current_branch}:{current_branch}"),
+        ],
+    )?;
+    git(
+        &fixture.repo,
+        [
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            &format!("refs/remotes/origin/{current_branch}"),
+        ],
+    )?;
+
+    git(&fixture.repo, ["checkout", "-q", "-b", "agent/shipped"])?;
+    fs::write(fixture.repo.join("shipped.txt"), "landed upstream\n")?;
+    git(&fixture.repo, ["add", "shipped.txt"])?;
+    git(&fixture.repo, ["commit", "-q", "-m", "shipped work"])?;
+    // Land it on origin's default branch through some other route, then
+    // refresh the local tracking ref — the main checkout itself never moves.
+    git(
+        &fixture.repo,
+        [
+            "push",
+            "-q",
+            "origin",
+            &format!("refs/heads/agent/shipped:refs/heads/{current_branch}"),
+        ],
+    )?;
+    git(&fixture.repo, ["fetch", "-q", "origin"])?;
+    git(&fixture.repo, ["checkout", "-q", &current_branch])?;
+    assert_eq!(resolve_commit(&repo, "HEAD")?, original);
+
+    delete_local_branch(&repo, "refs/heads/agent/shipped", false, Some(&original))?;
+    assert!(!branch_exists(&repo, "agent/shipped")?);
+    Ok(())
+}
+
+#[test]
+fn refine_remove_refusal_reframes_gits_dirty_worktree_message() {
+    let target = Path::new("/tmp/some/worktree");
+    let original = anyhow::anyhow!(
+        "git worktree remove failed (exit status: 128): fatal: '/tmp/some/worktree' contains \
+         modified or untracked files, use --force to delete it"
+    );
+    let refined = refine_remove_refusal(target, original);
+    let rendered = format!("{refined:?}");
+    assert!(
+        rendered.starts_with(
+            "refusing to remove /tmp/some/worktree: it has modified or untracked files — \
+             commit them, pass --commit to keep them on the branch, or --force to discard"
+        ),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Caused by"), "{rendered}");
+    assert!(
+        rendered.contains("contains modified or untracked files"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn refine_remove_refusal_leaves_unrelated_errors_alone() {
+    let target = Path::new("/tmp/some/worktree");
+    let original = anyhow::anyhow!("some other git failure");
+    let refined = refine_remove_refusal(target, original);
+    assert_eq!(refined.to_string(), "some other git failure");
+}
+
+#[test]
 fn gc_preserves_unowned_and_unknown_ignored_state() -> Result<()> {
     let fixture = Fixture::new()?;
     fs::write(
@@ -867,12 +1014,12 @@ fn assert_tree_matches(tree: &Path, repo: &RepoContext, commit: &str) -> Result<
     Ok(())
 }
 
-// Gap #6: a new base commit must not pay a full materialization when a
-// nearby baseline exists — it is derived from the nearest one, and the
-// derived tree is proven identical to the commit (modified, added, deleted,
-// and nested paths alike).
+// D13: the repository's own main working tree is tried before any cached
+// baseline — a fresh commit's baseline is derived straight from the
+// checkout when one is available, so the store pays no second physical copy
+// of content the checkout already holds.
 #[test]
-fn baselines_derive_from_the_nearest_existing_baseline() -> Result<()> {
+fn baselines_derive_from_the_checkout_before_any_cached_baseline() -> Result<()> {
     let fixture = Fixture::new()?;
     let repo = discover_repo(&fixture.repo)?;
     let first = resolve_commit(&repo, "HEAD")?;
@@ -887,17 +1034,19 @@ fn baselines_derive_from_the_nearest_existing_baseline() -> Result<()> {
     git(&fixture.repo, ["commit", "-q", "-m", "second"])?;
     let second = resolve_commit(&repo, "HEAD")?;
 
+    // The checkout is clean and at `second`, so it is the cheapest possible
+    // derivation source and wins over the cached `first` baseline.
     let second_tree = cow::ensure_baseline(&repo, &second, None)?;
     assert_tree_matches(&second_tree, &repo, &second)?;
     let derived_from = second_tree.parent().unwrap().join("derived-from");
     if cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
         assert_eq!(
             fs::read_to_string(&derived_from)?,
-            first,
-            "second baseline must derive from the first"
+            "checkout",
+            "second baseline must derive from the checkout, not the cached first baseline"
         );
     } else {
-        // A plain filesystem (NTFS, ext4) cannot clone the parent; the full
+        // A plain filesystem (NTFS, ext4) cannot clone the checkout; the full
         // materialization is the correct result and must not claim derivation.
         assert!(!derived_from.exists());
     }
@@ -906,15 +1055,100 @@ fn baselines_derive_from_the_nearest_existing_baseline() -> Result<()> {
     Ok(())
 }
 
-// The shortcut is proven, not trusted: a parent baseline that acquired a
-// stray file makes the derived tree fail verification, and the fallback
-// still produces an exact baseline.
+// A dirty checkout still derives correctly: modified, untracked, and
+// ignored paths are excluded from the clone and the modified/deleted ones
+// are re-materialized from `commit`, while clean tracked content (including
+// nested directories) still clones with copy-on-write.
 #[test]
-fn a_corrupt_parent_baseline_falls_back_to_a_full_materialization() -> Result<()> {
+fn baselines_derive_from_a_dirty_checkout_excludes_untrustworthy_paths() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let commit = resolve_commit(&repo, "HEAD")?;
+
+    fs::write(fixture.repo.join("file.txt"), "dirty in the checkout\n")?;
+    fs::write(fixture.repo.join("untracked.txt"), "never committed\n")?;
+    fs::create_dir_all(fixture.repo.join("node_modules/pkg"))?;
+    fs::write(fixture.repo.join(".gitignore"), "node_modules/\n")?;
+    fs::write(
+        fixture.repo.join("node_modules/pkg/index.js"),
+        "module.exports = 1;\n",
+    )?;
+
+    let tree = cow::ensure_baseline(&repo, &commit, None)?;
+    assert_tree_matches(&tree, &repo, &commit)?;
+    assert!(
+        !tree.join("untracked.txt").exists(),
+        "untracked checkout content must never appear in the baseline"
+    );
+    assert!(
+        !tree.join("node_modules").exists(),
+        "ignored checkout content must never appear in the baseline"
+    );
+    let derived_from = tree.parent().unwrap().join("derived-from");
+    if cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+        assert_eq!(fs::read_to_string(&derived_from)?, "checkout");
+    }
+    Ok(())
+}
+
+// Gap #6, still reachable: when the checkout is not a usable derivation
+// source (simulated here by pointing `main_worktree` at a path that is not
+// a working tree), a new base commit still avoids a full materialization by
+// deriving from the nearest cached baseline instead.
+#[test]
+fn baselines_fall_back_to_the_nearest_cached_baseline_without_a_checkout() -> Result<()> {
     let fixture = Fixture::new()?;
     let repo = discover_repo(&fixture.repo)?;
     let first = resolve_commit(&repo, "HEAD")?;
     let first_tree = cow::ensure_baseline(&repo, &first, None)?;
+    assert_tree_matches(&first_tree, &repo, &first)?;
+
+    fs::write(fixture.repo.join("file.txt"), "changed\n")?;
+    fs::create_dir_all(fixture.repo.join("nested/deeper"))?;
+    fs::write(fixture.repo.join("nested/deeper/new.txt"), "added\n")?;
+    fs::remove_file(fixture.repo.join("file with spaces.txt"))?;
+    git(&fixture.repo, ["add", "-A"])?;
+    git(&fixture.repo, ["commit", "-q", "-m", "second"])?;
+    let second = resolve_commit(&repo, "HEAD")?;
+
+    let repo_without_checkout = RepoContext {
+        top_level: repo.top_level.clone(),
+        common_git_dir: repo.common_git_dir.clone(),
+        main_worktree: fixture.root.join("no-such-checkout"),
+    };
+    let second_tree = cow::ensure_baseline(&repo_without_checkout, &second, None)?;
+    assert_tree_matches(&second_tree, &repo, &second)?;
+    let derived_from = second_tree.parent().unwrap().join("derived-from");
+    if cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+        assert_eq!(
+            fs::read_to_string(&derived_from)?,
+            first,
+            "second baseline must derive from the first when no checkout is available"
+        );
+    } else {
+        assert!(!derived_from.exists());
+    }
+    assert_tree_matches(&first_tree, &repo, &first)?;
+    Ok(())
+}
+
+// The shortcut is proven, not trusted: a parent baseline that acquired a
+// stray file makes the derived tree fail verification, and the fallback
+// still produces an exact baseline. `main_worktree` is pointed at a
+// non-checkout path so this exercises the nearest-cached-baseline fallback
+// specifically, rather than the checkout derivation that would otherwise
+// win first (and never touch the corrupted parent at all).
+#[test]
+fn a_corrupt_parent_baseline_falls_back_to_a_full_materialization() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let repo_without_checkout = RepoContext {
+        top_level: repo.top_level.clone(),
+        common_git_dir: repo.common_git_dir.clone(),
+        main_worktree: fixture.root.join("no-such-checkout"),
+    };
+    let first = resolve_commit(&repo, "HEAD")?;
+    let first_tree = cow::ensure_baseline(&repo_without_checkout, &first, None)?;
     fs::write(first_tree.join("stray.txt"), "should never propagate\n")?;
 
     fs::write(fixture.repo.join("file.txt"), "changed again\n")?;
@@ -922,7 +1156,7 @@ fn a_corrupt_parent_baseline_falls_back_to_a_full_materialization() -> Result<()
     git(&fixture.repo, ["commit", "-q", "-m", "third"])?;
     let third = resolve_commit(&repo, "HEAD")?;
 
-    let third_tree = cow::ensure_baseline(&repo, &third, None)?;
+    let third_tree = cow::ensure_baseline(&repo_without_checkout, &third, None)?;
     assert_tree_matches(&third_tree, &repo, &third)?;
     assert!(
         !third_tree.parent().unwrap().join("derived-from").exists(),

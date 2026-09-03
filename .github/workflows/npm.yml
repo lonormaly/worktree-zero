@@ -1,0 +1,62 @@
+name: Publish npm
+
+# Publish `wt0` and its six platform packages to npm from the assets of an
+# existing GitHub release — no laptop, no one-time password, no long-lived
+# token. Runs when a release is published (the Release workflow's last step)
+# and on demand for a given version. Authenticates with npm Trusted
+# Publishing (GitHub OIDC), as ImmorTerm's libraries do: npm mints a
+# short-lived credential for this repository + this workflow file, so there
+# is nothing to rotate and nothing that bypasses two-factor auth — which npm
+# is restricting for tokens from 2026/2027. One-time setup per package on
+# npmjs.com (Settings → Trusted Publisher): user `lonormaly`, repository
+# `worktree-zero`, workflow `npm.yml`. npm requires a package to exist
+# before a trusted publisher can be configured, so the very first version
+# of each package is published once from a logged-in laptop. Re-runs are
+# safe: a version already on the registry is skipped, never rejected.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Released version to publish (e.g. 0.1.16); defaults to the workspace version"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: npm with trusted-publishing support (11.5.1+)
+        run: npm install -g npm@latest && npm --version
+      - name: Resolve the version
+        id: version
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          if [ -z "$version" ]; then
+            case "${{ github.event_name }}" in
+              release) version="${{ github.event.release.tag_name }}"; version="${version#v}" ;;
+              *) version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1) ;;
+            esac
+          fi
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Build and publish from the release assets
+        # OIDC needs no secret. NPM_TOKEN, if a repository ever sets one, is
+        # honoured as a fallback for the transition and nothing more.
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm/publish.sh "${{ steps.version.outputs.version }}"

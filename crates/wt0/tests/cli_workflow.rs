@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn cli_reports_the_pinned_release_version() {
@@ -940,13 +940,15 @@ fn seeding_clones_ignored_trees_from_the_base_checkout() {
     let _ = fs::remove_dir_all(root);
 }
 
-// A node_modules seed is allowed only when it is provably cheap and sound: the
-// root tree, Bun, the same isolated global-store layout on both sides, a base
-// that really is a link tree, byte-identical lockfiles, and nothing holding the
-// base tree open. Every other shape keeps its refusal, with its own reason.
+// A Bun node_modules seed is always refused, each shape with its own precise
+// reason: a mismatched lockfile, a base and worktree asking for different
+// Bun linker layouts, or — when the layout does match — Bun's own global
+// store, which measured cheaper than cloning it (docs/research/dependency-link-trees.md:
+// 3 MiB native vs. docs/design-partners/flam-migration.md gap #7's 9 MiB
+// wt0-seeded). See `node_modules_seed_refusal`'s "native store is cheaper".
 #[cfg(unix)]
 #[test]
-fn seeding_clones_node_modules_only_when_the_bun_layout_matches() {
+fn seeding_always_refuses_bun_node_modules_with_a_precise_reason() {
     let root = std::env::temp_dir().join(format!(
         "worktree-zero-bunseed-{}-{}",
         std::process::id(),
@@ -1031,7 +1033,10 @@ fn seeding_clones_node_modules_only_when_the_bun_layout_matches() {
             .clone()
     };
 
-    // Matching layouts on the same lockfile: the tree is cloned, links and all.
+    // Matching layouts on the same lockfile: Bun's own global store is
+    // cheaper than cloning it, so the seed is refused rather than cloned —
+    // cloning would turn its hardlinks into wt0 clones that pay the full
+    // per-file metadata cost the native install already avoids.
     let matched = root.join("matched");
     let receipt = create("agent/bun-matched", None, &matched);
 
@@ -1047,33 +1052,14 @@ fn seeding_clones_node_modules_only_when_the_bun_layout_matches() {
     );
 
     let modules = seed_of(&receipt, "node_modules");
-    if modules["status"] == "seeded" {
-        assert_eq!(
-            fs::read_to_string(matched.join("node_modules/pkg/index.js")).expect("seeded package"),
-            "module.exports = 1;\n"
-        );
-        let link = matched.join("node_modules/.bun/pkg@1.0.0");
-        assert!(link.is_symlink(), "expected the store link to be recreated");
-        assert_eq!(fs::read_link(&link).expect("read the store link"), store);
-        assert!(
-            modules["files"].as_u64().is_some_and(|files| files > 0),
-            "{modules}"
-        );
-        assert!(
-            modules["logical_bytes"]
-                .as_u64()
-                .is_some_and(|bytes| bytes > 0),
-            "{modules}"
-        );
-    } else {
-        // No copy-on-write between the two locations (plain ext4, an overlay
-        // mount): the seed is skipped with a reason, never degraded to a copy.
-        assert_eq!(modules["status"], "skipped", "{modules}");
-        assert!(modules["reason"]
+    assert_eq!(modules["status"], "refused", "{modules}");
+    assert!(
+        modules["reason"]
             .as_str()
-            .is_some_and(|reason| !reason.is_empty()));
-        assert!(!matched.join("node_modules").exists());
-    }
+            .is_some_and(|reason| reason.contains("native store is cheaper")),
+        "{modules}"
+    );
+    assert!(!matched.join("node_modules").exists());
 
     // A different lockfile resolves to a different store layout: refused, and
     // the prepared environment handles it instead.
@@ -1142,11 +1128,12 @@ fn seeding_clones_any_node_modules_behind_an_identical_lockfile() {
     );
     git(&repo, &["commit", "-q", "-m", "no lockfile yet"]);
 
-    // Enough small files that the tree's metadata cost passes the 20 MiB
-    // bar doctor speaks up at (~2 KB per file).
+    // Enough small files that wt0's own clone cost passes the 20 MiB bar
+    // doctor speaks up at (~400 B/file, settled in
+    // docs/design-partners/flam-migration.md's "Verification" section).
     let package = repo.join("node_modules/pkg");
     fs::create_dir_all(&package).expect("create the package directory");
-    for i in 0..10_500 {
+    for i in 0..53_000 {
         fs::write(package.join(format!("f{i}.js")), "1\n").expect("write a package file");
     }
 
@@ -1198,7 +1185,7 @@ fn seeding_clones_any_node_modules_behind_an_identical_lockfile() {
     let receipt = create("agent/matched", None, &matched);
     let modules = seed_of(&receipt, "node_modules");
     if modules["status"] == "seeded" {
-        assert_eq!(modules["files"], 10_500, "{modules}");
+        assert_eq!(modules["files"], 53_000, "{modules}");
         assert_eq!(
             fs::read_to_string(matched.join("node_modules/pkg/f7.js")).expect("seeded file"),
             "1\n"
@@ -1223,9 +1210,358 @@ fn seeding_clones_any_node_modules_behind_an_identical_lockfile() {
         .expect("recommendations")
         .iter()
         .filter_map(|item| item.as_str())
-        .find(|item| item.contains("10500 files"))
+        .find(|item| item.contains("53000 files"))
         .unwrap_or_else(|| panic!("no metadata advice in {doctor}"));
-    assert!(advice.contains("20 MiB of filesystem metadata"), "{advice}");
+    // The 20 MiB bar is wt0's own clone cost (~400 B/file); the native-install
+    // figure (~2 KB/file) is shown alongside it for context, not the trigger.
+    assert!(
+        advice.contains("a native install pays about") && advice.contains("(~2 KB/file measured)"),
+        "{advice}"
+    );
+    assert!(
+        advice.contains("a wt0 seed or attach about") && advice.contains("(~400 B/file)"),
+        "{advice}"
+    );
+    assert!(advice.contains("under 20 MiB"), "{advice}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// pnpm's content-addressable store is default behavior, nothing to opt
+/// into: `wt0 doctor` reports it as a native store and does not warn about
+/// `node_modules`'s entry count (its entries are hardlinks and symlinks into
+/// the store, not wt0 clones), and the seed gate refuses to clone the tree
+/// because the native store is already cheaper than a clone
+/// (docs/research/dependency-link-trees.md: 6–7 MiB marginal cost per
+/// checkout with a warm store).
+#[test]
+fn pnpm_native_store_is_reported_by_doctor_and_exempted_from_seeding() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-pnpm-native-store-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    fs::write(repo.join(".wt0-seed"), "node_modules\n").expect("write seed policy");
+    fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").expect("write lockfile");
+    fs::write(repo.join("package.json"), "{\"name\":\"fixture\"}\n").expect("write manifest");
+    // Stands in for pnpm's own shape: `.modules.yaml` is the marker pnpm
+    // writes into a store-backed `node_modules`; a real install symlinks the
+    // package directory from `.pnpm`, but the fixture only needs what
+    // doctor and the seed gate key off (the lockfile and the manifest).
+    fs::create_dir_all(repo.join("node_modules/pkg")).expect("create the package directory");
+    fs::write(
+        repo.join("node_modules/.modules.yaml"),
+        "hoistPattern:\n  - '*'\n",
+    )
+    .expect("write pnpm modules marker");
+    fs::write(
+        repo.join("node_modules/pkg/index.js"),
+        "module.exports = 1;\n",
+    )
+    .expect("write the package");
+    git(
+        &repo,
+        &[
+            "add",
+            "-f",
+            ".gitignore",
+            ".wt0-seed",
+            "pnpm-lock.yaml",
+            "package.json",
+        ],
+    );
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    // Doctor exits non-zero when not "ready"; the report is still the JSON
+    // on stdout, so it is parsed regardless of exit status.
+    let doctor = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "doctor"])
+        .output()
+        .expect("doctor");
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)
+        .unwrap_or_else(|_| panic!("doctor JSON: {}", String::from_utf8_lossy(&doctor.stderr)));
+    assert!(
+        doctor["promise"]["dependency_sharing"]
+            .as_str()
+            .is_some_and(|sharing| sharing.starts_with("native store (pnpm")),
+        "{doctor}"
+    );
+    assert!(
+        doctor["dependencies"]["recommendations"]
+            .as_array()
+            .expect("recommendations")
+            .iter()
+            .filter_map(|item| item.as_str())
+            .all(|item| !item.contains("node_modules holds")),
+        "{doctor}"
+    );
+
+    let worktree = root.join("worktree");
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "create", "agent/pnpm-native", "--path"])
+        .arg(&worktree)
+        .output()
+        .expect("create worktree");
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&created.stdout).expect("create JSON");
+    let modules = receipt["seeded"]
+        .as_array()
+        .expect("seed receipts")
+        .iter()
+        .find(|seed| seed["path"] == "node_modules")
+        .unwrap_or_else(|| panic!("no seed receipt for node_modules: {receipt}"))
+        .clone();
+    assert_eq!(modules["status"], "refused", "{modules}");
+    assert!(
+        modules["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("native store is cheaper")),
+        "{modules}"
+    );
+    assert!(!worktree.join("node_modules").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Yarn Berry's default `node-modules` linker materializes a full tree with
+/// no cross-checkout sharing; `wt0 doctor` recommends switching to
+/// `nodeLinker: pnpm` for pnpm's own store shape, citing the measured
+/// marginal cost (docs/research/dependency-link-trees.md).
+#[test]
+fn yarn_berry_node_modules_linker_recommends_the_pnpm_linker() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-yarn-node-modules-linker-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    fs::write(repo.join("yarn.lock"), "# yarn lockfile v1\n").expect("write lockfile");
+    fs::write(repo.join(".yarnrc.yml"), "nodeLinker: node-modules\n").expect("write yarnrc");
+    fs::write(repo.join("package.json"), "{\"name\":\"fixture\"}\n").expect("write manifest");
+    git(
+        &repo,
+        &[
+            "add",
+            "-f",
+            ".gitignore",
+            "yarn.lock",
+            ".yarnrc.yml",
+            "package.json",
+        ],
+    );
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let doctor = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "doctor"])
+        .output()
+        .expect("doctor");
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)
+        .unwrap_or_else(|_| panic!("doctor JSON: {}", String::from_utf8_lossy(&doctor.stderr)));
+    assert!(
+        doctor["dependencies"]["recommendations"]
+            .as_array()
+            .expect("recommendations")
+            .iter()
+            .filter_map(|item| item.as_str())
+            .any(|item| item.contains("nodeLinker: pnpm")),
+        "{doctor}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// npm has no machine-wide store — `--install-strategy=linked` only
+/// restructures one project's own tree — so `wt0 doctor` says so plainly and
+/// points at pnpm or Bun's global store instead of implying npm has an
+/// equivalent (docs/research/dependency-link-trees.md).
+#[test]
+fn npm_recommendation_states_it_has_no_machine_wide_store() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-npm-no-store-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    fs::write(repo.join("package-lock.json"), "{\"lockfileVersion\": 3}\n")
+        .expect("write lockfile");
+    fs::write(repo.join("package.json"), "{\"name\":\"fixture\"}\n").expect("write manifest");
+    git(
+        &repo,
+        &[
+            "add",
+            "-f",
+            ".gitignore",
+            "package-lock.json",
+            "package.json",
+        ],
+    );
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let doctor = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "doctor"])
+        .output()
+        .expect("doctor");
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)
+        .unwrap_or_else(|_| panic!("doctor JSON: {}", String::from_utf8_lossy(&doctor.stderr)));
+    assert!(
+        doctor["dependencies"]["recommendations"]
+            .as_array()
+            .expect("recommendations")
+            .iter()
+            .filter_map(|item| item.as_str())
+            .any(|item| item.contains("no machine-wide store")),
+        "{doctor}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn create_prints_a_prepare_hint_and_reports_not_prepared_dependencies() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-create-hint-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    let worktree = root.join("worktree");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    fs::write(repo.join("package-lock.json"), "{\"lockfileVersion\": 3}\n")
+        .expect("write lockfile");
+    fs::write(repo.join("package.json"), "{\"name\":\"fixture\"}\n").expect("write manifest");
+    git(
+        &repo,
+        &[
+            "add",
+            "-f",
+            ".gitignore",
+            "package-lock.json",
+            "package.json",
+        ],
+    );
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "create", "agent/hint", "--path"])
+        .arg(&worktree)
+        .output()
+        .expect("create worktree");
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&created.stdout).expect("create JSON");
+    // No node_modules exists yet in the new worktree, and npm has no native
+    // link-tree store, so nothing here is ready to use.
+    assert_eq!(receipt["dependencies"], "not-prepared", "{receipt}");
+
+    let stderr = String::from_utf8_lossy(&created.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "next: run `wt0 prepare --apply` in {} (wt0 run does this automatically)",
+            worktree.display()
+        )),
+        "stderr: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn doctor_verdict_flags_generated_state_over_budget_even_when_otherwise_ready() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-doctor-budget-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("README.md"), "root\n").expect("write fixture");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    // No JavaScript manager, so dependency_ready holds trivially, and a
+    // reviewed .wt0-generated policy so the "no policy reviewed" shortfall
+    // does not fire either — the only thing left wrong is the budget itself.
+    fs::write(repo.join(".wt0-generated"), "# reviewed\n.next\n").expect("write policy");
+    fs::create_dir_all(repo.join(".next")).expect("create .next");
+    let big = fs::File::create(repo.join(".next/huge")).expect("create sparse fixture");
+    big.set_len(600 * 1024 * 1024)
+        .expect("extend sparse fixture past the default budget");
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let doctor = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "doctor"])
+        .output()
+        .expect("doctor");
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)
+        .unwrap_or_else(|_| panic!("doctor JSON: {}", String::from_utf8_lossy(&doctor.stderr)));
+
+    assert_eq!(doctor["ready"], false, "{doctor}");
+    assert_eq!(doctor["dependency_ready"], true, "{doctor}");
+    assert_ne!(doctor["promise"]["verdict"], "holds", "{doctor}");
+    assert!(
+        doctor["promise"]["shortfalls"]
+            .as_array()
+            .expect("shortfalls")
+            .iter()
+            .filter_map(|item| item.as_str())
+            .any(|item| item.contains("generated state exceeds the default budget")),
+        "{doctor}"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1318,6 +1654,111 @@ fn cloned_worktrees_adopt_the_baseline_index_and_stay_clean() {
     fs::remove_dir_all(root).expect("remove fixture");
 }
 
+// D13: the first worktree of a base commit derives its baseline from the
+// repository's own checkout instead of a second materialization from Git
+// objects. The base checkout is deliberately untrustworthy in three ways —
+// an ignored directory, an untracked file, and an uncommitted modification
+// to a tracked file — and none of that may reach the new worktree; the
+// modified file must carry the committed content, not the dirty one.
+#[test]
+fn create_derives_the_baseline_from_the_base_checkout() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-checkout-derive-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    let worktree = root.join("worktree");
+    fs::create_dir_all(repo.join("src")).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    // Runner images set core.autocrlf=true globally on Windows; the content
+    // assertions below target exact bytes, so pin checkout to raw LF.
+    git(&repo, &["config", "core.autocrlf", "false"]);
+    fs::write(repo.join("src/a.txt"), "committed a\n").expect("write fixture");
+    fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    // -f: a developer's global excludes file may ignore .gitignore itself.
+    git(&repo, &["add", "-f", "."]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    let commit = git_stdout_any(&repo, &["rev-parse", "HEAD"]);
+
+    // Untrustworthy checkout content that must never reach the baseline.
+    fs::create_dir_all(repo.join("node_modules/pkg")).expect("create node_modules");
+    fs::write(
+        repo.join("node_modules/pkg/index.js"),
+        "module.exports = 1;\n",
+    )
+    .expect("write dep");
+    fs::write(repo.join("untracked.txt"), "never committed\n").expect("write untracked");
+    fs::write(repo.join("src/a.txt"), "dirty in the checkout\n").expect("modify tracked file");
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "create", "checkout/derive", "--path"])
+        .arg(&worktree)
+        .output()
+        .expect("create worktree");
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&created.stdout).expect("create JSON");
+
+    // The tracked content matches the commit regardless of populate mode:
+    // the modified file carries the committed content, not the dirty one,
+    // and nothing untracked or ignored leaked in.
+    assert_eq!(
+        fs::read(worktree.join("src/a.txt")).expect("a.txt"),
+        b"committed a\n"
+    );
+    assert!(
+        !worktree.join("node_modules").exists(),
+        "ignored checkout content must never appear in the worktree"
+    );
+    assert!(
+        !worktree.join("untracked.txt").exists(),
+        "untracked checkout content must never appear in the worktree"
+    );
+    let status = git_stdout_any(&worktree, &["status", "--porcelain"]);
+    assert!(status.is_empty(), "fresh worktree is dirty:\n{status}");
+
+    // A plain filesystem (NTFS, ext4 without reflinks) cannot clone from the
+    // checkout, so only the copy-on-write mode claims the derivation.
+    if receipt["mode"] == "cow-clone" {
+        assert_eq!(
+            fs::read_to_string(
+                repo.join(".git/wt0/baselines")
+                    .join(&commit)
+                    .join("derived-from")
+            )
+            .expect("derived-from marker"),
+            "checkout"
+        );
+    }
+
+    // On Linux without reflinks the worktree is an overlay mount; only wt0
+    // can take it down, so the fixture is removed through it.
+    let removed = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["remove", "--force"])
+        .arg(&worktree)
+        .output()
+        .expect("remove worktree");
+    assert!(
+        removed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
 /// `git` output on every platform; missing keys yield an empty string.
 fn git_stdout_any(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -1326,4 +1767,427 @@ fn git_stdout_any(repo: &Path, args: &[&str]) -> String {
         .output()
         .expect("run git");
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+// A crashed agent runs no exit hook and stops no heartbeat early — the
+// process just disappears. This proves wt0 recovers regardless: the
+// worktree, its lease, and its port claim survive exactly as the docs
+// promise until `gc` reaps them, and a checkout that vanishes entirely
+// (`rm -rf`) is recovered by identity at `prune` time.
+#[cfg(unix)]
+#[test]
+fn crashed_agent_runtime_is_reaped_and_its_resources_released() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-crash-recovery-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    let machine = root.join("machine-state");
+    fs::create_dir_all(&machine).expect("create machine-state fixture");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    // wt0's own receipts root state under the repository's real path — see
+    // the `worktree_real` comment below for why that can differ here.
+    let repo_real = fs::canonicalize(&repo).expect("canonicalize repository path");
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let worktree = root.join("crashed");
+    // Mode doesn't matter for this half: `gc --apply` (via `force_teardown`)
+    // already unmounts an overlay worktree itself before removing it.
+    let (runtime_id, slot, port_base, _mode) = spawn_and_crash_agent(
+        wt0,
+        &repo,
+        &machine,
+        &root,
+        "agent/crash-1",
+        "crash-agent",
+        &worktree,
+    );
+
+    // The crash left nothing to clean up: the checkout, its lease, and its
+    // machine-global port claim are exactly what a live runtime's would be.
+    assert!(worktree.exists(), "crashed worktree must still exist");
+    // `git worktree list` (which `gc` reads from) and the port registry
+    // (which stores canonically) both report the real path — on macOS that
+    // resolves the temp directory's `/var` -> `/private/var` symlink —
+    // while `wt0 create`'s own receipts echo the literal `--path` argument
+    // back unchanged; the assertions below need the former.
+    let worktree_real = fs::canonicalize(&worktree).expect("canonicalize crashed worktree path");
+    let fleet = run_wt0(wt0, &repo, &machine, &["--json", "fleet"]);
+    let runtime = managed_runtime(&fleet, "agent/crash-1");
+    assert_eq!(runtime["runtime_id"], runtime_id.as_str());
+    assert_eq!(runtime["slot"], slot);
+    assert_eq!(runtime["port_base"], port_base);
+    let claim: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(machine.join("ports").join(format!("{port_base}.json")))
+            .expect("port claim survives the crash"),
+    )
+    .expect("claim JSON");
+    assert_eq!(claim["worktree"], worktree_real.to_string_lossy().as_ref());
+    let generated_root = repo.join(".git/wt0/generated").join(&runtime_id);
+    assert!(
+        generated_root.is_dir(),
+        "the owned generated root survives the crash"
+    );
+
+    // Dry run reports the crashed runtime as reclaimable...
+    let dry_run = run_wt0(
+        wt0,
+        &repo,
+        &machine,
+        &["--json", "gc", "--ephemeral", "--older-than", "0s"],
+    );
+    let reaped: Vec<&str> = dry_run["reaped"]
+        .as_array()
+        .expect("reaped array")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    assert!(
+        reaped.contains(&worktree_real.to_string_lossy().as_ref()),
+        "dry-run reaped: {reaped:?}"
+    );
+
+    // ...and --apply removes it and releases everything it held.
+    let applied = run_wt0(
+        wt0,
+        &repo,
+        &machine,
+        &[
+            "--json",
+            "gc",
+            "--ephemeral",
+            "--older-than",
+            "0s",
+            "--apply",
+        ],
+    );
+    let reaped: Vec<&str> = applied["reaped"]
+        .as_array()
+        .expect("reaped array")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    assert!(
+        reaped.contains(&worktree_real.to_string_lossy().as_ref()),
+        "apply reaped: {reaped:?}"
+    );
+    assert!(!worktree.exists(), "gc must remove the crashed worktree");
+    assert!(
+        !generated_root.exists(),
+        "gc must retire the owned generated root"
+    );
+    // Without --delete-branches the docs promise the branch survives.
+    let branch_kept = Command::new("git")
+        .current_dir(&repo)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/agent/crash-1",
+        ])
+        .status()
+        .expect("inspect branch");
+    assert!(
+        branch_kept.success(),
+        "gc without --delete-branches must retain the branch"
+    );
+
+    let events = run_wt0(wt0, &repo, &machine, &["--json", "events"]);
+    let kinds_for_runtime: Vec<&str> = events["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|event| event["runtime_id"] == runtime_id.as_str())
+        .filter_map(|event| event["event"].as_str())
+        .collect();
+    assert!(
+        kinds_for_runtime.contains(&"created"),
+        "{kinds_for_runtime:?}"
+    );
+    assert!(
+        kinds_for_runtime.contains(&"reaped"),
+        "{kinds_for_runtime:?}"
+    );
+
+    // The slot and port window gc just freed go to the next runtime — which
+    // doubles as the fixture for the rm -rf / prune path below.
+    let worktree2 = root.join("orphaned");
+    let (runtime_id2, slot2, port_base2, mode2) = spawn_and_crash_agent(
+        wt0,
+        &repo,
+        &machine,
+        &root,
+        "agent/crash-2",
+        "crash-agent-2",
+        &worktree2,
+    );
+    assert_eq!(slot2, slot, "the reaped slot must be reused");
+    assert_eq!(
+        port_base2, port_base,
+        "the released port window must be reused"
+    );
+
+    if mode2 == "overlay" {
+        // On a filesystem without reflinks (plain ext4 — most Linux CI
+        // runners) wt0 falls back to a fuse-overlayfs mount for the
+        // worktree, and a mount point cannot be `rm -rf`'d out from under
+        // wt0 (EBUSY) — that is a filesystem property, not something a
+        // crash changes. The orphan / `rm -rf` recovery path below is
+        // exercised on the CoW and plain git-checkout runners instead; here
+        // just tear the mount down through wt0 so it does not outlive the
+        // fixture and trip the same EBUSY in the cleanup below.
+        let removed = Command::new(wt0)
+            .current_dir(&repo)
+            .env("WT0_MACHINE_STATE", &machine)
+            .args(["remove", "--force"])
+            .arg(&worktree2)
+            .output()
+            .expect("remove overlay worktree");
+        assert!(
+            removed.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&removed.stderr)
+        );
+    } else {
+        fs::remove_dir_all(&worktree2).expect("simulate rm -rf of the crashed checkout");
+        let pruned = run_wt0(wt0, &repo, &machine, &["--json", "prune"]);
+        let orphans = pruned["orphaned_runtimes"].as_array().expect("orphans");
+        let orphan = orphans
+            .iter()
+            .find(|orphan| orphan["runtime_id"] == runtime_id2.as_str())
+            .unwrap_or_else(|| panic!("no orphan for {runtime_id2}: {orphans:?}"));
+        assert_eq!(orphan["owner"], "crash-agent-2");
+        assert_eq!(orphan["slot"], slot2);
+        assert_eq!(orphan["port_base"], port_base2);
+        let generated_root2 = repo_real.join(".git/wt0/generated").join(&runtime_id2);
+        assert_eq!(
+            orphan["generated_root"],
+            generated_root2.to_string_lossy().as_ref()
+        );
+
+        let events = run_wt0(wt0, &repo, &machine, &["--json", "events"]);
+        let orphaned_event = events["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .find(|event| {
+                event["event"] == "orphaned" && event["runtime_id"] == runtime_id2.as_str()
+            });
+        assert!(
+            orphaned_event.is_some(),
+            "no orphaned event for {runtime_id2}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Starts `wt0 run` with a long-lived child, waits for its lease to be
+/// published in the fleet, then SIGKILLs the whole process tree without
+/// letting anything clean up — an agent vanishing mid-run the way a crash or
+/// an OOM kill leaves it, not a graceful shutdown. Returns the runtime's
+/// identity, slot, port window, and populate mode so the caller can assert
+/// on exactly what a crash is supposed to leave behind (mode matters
+/// because an overlay-backed worktree, wt0's fallback where reflinks are
+/// unavailable — plain ext4, most Linux CI runners — is a mount point that
+/// cannot simply be deleted out from under it).
+#[cfg(unix)]
+fn spawn_and_crash_agent(
+    wt0: &str,
+    repo: &Path,
+    machine: &Path,
+    log_dir: &Path,
+    branch: &str,
+    owner: &str,
+    worktree: &Path,
+) -> (String, u64, u64, String) {
+    let label = branch.replace('/', "-");
+    let stdout = fs::File::create(log_dir.join(format!("{label}.stdout")))
+        .expect("create captured stdout log");
+    let stderr_path = log_dir.join(format!("{label}.stderr"));
+    let stderr = fs::File::create(&stderr_path).expect("create captured stderr log");
+    let mut child = Command::new(wt0)
+        .current_dir(repo)
+        .env("WT0_MACHINE_STATE", machine)
+        .args(["run", branch, "--owner", owner, "--path"])
+        .arg(worktree)
+        .args(["--", "sh", "-c", "sleep 300"])
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .expect("spawn wt0 run");
+
+    // `wt0 run` prints "worktree: ..." to stderr right after its call to
+    // `create_worktree` returns — which is also where marking the worktree
+    // ephemeral happens, strictly before the agent command is spawned.
+    // That, not "some descendant process exists", is the correct signal to
+    // wait for: `create_worktree` itself spawns many short-lived `git`
+    // subprocesses on the way there, any one of which would satisfy a
+    // "some descendant exists" check well before ephemeral-marking is
+    // actually done, letting a kill race ahead of it and leave a worktree
+    // `gc --ephemeral` silently skips.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("wt0 run for {branch} exited with {status} before printing its startup line");
+        }
+        if fs::read_to_string(&stderr_path).is_ok_and(|captured| captured.contains("worktree: ")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "wt0 run for {branch} never printed its startup line within 30s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let runtime = loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("wt0 run for {branch} exited with {status} before its lease was published");
+        }
+        let fleet = run_wt0(wt0, repo, machine, &["--json", "fleet"]);
+        if let Some(runtime) = fleet["runtimes"].as_array().and_then(|runtimes| {
+            runtimes
+                .iter()
+                .find(|runtime| runtime["branch"] == branch && runtime["managed"] == true)
+        }) {
+            break runtime.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runtime for {branch} never registered within 30s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let runtime_id = runtime["runtime_id"]
+        .as_str()
+        .expect("runtime id")
+        .to_owned();
+    let slot = runtime["slot"].as_u64().expect("slot");
+    let port_base = runtime["port_base"].as_u64().expect("port_base");
+    let mode = runtime["mode"].as_str().expect("mode").to_owned();
+
+    kill_tree(&mut child);
+
+    (runtime_id, slot, port_base, mode)
+}
+
+/// The one managed runtime for `branch` in a `fleet --json` receipt.
+#[cfg(unix)]
+fn managed_runtime<'a>(fleet: &'a serde_json::Value, branch: &str) -> &'a serde_json::Value {
+    fleet["runtimes"]
+        .as_array()
+        .expect("runtimes")
+        .iter()
+        .find(|runtime| runtime["branch"] == branch && runtime["managed"] == true)
+        .unwrap_or_else(|| panic!("no managed runtime for {branch} in {fleet}"))
+}
+
+/// Runs a `wt0` subcommand against `repo` with a private machine-state
+/// directory and parses its JSON receipt.
+#[cfg(unix)]
+fn run_wt0(wt0: &str, repo: &Path, machine: &Path, args: &[&str]) -> serde_json::Value {
+    let output = Command::new(wt0)
+        .current_dir(repo)
+        .env("WT0_MACHINE_STATE", machine)
+        .args(args)
+        .output()
+        .expect("run wt0");
+    assert!(
+        output.status.success(),
+        "wt0 {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "wt0 {args:?} JSON: {error}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+/// Every live descendant of `pid`, discovered before any kill so a process
+/// reparented mid-teardown is never missed.
+#[cfg(unix)]
+fn descendant_pids(pid: u32) -> Vec<u32> {
+    let mut all = Vec::new();
+    let mut frontier = vec![pid];
+    while let Some(current) = frontier.pop() {
+        let Ok(output) = Command::new("pgrep")
+            .args(["-P", &current.to_string()])
+            .output()
+        else {
+            continue;
+        };
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Ok(child) = line.trim().parse::<u32>() {
+                all.push(child);
+                frontier.push(child);
+            }
+        }
+    }
+    all
+}
+
+#[cfg(unix)]
+fn is_alive(pid: u32) -> bool {
+    // `.output()` rather than `.status()`: a dead pid is the expected steady
+    // state at the end of the poll loop below, and `kill -0` writes "No
+    // such process" to stderr every time it finds one — noise this capture
+    // discards instead of spamming the test log.
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// SIGKILLs `child` and every descendant of it — a `wt0 run` process tree —
+/// and blocks until all of them are confirmed dead, so nothing is left
+/// holding its working directory inside the worktree by the time `gc` looks.
+/// `child` is killed and reaped through its own handle rather than polled
+/// with `kill -0`: a killed process a parent has not `wait`ed on is a
+/// zombie, and `kill -0` reports a zombie's PID as alive until it is reaped.
+#[cfg(unix)]
+fn kill_tree(child: &mut std::process::Child) {
+    let pid = child.id();
+    let targets = descendant_pids(pid);
+    for target in &targets {
+        // A target may already be gone (e.g. `sh` exec'd into `sleep`,
+        // leaving no separate process); `.output()` swallows the resulting
+        // "No such process" instead of spamming the test log with it.
+        let _ = Command::new("kill")
+            .args(["-9", &target.to_string()])
+            .output();
+    }
+    let _ = child.kill();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                assert!(Instant::now() < deadline, "wt0 process {pid} did not die");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!("wait for wt0 process {pid}: {error}"),
+        }
+    }
+    while targets.iter().any(|&target| is_alive(target)) {
+        assert!(
+            Instant::now() < deadline,
+            "process tree rooted at {pid} did not die: {targets:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

@@ -63,7 +63,12 @@ struct DependencyStorage {
 #[derive(Debug)]
 struct PreparedEnvironment {
     key: String,
-    action: &'static str,
+    action: String,
+    /// How this call's dependency tree was cloned, when it cloned one at
+    /// all: `None` for a cache hit that needed no clone, or an install with
+    /// no compatible parent and no base seed (the manager's own work, not
+    /// wt0's).
+    clone_kind: Option<worktree::cow::CloneKind>,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -95,74 +100,232 @@ impl GeneratedStorage {
     }
 }
 
+/// The native, machine-wide link-tree store a JavaScript package manager is
+/// actually using here, if any — see `docs/research/dependency-link-trees.md`:
+/// with a warm store the marginal cost per checkout is pnpm 6–7 MiB and Bun's
+/// global store 3 MiB, both under wt0's own dependency-metadata bar, while a
+/// manager with no such mode (npm, Yarn classic, Yarn Berry's default
+/// `node-modules` linker) pays the full hoisted-tree cost every checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeStore {
+    /// pnpm's content-addressable store — default behavior, nothing to opt into.
+    Pnpm,
+    /// Bun's isolated linker with `globalStore = true` in `bunfig.toml`.
+    BunGlobalStore,
+    /// Yarn Berry with `.yarnrc.yml: nodeLinker: pnpm` — pnpm's own shape.
+    YarnPnpmLinker,
+    /// Yarn Berry's default Plug'n'Play mode: no `node_modules` at all.
+    YarnPnp,
+    /// This manager has no native link-tree store active.
+    None { manager: String },
+}
+
+/// Classify `manager`'s dependency layout at `root`. `bun` is the already
+/// computed Bun report (its version check gates whether the global store is
+/// something `wt0 doctor` can rely on as ready); pnpm and Yarn's `pnpm`
+/// linker need no such gate — their store is either configured or it isn't.
+fn native_store(root: &Path, manager: &str, bun: Option<&BunReport>) -> NativeStore {
+    match manager {
+        "pnpm" => NativeStore::Pnpm,
+        "bun" if bun.is_some_and(|report| bun_global_store_ready(report, root)) => {
+            NativeStore::BunGlobalStore
+        }
+        "yarn" if yarn_uses_pnp(root) => NativeStore::YarnPnp,
+        "yarn" if yarn_uses_pnpm_linker(root) => NativeStore::YarnPnpmLinker,
+        other => NativeStore::None {
+            manager: other.to_owned(),
+        },
+    }
+}
+
+/// One precise, actionable recommendation per manager that has no native
+/// store active, citing the measured number so the reader can weigh it
+/// against `docs/research/dependency-link-trees.md`. `None` when a native
+/// store is already in use (pnpm, Bun's global store, Yarn's pnpm linker or
+/// PnP) — there is nothing to recommend.
+fn native_store_recommendation(root: &Path, store: &NativeStore) -> Option<String> {
+    let NativeStore::None { manager } = store else {
+        return None;
+    };
+    match manager.as_str() {
+        "bun" => Some(BUN_GLOBAL_STORE_ADVICE.to_owned()),
+        "yarn" if root.join(".yarnrc.yml").is_file() => Some(
+            "Yarn Berry is not using a link-tree store here: set `.yarnrc.yml: nodeLinker: pnpm` \
+             for pnpm's own store shape (pnpm-shaped, ~6–7 MiB measured marginal cost per \
+             checkout with a warm store) instead of a full node_modules per checkout"
+                .to_owned(),
+        ),
+        "yarn" => Some(
+            "Yarn classic has no native link-tree store; migrate to Yarn Berry with \
+             `.yarnrc.yml: nodeLinker: pnpm`, or to pnpm, for a shared store (~6–7 MiB \
+             measured marginal cost per checkout with a warm store)"
+                .to_owned(),
+        ),
+        "npm" => Some(
+            "npm has no machine-wide store: its `--install-strategy=linked` keeps a \
+             per-project `.store`, measured identical to hoisted (~389 MiB per checkout); \
+             wt0 seeds node_modules from the base checkout behind an identical lockfile, but \
+             a shared store across worktrees means pnpm (`corepack use pnpm@latest`) or Bun \
+             with `globalStore = true`"
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
+/// The dependency facts `wt0 doctor` and `wt0 create` both need: which
+/// JavaScript package manager (if any) governs this tree, what native
+/// link-tree store it resolves to, and whether its dependencies are already
+/// usable. Doctor renders these into its promise line, recommendations, and
+/// verdict; `create` renders them into a one-line "run prepare" hint and its
+/// receipt's `dependencies` field (see `dependency_classification`).
+pub(crate) struct DependencyFacts {
+    pub(crate) manager: Option<String>,
+    pub(crate) manager_version: Option<String>,
+    pub(crate) store: Option<NativeStore>,
+    /// True when the dependency tree this manager would use is already
+    /// usable here — a ready native link-tree store, or an attached prepared
+    /// environment. False means `wt0 prepare --apply` (or `wt0 run`, which
+    /// does this automatically) has work to do.
+    pub(crate) manager_ready: bool,
+    pub(crate) prepared_key: Option<String>,
+    pub(crate) prepared_attached: bool,
+    pub(crate) bun_links_ready: bool,
+}
+
+fn dependency_facts(root: &Path) -> Result<DependencyFacts> {
+    let bun = bun_report(root);
+    let manager = javascript_package_manager(root)?;
+    let store = manager
+        .as_deref()
+        .map(|manager| native_store(root, manager, bun.as_ref()));
+    let manager_version = manager
+        .as_deref()
+        .and_then(|manager| package_manager_version(manager).ok());
+    let prepared_key = manager
+        .as_deref()
+        .zip(manager_version.as_deref())
+        .and_then(|(manager, version)| package_environment_key(root, manager, version).ok());
+    let prepared_attached = prepared_key
+        .as_deref()
+        .is_some_and(|key| prepared_marker_key(root).ok().flatten().as_deref() == Some(key));
+    let bun_links_ready = has_global_links(root).unwrap_or(false);
+    // pnpm and Yarn's pnpm linker need no prepared environment either: their
+    // native store already resolves whatever `node_modules` links to, the
+    // same way Bun's global store does once its links are ready.
+    let manager_ready = match &store {
+        None => true,
+        Some(NativeStore::BunGlobalStore) => bun_links_ready,
+        Some(NativeStore::YarnPnp) => true,
+        Some(NativeStore::Pnpm) | Some(NativeStore::YarnPnpmLinker) => {
+            root.join("node_modules").is_dir()
+        }
+        Some(NativeStore::None { .. }) => root.join("node_modules").is_dir() && prepared_attached,
+    };
+    Ok(DependencyFacts {
+        manager,
+        manager_version,
+        store,
+        manager_ready,
+        prepared_key,
+        prepared_attached,
+        bun_links_ready,
+    })
+}
+
+/// Whether `store` is a manager's own native link-tree store (pnpm, Yarn's
+/// pnpm linker or PnP, Bun's global store) — one that resolves `node_modules`
+/// on its own, with nothing for `wt0 prepare` to seal. Shared by `doctor`'s
+/// "seal" action gate and `create`'s dependency classification so the two
+/// never disagree about what counts as native.
+fn is_native_store(store: &Option<NativeStore>) -> bool {
+    matches!(
+        store,
+        Some(
+            NativeStore::Pnpm
+                | NativeStore::YarnPnpmLinker
+                | NativeStore::YarnPnp
+                | NativeStore::BunGlobalStore
+        )
+    )
+}
+
+/// The three-state summary `wt0 create`'s receipt reports for its new
+/// worktree: whether the dependency tree its manager would use is already
+/// usable, and how. `None` when no JavaScript package manager is detected —
+/// there is nothing to classify, and `create` prints no hint.
+pub(crate) fn dependency_classification(root: &Path) -> Result<Option<&'static str>> {
+    let facts = dependency_facts(root)?;
+    if facts.store.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(
+        match (facts.manager_ready, is_native_store(&facts.store)) {
+            (false, _) => "not-prepared",
+            (true, true) => "native",
+            (true, false) => "prepared",
+        },
+    ))
+}
+
 pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let requested = args.path.unwrap_or(std::env::current_dir()?);
     let root = git_root(&requested)?;
     let dependencies = dependency_storage(&root)?;
     let generated = generated_storage(&root)?;
     let bun = bun_report(&root);
-    let javascript_manager = javascript_package_manager(&root)?;
+    let DependencyFacts {
+        manager: javascript_manager,
+        manager_version,
+        store,
+        manager_ready,
+        prepared_key,
+        prepared_attached,
+        bun_links_ready,
+    } = dependency_facts(&root)?;
     // A materialized tree is only "stale" when Bun's global store should have
     // linked it; under the prepared-environment fallback it is the layout.
-    let stale = if javascript_manager.as_deref() == Some("bun")
-        && bun
-            .as_ref()
-            .is_some_and(|report| bun_global_store_ready(report, &root))
-    {
+    let stale = if matches!(store, Some(NativeStore::BunGlobalStore)) {
         dependencies.bun_backups + dependencies.materialized_root_entries
     } else {
         0
     };
-    let manager_version = javascript_manager
-        .as_deref()
-        .and_then(|manager| package_manager_version(manager).ok());
-    let prepared_key = javascript_manager
-        .as_deref()
-        .zip(manager_version.as_deref())
-        .and_then(|(manager, version)| package_environment_key(&root, manager, version).ok());
-    let prepared_attached = prepared_key
-        .as_deref()
-        .is_some_and(|key| prepared_marker_key(&root).ok().flatten().as_deref() == Some(key));
-    let bun_links_ready = has_global_links(&root).unwrap_or(false);
     let dependency_adapter_shipped = javascript_manager
         .as_deref()
         .is_none_or(|manager| matches!(manager, "bun" | "npm" | "pnpm" | "yarn"));
-    let manager_ready = match javascript_manager.as_deref() {
-        None => true,
-        Some("bun")
-            if bun
-                .as_ref()
-                .is_some_and(|report| bun_global_store_ready(report, &root)) =>
-        {
-            bun_links_ready
-        }
-        Some("yarn") if yarn_uses_pnp(&root) => true,
-        Some(_) => root.join("node_modules").is_dir() && prepared_attached,
-    };
-    let mut recommendations: Vec<String> = match javascript_manager.as_deref() {
-        Some("bun")
-            if !bun
-                .as_ref()
-                .is_some_and(|report| bun_global_store_ready(report, &root)) =>
-        {
-            vec![BUN_GLOBAL_STORE_ADVICE.to_owned()]
-        }
-        _ => Vec::new(),
-    };
+    // A manager's own native link-tree store resolves node_modules on its
+    // own; there is nothing for `wt0 prepare` to seal, so the seal action
+    // below must not fire alongside a "dependencies: native store (...)" line.
+    let native_store_active = is_native_store(&store);
+    let mut recommendations: Vec<String> = store
+        .as_ref()
+        .and_then(|store| native_store_recommendation(&root, store))
+        .into_iter()
+        .collect();
     // Every worktree that materializes a dependency tree — seeded, attached,
     // or installed — pays filesystem metadata per file, whatever the bytes
-    // share. Say what this tree costs before anyone relies on it.
+    // share. Say what this tree costs before anyone relies on it — but not
+    // for a native link-tree store: a pnpm or Yarn-pnpm tree's entries are
+    // hardlinks and symlinks into a shared store, not wt0 clones, so entry
+    // count does not predict their physical cost (docs/research/dependency-link-trees.md).
     let modules = root.join("node_modules");
-    let modules_files = if modules.is_dir() && !bun_links_ready {
-        worktree::tree_files(&modules)
-    } else {
-        0
+    let modules_files = match &store {
+        Some(NativeStore::Pnpm | NativeStore::YarnPnpmLinker | NativeStore::YarnPnp) => 0,
+        Some(NativeStore::BunGlobalStore) if bun_links_ready => 0,
+        _ if modules.is_dir() => worktree::tree_files(&modules),
+        _ => 0,
     };
-    let modules_metadata = modules_files * worktree::CLONED_FILE_METADATA_BYTES;
-    if modules_metadata > DEPENDENCY_METADATA_ADVICE_BYTES {
+    // wt0's own clone (seed or attach) is the number the 20 MiB bar is about;
+    // the native-install number is context for why it matters at all — see
+    // `worktree::CLONED_FILE_METADATA_BYTES` and
+    // `worktree::NATIVE_INSTALL_FILE_METADATA_BYTES`.
+    let wt0_metadata = modules_files * worktree::CLONED_FILE_METADATA_BYTES;
+    let native_metadata = modules_files * worktree::NATIVE_INSTALL_FILE_METADATA_BYTES;
+    if wt0_metadata > DEPENDENCY_METADATA_ADVICE_BYTES {
         recommendations.push(format!(
-            "node_modules holds {modules_files} files; every worktree that materializes it pays about {} of filesystem metadata (measured ~2 KB per file on APFS) — a link-tree layout (Bun's global store, pnpm) keeps a tree this size under 20 MiB",
-            format_mib(modules_metadata)
+            "node_modules holds {modules_files} files; a native install pays about {} of filesystem metadata per worktree (~2 KB/file measured), a wt0 seed or attach about {} (~400 B/file) — a link-tree layout (Bun's global store, pnpm) keeps a tree this size under 20 MiB",
+            format_mib(native_metadata),
+            format_mib(wt0_metadata)
         ));
     }
     let dependency_ready = dependency_adapter_shipped
@@ -177,18 +340,18 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let cow_available = worktree::discover_repo(&root)
         .and_then(|repo| worktree::cow::clone_supported(&repo.common_git_dir, &root))
         .unwrap_or(false);
-    let dependency_sharing = match javascript_manager.as_deref() {
+    let dependency_sharing = match &store {
         None => "none-detected".to_owned(),
-        Some("yarn") if yarn_uses_pnp(&root) => "native (Yarn PnP)".to_owned(),
-        Some("bun")
-            if bun
-                .as_ref()
-                .is_some_and(|report| bun_global_store_ready(report, &root)) =>
-        {
-            "native store (Bun global virtual store)".to_owned()
+        Some(NativeStore::YarnPnp) => "native (Yarn PnP)".to_owned(),
+        Some(NativeStore::BunGlobalStore) => "native store (Bun global virtual store)".to_owned(),
+        Some(NativeStore::Pnpm) => "native store (pnpm content-addressable store)".to_owned(),
+        Some(NativeStore::YarnPnpmLinker) => "native store (Yarn nodeLinker: pnpm)".to_owned(),
+        Some(NativeStore::None { manager }) if prepared_attached => {
+            format!("prepared environment ({manager})")
         }
-        Some(manager) if prepared_attached => format!("prepared environment ({manager})"),
-        Some(manager) => format!("not yet prepared ({manager}; run wt0 prepare --apply)"),
+        Some(NativeStore::None { manager }) => {
+            format!("not yet prepared ({manager}; run wt0 prepare --apply)")
+        }
     };
     let policy_paths = worktree::project_generated_policy(&root)
         .map(|paths| paths.len())
@@ -201,16 +364,29 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     } else {
         "report-only (no .wt0-generated policy; gc will refuse unknown ignored state)".to_owned()
     };
-    let mut shortfalls: Vec<&str> = Vec::new();
+    let mut shortfalls: Vec<String> = Vec::new();
     if !cow_available {
-        shortfalls.push("tracked files are full copies here: no copy-on-write on this volume");
+        shortfalls
+            .push("tracked files are full copies here: no copy-on-write on this volume".to_owned());
     }
     if dependency_sharing.starts_with("not yet prepared") {
-        shortfalls.push("dependencies are not shared until `wt0 prepare --apply` seals them");
+        shortfalls
+            .push("dependencies are not shared until `wt0 prepare --apply` seals them".to_owned());
     }
     if policy_paths == 0 {
-        shortfalls
-            .push("generated state cannot be reclaimed until a .wt0-generated policy is reviewed");
+        shortfalls.push(
+            "generated state cannot be reclaimed until a .wt0-generated policy is reviewed"
+                .to_owned(),
+        );
+    }
+    // `ready` can be false purely because generated state is over budget even
+    // when every other promise line above is clean — without this, the
+    // verdict would misreport "holds" while `ready: no`.
+    if !generated_ready {
+        shortfalls.push(format!(
+            "generated state exceeds the default budget ({})",
+            human_bytes(DEFAULT_GENERATED_BUDGET_BYTES)
+        ));
     }
     let verdict = match shortfalls.len() {
         0 => "holds",
@@ -313,7 +489,8 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
                 javascript_manager.as_deref().unwrap_or("package-manager")
             );
         }
-        if dependencies.materialized_store_entries > 0 && !prepared_attached {
+        if dependencies.materialized_store_entries > 0 && !prepared_attached && !native_store_active
+        {
             println!(
                 "  action: seal the worktree-local post-install files with `wt0 prepare --apply`"
             );
@@ -459,11 +636,10 @@ fn migrate_one(
     let generated = generated_storage(root)?;
     let bun = bun_report(root);
     let manager = javascript_package_manager(root)?;
-    let stale_before = if manager.as_deref() == Some("bun")
-        && bun
-            .as_ref()
-            .is_some_and(|report| bun_global_store_ready(report, root))
-    {
+    let store = manager
+        .as_deref()
+        .map(|manager| native_store(root, manager, bun.as_ref()));
+    let stale_before = if matches!(store, Some(NativeStore::BunGlobalStore)) {
         dependencies_before.bun_backups + dependencies_before.materialized_root_entries
     } else {
         0
@@ -479,11 +655,17 @@ fn migrate_one(
     let prepared_attached = prepared_key
         .as_deref()
         .is_some_and(|key| prepared_marker_key(root).ok().flatten().as_deref() == Some(key));
-    let needs_prepared_environment = match manager.as_deref() {
+    // pnpm and Yarn's pnpm linker need no wt0-sealed environment either: a
+    // native store is never sealed (`prepare_native_store`), so there is
+    // nothing here for migrate to attach — treat dependencies as already
+    // migrated, the same way Yarn PnP already was.
+    let needs_prepared_environment = match &store {
         None => false,
-        Some("yarn") if yarn_uses_pnp(root) => false,
-        Some("bun") => dependencies_before.materialized_store_entries > 0 && !prepared_attached,
-        Some(_) => !prepared_attached,
+        Some(NativeStore::YarnPnp | NativeStore::Pnpm | NativeStore::YarnPnpmLinker) => false,
+        Some(NativeStore::BunGlobalStore) => {
+            dependencies_before.materialized_store_entries > 0 && !prepared_attached
+        }
+        Some(NativeStore::None { .. }) => !prepared_attached,
     };
     let source_before = worktree::migrate_identical_source(root, baseline_ref, false)?;
     let repo = worktree::discover_repo(root)?;
@@ -565,11 +747,7 @@ fn migrate_one(
             let version = manager_version
                 .as_deref()
                 .context("prepared environment has no package-manager version")?;
-            if selected == "bun"
-                && bun
-                    .as_ref()
-                    .is_some_and(|report| bun_global_store_ready(report, root))
-            {
+            if matches!(store, Some(NativeStore::BunGlobalStore)) {
                 prepare_bun_environment(root, key, version)?;
             } else {
                 prepare_portable_node_environment(root, selected, key, version)?;
@@ -649,35 +827,49 @@ pub fn prepare(args: Prepare, json_output: bool) -> Result<()> {
     let root = git_root(&requested)?;
     let manager = javascript_package_manager(&root)?
         .context("no JavaScript package-manager lockfile was found")?;
-    if manager == "yarn" && yarn_uses_pnp(&root) {
-        emit_prepare(
-            json_output,
-            &root,
-            false,
-            0,
-            None,
-            None,
-            "Yarn Plug'n'Play or zero-install is already repository-native; no node_modules environment is needed",
-        )?;
-        return Ok(());
+    if manager == "bun" {
+        return prepare_bun(&root, args.apply, json_output);
     }
-    if manager != "bun" {
-        return prepare_node_environment(&root, &manager, args.apply, json_output);
+    match native_store(&root, &manager, None) {
+        NativeStore::YarnPnp => {
+            emit_prepare(
+                json_output,
+                PrepareReceipt {
+                    root: &root,
+                    applied: false,
+                    bytes: 0,
+                    environment_key: None,
+                    physical_delta: None,
+                    message: "Yarn Plug'n'Play or zero-install is already repository-native; no node_modules environment is needed",
+                    clone_kind: None,
+                },
+            )?;
+            Ok(())
+        }
+        NativeStore::Pnpm | NativeStore::YarnPnpmLinker => {
+            prepare_native_store(&root, &manager, args.apply, json_output)
+        }
+        NativeStore::BunGlobalStore | NativeStore::None { .. } => {
+            prepare_node_environment(&root, &manager, args.apply, json_output)
+        }
     }
-    prepare_bun(&root, args.apply, json_output)
 }
 
 pub(crate) fn prepare_for_agent_run(root: &Path) -> Result<()> {
     let Some(manager) = javascript_package_manager(root)? else {
         return Ok(());
     };
-    if manager == "yarn" && yarn_uses_pnp(root) {
-        return Ok(());
-    }
     if manager == "bun" {
-        prepare_bun(root, true, false)
-    } else {
-        prepare_node_environment(root, &manager, true, false)
+        return prepare_bun(root, true, false);
+    }
+    match native_store(root, &manager, None) {
+        NativeStore::YarnPnp => Ok(()),
+        NativeStore::Pnpm | NativeStore::YarnPnpmLinker => {
+            prepare_native_store(root, &manager, true, false)
+        }
+        NativeStore::BunGlobalStore | NativeStore::None { .. } => {
+            prepare_node_environment(root, &manager, true, false)
+        }
     }
 }
 
@@ -724,12 +916,15 @@ fn prepare_bun(root: &Path, apply: bool, json_output: bool) -> Result<()> {
     if !apply {
         emit_prepare(
             json_output,
-            root,
-            false,
-            stale,
-            environment_key.as_deref(),
-            None,
-            "dry run; repeat with --apply after reviewing the exact target",
+            PrepareReceipt {
+                root,
+                applied: false,
+                bytes: stale,
+                environment_key: environment_key.as_deref(),
+                physical_delta: None,
+                message: "dry run; repeat with --apply after reviewing the exact target",
+                clone_kind: None,
+            },
         )?;
         return Ok(());
     }
@@ -761,17 +956,22 @@ fn prepare_bun(root: &Path, apply: bool, json_output: bool) -> Result<()> {
     }
     emit_prepare(
         json_output,
-        root,
-        true,
-        stale,
-        prepared
-            .as_ref()
-            .map(|environment| environment.key.as_str()),
-        Some(i128::from(physical_after) - i128::from(physical_before)),
-        prepared
-            .as_ref()
-            .map(|environment| environment.action)
-            .unwrap_or("stale dependency layout retired after verification"),
+        PrepareReceipt {
+            root,
+            applied: true,
+            bytes: stale,
+            environment_key: prepared
+                .as_ref()
+                .map(|environment| environment.key.as_str()),
+            physical_delta: Some(i128::from(physical_after) - i128::from(physical_before)),
+            message: prepared
+                .as_ref()
+                .map(|environment| environment.action.as_str())
+                .unwrap_or("stale dependency layout retired after verification"),
+            clone_kind: prepared
+                .as_ref()
+                .and_then(|environment| environment.clone_kind),
+        },
     )
 }
 
@@ -784,15 +984,24 @@ fn prepare_node_environment(
     assert_node_modules_ignored(root)?;
     let version = package_manager_version(manager)?;
     let key = package_environment_key(root, manager, &version)?;
+    // Captured once, before anything runs: on the first seal of an empty
+    // tree (no node_modules yet) this is 0, and it must stay 0 in the
+    // receipt even though `prepare_portable_node_environment` below fills
+    // node_modules in — the field reports what is being replaced, not what
+    // the attach left behind.
+    let bytes_to_replace = logical_bytes(&root.join("node_modules"))?;
     if !apply {
         emit_prepare(
             json_output,
-            root,
-            false,
-            logical_bytes(&root.join("node_modules"))?,
-            Some(&key),
-            None,
-            "dry run; repeat with --apply after reviewing the exact target",
+            PrepareReceipt {
+                root,
+                applied: false,
+                bytes: bytes_to_replace,
+                environment_key: Some(&key),
+                physical_delta: None,
+                message: "dry run; repeat with --apply after reviewing the exact target",
+                clone_kind: None,
+            },
         )?;
         return Ok(());
     }
@@ -812,12 +1021,96 @@ fn prepare_node_environment(
     let physical_after = filesystem_free_bytes(root)?;
     emit_prepare(
         json_output,
-        root,
-        true,
-        logical_bytes(&root.join("node_modules"))?,
-        Some(&prepared.key),
-        Some(i128::from(physical_after) - i128::from(physical_before)),
-        prepared.action,
+        PrepareReceipt {
+            root,
+            applied: true,
+            bytes: bytes_to_replace,
+            environment_key: Some(&prepared.key),
+            physical_delta: Some(i128::from(physical_after) - i128::from(physical_before)),
+            message: &prepared.action,
+            clone_kind: prepared.clone_kind,
+        },
+    )
+}
+
+/// A repository whose manager already runs its own native link-tree store
+/// (pnpm, Yarn Berry's `nodeLinker: pnpm`) needs no wt0-sealed prepared
+/// environment: sealing one the way `prepare_portable_node_environment` does
+/// would clone the store's hardlinks into wt0 clones — the exact cost the
+/// seed gate now refuses to pay (`node_modules_seed_refusal`'s "native store
+/// is cheaper"). Instead this runs the manager's own frozen install directly
+/// against its shared store — the marginal cost per checkout is 6–7 MiB once
+/// the store is warm (docs/research/dependency-link-trees.md) — but only
+/// when `node_modules` is missing or the local marker shows its lockfile
+/// changed since the last install; otherwise there is nothing to do, and no
+/// `.wt0-environment.json` is written, because there is nothing sealed.
+fn prepare_native_store(root: &Path, manager: &str, apply: bool, json_output: bool) -> Result<()> {
+    assert_node_modules_ignored(root)?;
+    let lock = manager_lockfile(root, manager)?;
+    let lockfile_hash =
+        content_hash(&fs::read(&lock).with_context(|| format!("read {}", lock.display()))?)?;
+    let modules = root.join("node_modules");
+    let stale = !modules.is_dir()
+        || native_store_marker_key(root)?.as_deref() != Some(lockfile_hash.as_str());
+    if !stale {
+        emit_prepare(
+            json_output,
+            PrepareReceipt {
+                root,
+                applied: false,
+                bytes: 0,
+                environment_key: None,
+                physical_delta: None,
+                message: &format!(
+                    "native store ({manager}): already installed from the shared store; nothing to seal"
+                ),
+                clone_kind: None,
+            },
+        )?;
+        return Ok(());
+    }
+    if !apply {
+        emit_prepare(
+            json_output,
+            PrepareReceipt {
+                root,
+                applied: false,
+                bytes: 0,
+                environment_key: None,
+                physical_delta: None,
+                message: "dry run; repeat with --apply after reviewing the exact target",
+                clone_kind: None,
+            },
+        )?;
+        return Ok(());
+    }
+    let dirty_entries = git_dirty_count(root)?;
+    if dirty_entries > 0 {
+        bail!("refusing dependency preparation in dirty worktree ({dirty_entries} entries)");
+    }
+    if modules.exists() {
+        if let Some(path) = crate::process::live_open_path(&modules)? {
+            bail!("refusing dependency preparation while a process uses {path}");
+        }
+    }
+    let version = package_manager_version(manager)?;
+    let physical_before = filesystem_free_bytes(root)?;
+    run_package_manager_install(root, manager, &version)?;
+    write_native_store_marker(root, manager, &lockfile_hash)?;
+    let physical_after = filesystem_free_bytes(root)?;
+    emit_prepare(
+        json_output,
+        PrepareReceipt {
+            root,
+            applied: true,
+            bytes: 0,
+            environment_key: None,
+            physical_delta: Some(i128::from(physical_after) - i128::from(physical_before)),
+            message: &format!(
+                "native store ({manager}): installed from the shared store; nothing to seal"
+            ),
+            clone_kind: None,
+        },
     )
 }
 
@@ -836,13 +1129,16 @@ fn prepare_portable_node_environment(
         if prepared_marker_key(root)?.as_deref() == Some(key) {
             return Ok(PreparedEnvironment {
                 key: key.to_owned(),
-                action: "prepared environment already attached",
+                action: "prepared environment already attached".to_owned(),
+                clone_kind: None,
             });
         }
-        attach_portable_node_environment(root, &exact_modules, manager, key, version, false)?;
+        let clone_kind =
+            attach_portable_node_environment(root, &exact_modules, manager, key, version, false)?;
         return Ok(PreparedEnvironment {
             key: key.to_owned(),
-            action: "attached exact prepared environment",
+            action: "attached exact prepared environment".to_owned(),
+            clone_kind: Some(clone_kind),
         });
     }
     if exact.exists() {
@@ -854,29 +1150,91 @@ fn prepare_portable_node_environment(
 
     let platform_identity = platform_identity()?;
     let parent = newest_manager_environment(&family, manager, version, &platform_identity)?;
-    if let Some(parent) = &parent {
-        attach_portable_node_environment(
+    let mut derived_from_base = false;
+    let clone_kind = if let Some(parent) = &parent {
+        Some(attach_portable_node_environment(
             root,
             &parent.join("node_modules"),
             manager,
             key,
             version,
             true,
-        )?;
+        )?)
     } else {
+        let seed_kind = seed_node_modules_from_base(root, manager)?;
+        derived_from_base = seed_kind.is_some();
         run_package_manager_install(root, manager, version)?;
         write_prepared_marker_for(root, manager, key, version)?;
-    }
+        seed_kind
+    };
     validate_environment_links(root, &root.join("node_modules"))?;
     publish_manager_environment(root, &family, manager, key, version, &platform_identity)?;
     Ok(PreparedEnvironment {
         key: key.to_owned(),
-        action: if parent.is_some() {
-            "derived and sealed a prepared environment from the nearest compatible snapshot"
-        } else {
-            "sealed the first prepared environment for this platform"
-        },
+        action: prepared_environment_action(parent.is_some(), derived_from_base),
+        clone_kind,
     })
+}
+
+/// The message reported for a freshly sealed (never-before-cached) prepared
+/// environment: whether the manager's install ran from scratch, or reconciled
+/// on top of a clone of the base checkout's own `node_modules` (see
+/// `seed_node_modules_from_base`). A `parent` cache hit (an existing
+/// compatible snapshot in the store) always takes priority over both, since
+/// it needs no install at all beyond the reconcile.
+fn prepared_environment_action(has_parent: bool, derived_from_base: bool) -> String {
+    if has_parent {
+        "derived and sealed a prepared environment from the nearest compatible snapshot".to_owned()
+    } else if derived_from_base {
+        "sealed the first prepared environment for this platform, derived from the base checkout's node_modules".to_owned()
+    } else {
+        "sealed the first prepared environment for this platform".to_owned()
+    }
+}
+
+/// Before a genuinely new environment key installs into an empty
+/// `node_modules`, try seeding it from the base checkout's own
+/// `node_modules` first: a copy-on-write clone shares the store's blocks,
+/// and the manager's ordinary install then reconciles only what differs
+/// from the base — measured to write nothing at all when the lockfile
+/// matches (`docs/design-partners/drift.md`). See
+/// `worktree::base_node_modules_seed_for_prepare` for the soundness gate:
+/// matching lockfile, matching manager, matching Bun linker layout, and the
+/// base tree not mid-install. Never fatal: a clone failure (typically no
+/// copy-on-write between the two locations) falls back to the ordinary
+/// from-scratch install, exactly as `wt0 create`'s seed-from-base policy
+/// does for the same reason.
+fn seed_node_modules_from_base(
+    root: &Path,
+    manager: &str,
+) -> Result<Option<worktree::cow::CloneKind>> {
+    let repo = match worktree::discover_repo(root) {
+        Ok(repo) => repo,
+        Err(_) => return Ok(None),
+    };
+    let base = &repo.main_worktree;
+    if base.as_path() == root || !worktree::base_node_modules_seed_for_prepare(base, root, manager)
+    {
+        return Ok(None);
+    }
+    let modules = root.join("node_modules");
+    if modules.exists() {
+        return Ok(None);
+    }
+    let seeded = (|| -> Result<worktree::cow::CloneKind> {
+        fs::create_dir(&modules).context("create node_modules for the base-checkout seed")?;
+        worktree::cow::clone_tree(&base.join("node_modules"), &modules)
+    })();
+    match seeded {
+        Ok(clone_kind) => Ok(Some(clone_kind)),
+        Err(error) => {
+            eprintln!(
+                "wt0: could not seed node_modules from the base checkout ({error:#}); installing fresh"
+            );
+            let _ = fs::remove_dir_all(&modules);
+            Ok(None)
+        }
+    }
 }
 
 fn attach_portable_node_environment(
@@ -886,7 +1244,7 @@ fn attach_portable_node_environment(
     key: &str,
     version: &str,
     reconcile: bool,
-) -> Result<()> {
+) -> Result<worktree::cow::CloneKind> {
     let modules = root.join("node_modules");
     let parent = root.parent().context("worktree root has no parent")?;
     let rollback = parent.join(format!(".wt0-environment-rollback-{}", Uuid::now_v7()));
@@ -894,29 +1252,34 @@ fn attach_portable_node_environment(
     if had_modules {
         fs::rename(&modules, &rollback).context("move dependency tree into exact rollback")?;
     }
-    let attempt = (|| -> Result<()> {
+    let attempt = (|| -> Result<worktree::cow::CloneKind> {
         fs::create_dir(&modules).context("create private prepared-environment view")?;
-        worktree::cow::clone_tree(source_modules, &modules)
+        let clone_kind = worktree::cow::clone_tree(source_modules, &modules)
             .context("attach copy-on-write prepared environment")?;
         if reconcile {
             run_package_manager_install(root, manager, version)?;
         }
         write_prepared_marker_for(root, manager, key, version)?;
-        validate_environment_links(root, &modules)
+        validate_environment_links(root, &modules)?;
+        Ok(clone_kind)
     })();
-    if let Err(error) = attempt {
-        if modules.exists() {
-            fs::remove_dir_all(&modules).context("remove failed prepared-environment view")?;
+    match attempt {
+        Ok(clone_kind) => {
+            if had_modules {
+                fs::remove_dir_all(&rollback).context("retire verified dependency rollback")?;
+            }
+            Ok(clone_kind)
         }
-        if had_modules {
-            fs::rename(&rollback, &modules).context("restore dependency rollback")?;
+        Err(error) => {
+            if modules.exists() {
+                fs::remove_dir_all(&modules).context("remove failed prepared-environment view")?;
+            }
+            if had_modules {
+                fs::rename(&rollback, &modules).context("restore dependency rollback")?;
+            }
+            Err(error.context("prepared-environment attach failed; original tree restored"))
         }
-        return Err(error.context("prepared-environment attach failed; original tree restored"));
     }
-    if had_modules {
-        fs::remove_dir_all(&rollback).context("retire verified dependency rollback")?;
-    }
-    Ok(())
 }
 
 fn run_package_manager_install(root: &Path, manager: &str, version: &str) -> Result<()> {
@@ -966,7 +1329,13 @@ fn manager_lockfile(root: &Path, manager: &str) -> Result<PathBuf> {
         .iter()
         .map(|name| root.join(name))
         .find(|path| path.is_file())
-        .with_context(|| format!("{manager} lockfile was not found"))
+        .with_context(|| {
+            format!(
+                "no {manager} lockfile found; the four managers' lockfiles are \
+                 package-lock.json/npm-shrinkwrap.json (npm), pnpm-lock.yaml (pnpm), \
+                 yarn.lock (yarn), and bun.lock/bun.lockb (bun) — {manager}'s must be committed"
+            )
+        })
 }
 
 fn repair_dependency_layout(root: &Path, before: &DependencyStorage) -> Result<()> {
@@ -988,15 +1357,33 @@ fn repair_dependency_layout(root: &Path, before: &DependencyStorage) -> Result<(
     }
 }
 
-fn emit_prepare(
-    json_output: bool,
-    root: &Path,
+/// Everything one `wt0 prepare` outcome reports, bundled so `emit_prepare`
+/// doesn't grow another positional bool or `Option` every time it learns to
+/// report one more thing (see `clone_kind`, added alongside the clone-path
+/// visibility work).
+struct PrepareReceipt<'a> {
+    root: &'a Path,
     applied: bool,
     bytes: u64,
-    environment_key: Option<&str>,
+    environment_key: Option<&'a str>,
     physical_delta: Option<i128>,
-    message: &str,
-) -> Result<()> {
+    message: &'a str,
+    /// How this call's dependency tree was cloned, if it cloned one at all —
+    /// `None` when nothing was cloned this call (a dry run, a cache hit, a
+    /// native-store install, or a from-scratch install with no base seed).
+    clone_kind: Option<worktree::cow::CloneKind>,
+}
+
+fn emit_prepare(json_output: bool, receipt: PrepareReceipt) -> Result<()> {
+    let PrepareReceipt {
+        root,
+        applied,
+        bytes,
+        environment_key,
+        physical_delta,
+        message,
+        clone_kind,
+    } = receipt;
     if json_output {
         println!(
             "{}",
@@ -1008,16 +1395,20 @@ fn emit_prepare(
                 "environment_key": environment_key,
                 "physical_free_space_delta_bytes": physical_delta,
                 "message": message,
+                "clone": clone_kind.map(worktree::cow::CloneKind::label),
             }))?
         );
     } else {
         println!("Worktree Zero prepare: {}", root.display());
-        println!("  stale dependency layout: {}", human_bytes(bytes));
+        println!("  dependency tree to replace: {}", human_bytes(bytes));
         if let Some(key) = environment_key {
             println!("  prepared environment: {key}");
         }
         if let Some(delta) = physical_delta {
             println!("  filesystem free-space delta: {delta} bytes");
+        }
+        if let Some(kind) = clone_kind {
+            println!("  clone: {}", kind.label());
         }
         println!("  {message}");
     }
@@ -1041,13 +1432,15 @@ fn prepare_bun_environment(
         if marker_key.as_deref() == Some(key) {
             return Ok(PreparedEnvironment {
                 key: key.to_owned(),
-                action: "prepared environment already attached",
+                action: "prepared environment already attached".to_owned(),
+                clone_kind: None,
             });
         }
-        attach_prepared_environment(root, &exact_modules, key, bun_version)?;
+        let clone_kind = attach_prepared_environment(root, &exact_modules, key, bun_version)?;
         return Ok(PreparedEnvironment {
             key: key.to_owned(),
-            action: "attached exact prepared environment",
+            action: "attached exact prepared environment".to_owned(),
+            clone_kind: Some(clone_kind),
         });
     }
 
@@ -1060,25 +1453,32 @@ fn prepare_bun_environment(
 
     let modules = root.join("node_modules");
     let parent = newest_prepared_environment(&family, bun_version, &platform_identity)?;
-    if let Some(parent) = &parent {
-        attach_prepared_environment(root, &parent.join("node_modules"), key, bun_version)?;
+    let mut derived_from_base = false;
+    let clone_kind = if let Some(parent) = &parent {
+        Some(attach_prepared_environment(
+            root,
+            &parent.join("node_modules"),
+            key,
+            bun_version,
+        )?)
     } else if modules.is_dir() {
         replace_dependency_tree(root)?;
         write_prepared_marker(root, key, bun_version)?;
+        None
     } else {
+        let seed_kind = seed_node_modules_from_base(root, "bun")?;
+        derived_from_base = seed_kind.is_some();
         run_bun_install(root)?;
         write_prepared_marker(root, key, bun_version)?;
-    }
+        seed_kind
+    };
     validate_environment_links(root, &modules)?;
     publish_prepared_environment(root, &family, key, bun_version, &platform_identity)?;
 
     Ok(PreparedEnvironment {
         key: key.to_owned(),
-        action: if parent.is_some() {
-            "derived and sealed a prepared environment from the nearest compatible snapshot"
-        } else {
-            "sealed the first prepared environment for this platform"
-        },
+        action: prepared_environment_action(parent.is_some(), derived_from_base),
+        clone_kind,
     })
 }
 
@@ -1345,9 +1745,23 @@ fn package_manager_version(manager: &str) -> Result<String> {
 fn yarn_uses_pnp(root: &Path) -> bool {
     root.join(".pnp.cjs").is_file()
         || root.join(".pnp.js").is_file()
-        || fs::read_to_string(root.join(".yarnrc.yml"))
-            .ok()
-            .is_some_and(|config| config.lines().any(|line| line.trim() == "nodeLinker: pnp"))
+        || yarn_node_linker(root).as_deref() == Some("pnp")
+}
+
+/// `.yarnrc.yml`'s `nodeLinker` value, if the file exists and sets one.
+fn yarn_node_linker(root: &Path) -> Option<String> {
+    let config = fs::read_to_string(root.join(".yarnrc.yml")).ok()?;
+    config.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("nodeLinker:")
+            .map(|value| value.trim().to_owned())
+    })
+}
+
+/// Whether `.yarnrc.yml` selects Yarn Berry's `nodeLinker: pnpm` — pnpm's own
+/// content-addressable-store shape, not the default PnP layout.
+fn yarn_uses_pnpm_linker(root: &Path) -> bool {
+    yarn_node_linker(root).as_deref() == Some("pnpm")
 }
 
 fn newest_manager_environment(
@@ -1533,7 +1947,7 @@ fn attach_prepared_environment(
     source_modules: &Path,
     key: &str,
     bun_version: &str,
-) -> Result<()> {
+) -> Result<worktree::cow::CloneKind> {
     let modules = root.join("node_modules");
     let parent = root.parent().context("worktree root has no parent")?;
     let rollback = parent.join(format!(".wt0-environment-rollback-{}", Uuid::now_v7()));
@@ -1541,27 +1955,32 @@ fn attach_prepared_environment(
     if had_modules {
         fs::rename(&modules, &rollback).context("move dependency tree into exact rollback")?;
     }
-    let attempt = (|| -> Result<()> {
+    let attempt = (|| -> Result<worktree::cow::CloneKind> {
         fs::create_dir(&modules).context("create private prepared-environment view")?;
-        worktree::cow::clone_tree(source_modules, &modules)
+        let clone_kind = worktree::cow::clone_tree(source_modules, &modules)
             .context("attach copy-on-write prepared environment")?;
         run_bun_install(root)?;
         write_prepared_marker(root, key, bun_version)?;
-        validate_environment_links(root, &modules)
+        validate_environment_links(root, &modules)?;
+        Ok(clone_kind)
     })();
-    if let Err(error) = attempt {
-        if modules.exists() {
-            fs::remove_dir_all(&modules).context("remove failed prepared-environment view")?;
+    match attempt {
+        Ok(clone_kind) => {
+            if had_modules {
+                fs::remove_dir_all(&rollback).context("retire verified dependency rollback")?;
+            }
+            Ok(clone_kind)
         }
-        if had_modules {
-            fs::rename(&rollback, &modules).context("restore dependency rollback")?;
+        Err(error) => {
+            if modules.exists() {
+                fs::remove_dir_all(&modules).context("remove failed prepared-environment view")?;
+            }
+            if had_modules {
+                fs::rename(&rollback, &modules).context("restore dependency rollback")?;
+            }
+            Err(error.context("prepared-environment attach failed; original tree restored"))
         }
-        return Err(error.context("prepared-environment attach failed; original tree restored"));
     }
-    if had_modules {
-        fs::remove_dir_all(&rollback).context("retire verified dependency rollback")?;
-    }
-    Ok(())
 }
 
 fn run_bun_install(root: &Path) -> Result<()> {
@@ -1619,6 +2038,57 @@ fn write_prepared_marker_for(
         }))?,
     )
     .context("write prepared-environment marker")
+}
+
+/// A stable content hash via `git hash-object` — the same identity
+/// technique `package_environment_key` uses, deterministic across process
+/// runs (unlike `std::hash`'s randomized default), with no extra hashing
+/// dependency.
+fn content_hash(bytes: &[u8]) -> Result<String> {
+    let mut child = Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("start content hash")?;
+    child
+        .stdin
+        .take()
+        .context("open content hash input")?
+        .write_all(bytes)
+        .context("write content hash input")?;
+    let output = child.wait_with_output().context("compute content hash")?;
+    if !output.status.success() {
+        bail!("git hash-object failed while hashing content");
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+/// The lockfile hash a native store's `node_modules` was last installed
+/// against, if `root` carries the marker. Separate from
+/// `.wt0-environment.json`, which names a wt0-sealed prepared environment —
+/// a native store is never sealed, so this only tracks local staleness.
+fn native_store_marker_key(root: &Path) -> Result<Option<String>> {
+    let marker = root.join("node_modules/.wt0-native-store.json");
+    let bytes = match fs::read(&marker) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read native-store marker"),
+    };
+    let value: Value = serde_json::from_slice(&bytes).context("parse native-store marker")?;
+    Ok(value["lockfile_hash"].as_str().map(str::to_owned))
+}
+
+fn write_native_store_marker(root: &Path, manager: &str, lockfile_hash: &str) -> Result<()> {
+    fs::write(
+        root.join("node_modules/.wt0-native-store.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "adapter": manager,
+            "lockfile_hash": lockfile_hash,
+        }))?,
+    )
+    .context("write native-store marker")
 }
 
 /// Walk the tree natively (no external `find`) and refuse symlinks whose
@@ -1702,7 +2172,11 @@ fn replace_dependency_tree(root: &Path) -> Result<()> {
 
 fn assert_node_modules_ignored(root: &Path) -> Result<()> {
     if !node_modules_ignored(root)? {
-        bail!("node_modules is not ignored in {}", root.display());
+        bail!(
+            "node_modules is not ignored in {}: add \"node_modules/\" to a committed .gitignore \
+             (an uncommitted .gitignore does not reach a worktree)",
+            root.display()
+        );
     }
     Ok(())
 }
@@ -1787,6 +2261,21 @@ pub(crate) fn bun_isolated_global_store(root: &Path) -> bool {
         && config
             .lines()
             .any(|line| line.trim() == "globalStore = true")
+}
+
+/// The active native link-tree store at `root`, if any — pnpm's store
+/// (default, unconditional), Bun's isolated linker with `globalStore = true`,
+/// or Yarn Berry's `nodeLinker: pnpm`. Unlike `wt0 doctor`'s [`NativeStore`]
+/// classification this gates on configuration alone, no Bun-version check:
+/// the seed gate only needs to know a native install would be cheaper than
+/// cloning the base's tree, not whether wt0 can rely on it as "ready".
+pub(crate) fn native_link_tree_store(root: &Path, manager: &str) -> Option<&'static str> {
+    match manager {
+        "pnpm" => Some("pnpm content-addressable store"),
+        "bun" if bun_isolated_global_store(root) => Some("Bun global virtual store"),
+        "yarn" if yarn_uses_pnpm_linker(root) => Some("Yarn nodeLinker: pnpm"),
+        _ => None,
+    }
 }
 
 fn bun_report(root: &Path) -> Option<BunReport> {
@@ -2133,6 +2622,87 @@ fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn is_native_store_covers_every_link_tree_store() {
+        assert!(is_native_store(&Some(NativeStore::Pnpm)));
+        assert!(is_native_store(&Some(NativeStore::YarnPnpmLinker)));
+        assert!(is_native_store(&Some(NativeStore::YarnPnp)));
+        assert!(is_native_store(&Some(NativeStore::BunGlobalStore)));
+        assert!(!is_native_store(&Some(NativeStore::None {
+            manager: "npm".to_owned()
+        })));
+        assert!(!is_native_store(&None));
+    }
+
+    fn init_test_repo(root: &Path) {
+        fs::create_dir_all(root).expect("create fixture root");
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .expect("init fixture repository")
+            .success());
+    }
+
+    #[test]
+    fn node_modules_not_ignored_names_the_fix() {
+        let root = std::env::temp_dir().join(format!(
+            "wt0-not-ignored-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        init_test_repo(&root);
+
+        let error = assert_node_modules_ignored(&root)
+            .expect_err("a repository with no ignore rule for node_modules must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("node_modules is not ignored in"),
+            "{message}"
+        );
+        assert!(
+            message.contains("add \"node_modules/\" to a committed .gitignore"),
+            "{message}"
+        );
+        assert!(
+            message.contains("an uncommitted .gitignore does not reach a worktree"),
+            "{message}"
+        );
+
+        fs::remove_dir_all(root).expect("remove test fixture");
+    }
+
+    #[test]
+    fn manager_lockfile_names_all_four_lockfiles_when_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "wt0-no-lockfile-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        init_test_repo(&root);
+
+        let error = manager_lockfile(&root, "pnpm")
+            .expect_err("a repository with no pnpm-lock.yaml must be refused");
+        let message = error.to_string();
+        assert!(message.contains("no pnpm lockfile found"), "{message}");
+        assert!(
+            message.contains("package-lock.json/npm-shrinkwrap.json (npm)"),
+            "{message}"
+        );
+        assert!(message.contains("pnpm-lock.yaml (pnpm)"), "{message}");
+        assert!(message.contains("yarn.lock (yarn)"), "{message}");
+        assert!(message.contains("bun.lock/bun.lockb (bun)"), "{message}");
+        assert!(message.contains("pnpm's must be committed"), "{message}");
+
+        fs::remove_dir_all(root).expect("remove test fixture");
+    }
 
     #[test]
     fn finds_bun_migration_backups_and_generated_state_without_following_links() {

@@ -23,6 +23,31 @@ wt0 migrate --all --source-only
 wt0 migrate --all --source-only --apply --adopt
 ```
 
+### Inspecting the fleet
+
+`wt0 list` prints every worktree Git's own registry knows about, owned by
+Worktree Zero or not — path, commit, and branch, one line per worktree. Two
+lines from a real run, right after `wt0 create agent/add-tests` and
+`wt0 create agent/fix-checkout`:
+
+```text
+/Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-add-tests-99c97ab6     87194d1 [agent/add-tests]
+/Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-fix-checkout-9b8dc285  87194d1 [agent/fix-checkout]
+```
+
+`wt0 fleet` is the control view: every Worktree Zero runtime with its slot,
+port window, lease age, mode, and path — the one call an orchestrator needs
+(`wt0 fleet --json` for the machine-readable form). Same two runtimes:
+
+```text
+  agent/add-tests  slot 4  ports 22500+  lease 0s  cow-clone  /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-add-tests-99c97ab6
+  agent/fix-checkout  slot 1  ports 22300+  lease 1s  cow-clone  /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-fix-checkout-9b8dc285
+```
+
+Both worktrees above were created without `--path`: by default a worktree
+lives under `<repo>/.git/wt0/worktrees/<slug>/`, inside the repository's own
+`.git` directory, so nothing is added beside your checkout.
+
 ### Orphans: a checkout that vanished outside wt0
 
 An `rm -rf`, a wiped temp volume, or a crashed machine removes a checkout
@@ -34,6 +59,25 @@ generated root), recorded as an `orphaned` lifecycle event, and its port
 window released. A project reconciles its own external resources — a
 per-runtime database, a namespace — from those events; wt0 never deletes
 what only the project's hooks know about.
+
+### The baseline: deriving from the checkout
+
+`wt0 create` populates a new worktree from an immutable cached baseline —
+the commit's tracked tree, cloned copy-on-write. The first time a commit is
+requested, that baseline is derived from the cheapest sound source
+available, in order: the repository's own main working tree, if it is
+clean enough to trust; otherwise the nearest existing baseline already in
+the store (unchanged paths shared, the diff re-materialized); otherwise a
+full materialization from Git objects. Deriving from the checkout means
+clean tracked content clones straight from it — untracked, ignored, and
+locally modified paths are excluded and re-materialized from the commit
+instead, so a dirty checkout never leaks into a baseline. Any doubt about
+the result falls back to the next source rather than risk a wrong tree; the
+baseline's `derived-from` marker records which source won (`checkout`, a
+parent commit, or absent for a full materialization). This is what keeps
+the first worktree of a base commit from paying a second physical copy of
+content the checkout already holds — measured on FLAM,
+`docs/design-partners/flam-migration.md` ("After — D13").
 
 ### Seeding: the base checkout as the store
 
@@ -52,16 +96,16 @@ entries by content hash (Nx, Next, Turbo) treats a torn entry as a miss, so
 seeding from a base that is being written to is safe. On APFS the whole
 tree is cloned in one `clonefile` call; elsewhere file by file.
 
-**`node_modules` seeds behind an identical lockfile.** The base checkout is
-then the store for dependencies too: the package manager's ordinary install
-in the new worktree reconciles a tree that already matches and rewrites
-nothing. Measured (`docs/design-partners/flam-migration.md`, gap #7): after
-seeding an npm tree, `npm install` touched three paths and wrote 0 MiB;
-after seeding a hoisted Bun tree, `bun install` recreated only the workspace
-trees the root-only rule leaves out. With a *different* lockfile the
-reconcile leaves a mix of the base's layout and the worktree's, so the
-lockfile is the proof. Four conditions, checked in order, each with its own
-receipt reason:
+**`node_modules` seeds behind an identical lockfile — unless a native store
+already makes it cheaper.** The base checkout is the store for dependencies
+too: the package manager's ordinary install in the new worktree reconciles a
+tree that already matches and rewrites nothing. Measured
+(`docs/design-partners/flam-migration.md`, gap #7): after seeding an npm
+tree, `npm install` touched three paths and wrote 0 MiB; after seeding a
+hoisted Bun tree, `bun install` recreated only the workspace trees the
+root-only rule leaves out. With a *different* lockfile the reconcile leaves a
+mix of the base's layout and the worktree's, so the lockfile is the proof.
+Five conditions, checked in order, each with its own receipt reason:
 
 1. the seed is the root `node_modules` — a nested workspace tree is only part
    of a layout ("only the root node_modules can be seeded");
@@ -72,28 +116,48 @@ receipt reason:
    lockfile proves the base tree matches");
 3. for Bun, base and worktree ask for the same linker layout in
    `bunfig.toml` — a global-store link tree and a hoisted tree are different
-   shapes ("base and worktree must use the same Bun linker layout"); and
-4. no live process holds the base's `node_modules` open, so it is not
+   shapes ("base and worktree must use the same Bun linker layout");
+4. the base's manager has no active native link-tree store — pnpm always,
+   Bun's isolated linker with `globalStore = true`, Yarn Berry's
+   `.yarnrc.yml: nodeLinker: pnpm` — because cloning a hardlink tree turns
+   its hardlinks into wt0 clones that pay the full ~2 KB/file metadata cost,
+   and a native warm install measured cheaper than that clone: Bun's global
+   store 3 MiB native vs. 9 MiB wt0-seeded
+   (`docs/research/dependency-link-trees.md`, `docs/design-partners/flam-migration.md`
+   gap #7) ("native store is cheaper: `<store>`"); and
+5. no live process holds the base's `node_modules` open, so it is not
    mid-install ("base node_modules is in use").
 
-What the gate does not judge is size, because the cost is not the bytes.
-Copy-on-write shares blocks, not inodes: every worktree that materializes a
-tree — seeded, attached from a prepared environment, or installed natively —
-pays about 2 KB of filesystem metadata per file (measured on APFS: 236,332
-files cost 471 MiB per worktree, 11,687 cost 5 MiB, a 12,669-link Bun
-global-store tree 9 MiB). The receipt reports the file count, and `wt0
-doctor` states what that count costs per worktree once it passes 20 MiB —
-the point at which only a link-tree layout (Bun's global store, pnpm) keeps
-the promise for that tree.
+What the gate does not judge, for the trees it does seed, is size — the cost
+is not the bytes. Copy-on-write shares blocks, not inodes: every worktree
+that materializes a tree — seeded, attached from a prepared environment, or
+installed natively — pays about 2 KB of filesystem metadata per file
+(measured on APFS: 236,332 files cost 471 MiB per worktree, 11,687 cost
+5 MiB). The receipt reports the file count, and `wt0 doctor` states what
+that count costs per worktree once it passes 20 MiB — the point at which
+only a link-tree layout (pnpm, Bun's global store, Yarn's `nodeLinker: pnpm`)
+keeps the promise for that tree, and `doctor` no longer needs to: those
+layouts' entries are hardlinks and symlinks into a shared store, not
+materialized copies, so their entry count does not predict physical cost.
 
 A worktree whose lockfile changed gets its dependencies from a sealed
 prepared environment (`wt0 prepare`), the base's install made consistent and
-keyed to the lockfile, attached automatically.
+keyed to the lockfile, attached automatically. The same "base checkout as
+the store" idea applies to the very first seal of a new environment key too:
+when no compatible environment is cached yet and the base checkout's own
+`node_modules` passes the same trust conditions above (matching lockfile,
+matching manager, matching Bun linker layout, not mid-install), `wt0
+prepare` clones it as the starting point and lets the manager's ordinary
+install reconcile on top, instead of installing into empty air — measured
+to fall from 391.6 MiB to 8.9 MiB on an npm/Next fixture
+(`docs/design-partners/drift.md`, Scenario 2). Native-store managers (pnpm,
+Yarn's `nodeLinker: pnpm`) never reach this — they seal nothing, by design.
 
 The same rules as `.wt0-generated` apply: relative paths only; `.env*`,
 `.dev.vars`, and `secrets` are rejected by the policy. Per entry the create
 receipt reports `seeded`, `absent` (the base has nothing there), `refused`
-(tracked in the new worktree, or a dependency tree without a matching lockfile),
+(tracked in the new worktree, a dependency tree without a matching lockfile,
+or one a native link-tree store already makes cheaper to install than to clone),
 or `skipped` with a reason (no copy-on-write between the two locations — a
 full copy is never substituted). Mutable state — databases, emulator persistence, build
 *output* — stays private per runtime and must not be seeded. `--no-seed`

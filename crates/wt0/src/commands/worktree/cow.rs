@@ -1,9 +1,10 @@
 use super::{run_command, state_dir, RepoContext};
 use anyhow::{bail, Context, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread;
@@ -11,6 +12,42 @@ use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 const BASELINE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Which physical mechanism `clone_tree` used to move a directory's files:
+/// one atomic whole-directory clone, or the entry-by-entry fallback used
+/// when the filesystem has no whole-directory primitive (or it failed).
+/// The two cost very different amounts of filesystem metadata per file —
+/// measured on APFS at ≈400 B/file for a whole-directory `clonefile` versus
+/// ≈2 KB/file entry by entry (`docs/design-partners/flam-migration.md`,
+/// "Verification — hoisted node_modules per-worktree cost") — so a silent
+/// fallback from one to the other is exactly the kind of thing that made an
+/// earlier measurement land 5x higher than the settled number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloneKind {
+    /// One atomic whole-directory clone (APFS `clonefile`, Windows ReFS
+    /// block clone).
+    Directory,
+    /// Entry-by-entry fallback: one clone (or symlink recreation, or
+    /// directory creation) per tree entry.
+    PerFile,
+}
+
+impl CloneKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Directory => "directory",
+            Self::PerFile => "per-file",
+        }
+    }
+}
+
+/// `WT0_TRACE=1` prints which clone mechanism ran for every `clone_tree`
+/// call, to stderr — the fastest way to catch a silent fallback from the
+/// cheap whole-directory clone to the entry-by-entry path without
+/// instrumenting a benchmark script by hand.
+pub(crate) fn trace_enabled() -> bool {
+    std::env::var_os("WT0_TRACE").is_some_and(|value| value == "1")
+}
 
 /// Probe whether the filesystem holding both the state directory and the
 /// destination supports copy-on-write cloning: APFS `clonefile` on macOS,
@@ -145,14 +182,38 @@ fn preserve_modified_time(source: &Path, destination: &Path) -> Result<()> {
 /// recreated as symlinks. Equivalent to the former `cp -c -R source/. dest`
 /// without the platform-specific `cp` dependency. On APFS the whole tree is
 /// cloned in one `clonefile` call, which is tens of times faster than
-/// cloning file by file. Returns the number of files and symlinks cloned
-/// file-by-file — 0 on the atomic path, which clones in a single syscall and
-/// so never counts them.
-pub(crate) fn clone_tree(source: &Path, destination: &Path) -> Result<usize> {
-    if clone_tree_atomically(source, destination)? {
-        return Ok(0);
+/// cloning file by file — and, per the measurement in `CloneKind`'s doc
+/// comment, roughly 5x cheaper in filesystem metadata too. The entry-by-entry
+/// fallback clones files with a bounded pool of worker threads (see
+/// `clone_files_concurrently`): each clone is a kernel round trip — several
+/// `DeviceIoControl` calls on Windows — so concurrency hides that latency
+/// instead of paying it once per file, serially. Returns which mechanism
+/// actually ran, so a caller building a receipt (or `WT0_TRACE`) can tell
+/// the two apart instead of assuming the cheap path was taken.
+pub(crate) fn clone_tree(source: &Path, destination: &Path) -> Result<CloneKind> {
+    let (kind, cloned) = if clone_tree_atomically(source, destination)? {
+        (CloneKind::Directory, None)
+    } else {
+        let cloned = clone_tree_entries(source, destination)?;
+        (CloneKind::PerFile, Some(cloned))
+    };
+    if trace_enabled() {
+        match cloned {
+            Some(cloned) => eprintln!(
+                "wt0 trace: clone {} -> {} ({}, {cloned} files)",
+                source.display(),
+                destination.display(),
+                kind.label()
+            ),
+            None => eprintln!(
+                "wt0 trace: clone {} -> {} ({})",
+                source.display(),
+                destination.display(),
+                kind.label()
+            ),
+        }
     }
-    clone_tree_entries(source, destination)
+    Ok(kind)
 }
 
 /// APFS clones a directory hierarchy atomically, metadata included. The clone
@@ -418,26 +479,47 @@ pub(super) fn materialize_baseline_at(
     let cache = temporary.join("cache");
     let temporary_tree = cache.join("tree");
     fs::create_dir_all(&temporary_tree)?;
-    // Prefer deriving from the nearest existing baseline: unchanged files
-    // then share blocks across commits instead of every new base paying a
-    // full materialization. Any doubt about the derived tree falls back to
-    // the plain checkout, so correctness never depends on the shortcut.
-    let derived_from = match store_clones(&root)
-        .then(|| nearest_baseline(&root, repo, commit))
-        .flatten()
-    {
-        Some(parent) => match derive_baseline(repo, &root, &parent, commit, &temporary_tree) {
-            Ok(()) => Some(parent),
-            Err(error) => {
-                eprintln!(
-                    "wt0: could not derive baseline {commit} from {parent} ({error:#}); materializing in full"
-                );
-                let _ = fs::remove_dir_all(&temporary_tree);
-                fs::create_dir_all(&temporary_tree)?;
-                None
-            }
-        },
-        None => None,
+    // First choice: derive from the repository's own main working tree. It
+    // already holds the tracked content the store would otherwise recreate
+    // from Git objects, so a first baseline for a repository pays no second
+    // physical copy of it. Any doubt falls back to the store's own cached
+    // baselines, then a full materialization — correctness never depends on
+    // the shortcut.
+    let derived_from = match derive_baseline_from_checkout(repo, commit, &temporary_tree) {
+        Ok(true) => Some("checkout".to_owned()),
+        Ok(false) => None,
+        Err(error) => {
+            eprintln!(
+                "wt0: could not derive baseline {commit} from the checkout ({error:#}); trying cached baselines"
+            );
+            let _ = fs::remove_dir_all(&temporary_tree);
+            fs::create_dir_all(&temporary_tree)?;
+            None
+        }
+    };
+    // Next: derive from the nearest existing cached baseline — unchanged
+    // files then share blocks across commits instead of every new base
+    // paying a full materialization.
+    let derived_from = if derived_from.is_some() {
+        derived_from
+    } else {
+        match store_clones(&root)
+            .then(|| nearest_baseline(&root, repo, commit))
+            .flatten()
+        {
+            Some(parent) => match derive_baseline(repo, &root, &parent, commit, &temporary_tree) {
+                Ok(()) => Some(parent),
+                Err(error) => {
+                    eprintln!(
+                        "wt0: could not derive baseline {commit} from {parent} ({error:#}); materializing in full"
+                    );
+                    let _ = fs::remove_dir_all(&temporary_tree);
+                    fs::create_dir_all(&temporary_tree)?;
+                    None
+                }
+            },
+            None => None,
+        }
     };
     if derived_from.is_none() {
         if let Err(error) = materialize_baseline(repo, commit, &temporary_tree) {
@@ -567,8 +649,34 @@ fn derive_baseline(
         .args(["read-tree", commit]);
     run_command(&mut read_tree, "initialize derived baseline index")?;
 
+    // `read-tree` just replaced the whole index with `commit`'s flat listing,
+    // stat-less; nothing here started with valid stat data to lose, so the
+    // shared verification hashes every unchanged file exactly as before.
+    apply_changes_and_verify(repo, commit, destination, &index, &changes, false)
+}
+
+/// Apply a list of path-level changes (`tree_diff`'s A/M/T/D, or any non-`D`
+/// placeholder a caller assigns) onto a tree and index that are already
+/// positioned everywhere else, then prove the result is exactly `commit`'s
+/// tree: every tracked path matches and nothing untracked or ignored
+/// remains. Shared by derivation from a cached baseline (`derive_baseline`,
+/// whose freshly `read-tree`'d index carries no stat data at all) and
+/// derivation from the live checkout (`derive_baseline_from_checkout`, whose
+/// index inherits the checkout's own valid stat data for every path this
+/// function leaves untouched) — `checkstat_minimal` tells the verifying
+/// `status` to trust an inherited mtime and size instead of hashing the
+/// file, which is only sound when the caller's clone preserved the
+/// checkout's own modification times.
+fn apply_changes_and_verify(
+    repo: &RepoContext,
+    commit: &str,
+    destination: &Path,
+    index: &Path,
+    changes: &[(char, String)],
+    checkstat_minimal: bool,
+) -> Result<()> {
     let mut refresh: Vec<u8> = Vec::new();
-    for (status, path) in &changes {
+    for (status, path) in changes {
         let target = destination.join(path);
         // Remove first so a type change (file <-> symlink) never leaves the
         // old kind behind; checkout-index then recreates A/M/T entries.
@@ -598,22 +706,21 @@ fn derive_baseline(
     if !refresh.is_empty() {
         let mut checkout = Command::new("git");
         checkout
-            .env("GIT_INDEX_FILE", &index)
+            .env("GIT_INDEX_FILE", index)
             .arg(format!("--git-dir={}", repo.common_git_dir.display()))
             .arg(format!("--work-tree={}", destination.display()))
             .args(["checkout-index", "--force", "--index", "-z", "--stdin"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = checkout.spawn().context("refresh changed baseline paths")?;
         {
-            use std::io::Write;
             let mut stdin = child.stdin.take().context("checkout-index stdin")?;
             stdin.write_all(&refresh)?;
         }
         let output = child.wait_with_output()?;
         if !output.status.success() {
-            let _ = fs::remove_file(&index);
+            let _ = fs::remove_file(index);
             bail!(
                 "checkout-index failed: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -622,13 +729,22 @@ fn derive_baseline(
     }
 
     // Proof, not trust: every tracked path must match the commit byte for
-    // byte, and no untracked or ignored path may remain from the parent.
+    // byte, and no untracked or ignored path may remain from the source.
     // `status` refreshes the index first — plumbing `diff-index` would report
     // every file whose stat data is missing as modified without hashing it.
     // The refreshed index stays beside the tree: worktrees adopt it so their
     // own first `git status` never repeats this hashing pass.
-    let status = Command::new("git")
-        .env("GIT_INDEX_FILE", &index)
+    let mut status_command = Command::new("git");
+    status_command.env("GIT_INDEX_FILE", index);
+    if checkstat_minimal {
+        status_command.args([
+            "-c",
+            "core.checkStat=minimal",
+            "-c",
+            "core.trustctime=false",
+        ]);
+    }
+    status_command
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))
         .arg(format!("--work-tree={}", destination.display()))
         .args([
@@ -637,11 +753,10 @@ fn derive_baseline(
             "--untracked-files=all",
             "--ignored=matching",
         ])
-        .current_dir(destination)
-        .output()
-        .context("verify derived baseline")?;
+        .current_dir(destination);
+    let status = status_command.output().context("verify derived baseline")?;
     if !status.status.success() {
-        let _ = fs::remove_file(&index);
+        let _ = fs::remove_file(index);
         bail!(
             "verification of the derived tree failed: {}",
             String::from_utf8_lossy(&status.stderr)
@@ -660,7 +775,7 @@ fn derive_baseline(
         })
         .collect();
     if !mismatches.is_empty() {
-        let _ = fs::remove_file(&index);
+        let _ = fs::remove_file(index);
         bail!(
             "derived tree does not match {commit}: {}",
             mismatches
@@ -672,6 +787,318 @@ fn derive_baseline(
         );
     }
     Ok(())
+}
+
+/// A snapshot of the main working tree's dirty state: every path git
+/// reports as not clean, relative to the checkout root. `tracked_dirty` is
+/// the subset that is actually tracked (modified, deleted, or a rename's old
+/// or new path) — those need fresh content from the target commit once
+/// excluded from the clone; the untracked and ignored paths in `excluded`
+/// never do, since they are not part of any commit.
+struct CheckoutStatus {
+    head: String,
+    excluded: BTreeSet<PathBuf>,
+    tracked_dirty: BTreeSet<PathBuf>,
+}
+
+/// Read the main working tree's HEAD and dirty state: one `status` call for
+/// every path that is not clean, one `rev-parse` for the commit it is dirty
+/// relative to. Rename detection is turned off — a rename then reports as a
+/// plain deletion of the old path and an untracked or added new path, both
+/// single-field porcelain records, which this derivation resolves correctly
+/// either way (it does not care which label git used, only which paths are
+/// trustworthy to clone as-is).
+fn checkout_status(main_worktree: &Path) -> Result<CheckoutStatus> {
+    let head_output = Command::new("git")
+        .arg("-C")
+        .arg(main_worktree)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .context("resolve checkout HEAD")?;
+    if !head_output.status.success() {
+        bail!(
+            "git rev-parse HEAD failed in {}: {}",
+            main_worktree.display(),
+            String::from_utf8_lossy(&head_output.stderr)
+        );
+    }
+    let head = String::from_utf8(head_output.stdout)?.trim().to_owned();
+
+    let status_output = Command::new("git")
+        .arg("-C")
+        .arg(main_worktree)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--no-renames",
+        ])
+        .output()
+        .context("inspect checkout status")?;
+    if !status_output.status.success() {
+        bail!(
+            "git status failed in {}: {}",
+            main_worktree.display(),
+            String::from_utf8_lossy(&status_output.stderr)
+        );
+    }
+    let mut excluded = BTreeSet::new();
+    let mut tracked_dirty = BTreeSet::new();
+    for record in status_output.stdout.split(|byte| *byte == 0) {
+        if record.len() < 3 {
+            continue;
+        }
+        let record =
+            std::str::from_utf8(record).context("non-UTF-8 checkout path is unsupported")?;
+        let (code, rest) = record.split_at(2);
+        let relative = PathBuf::from(rest.strip_prefix(' ').unwrap_or(rest));
+        if code != "??" && code != "!!" {
+            tracked_dirty.insert(relative.clone());
+        }
+        excluded.insert(relative);
+    }
+    Ok(CheckoutStatus {
+        head,
+        excluded,
+        tracked_dirty,
+    })
+}
+
+/// Clone `source`'s entries into the existing directory `destination`,
+/// mirroring `clone_tree_entries` except that any path in `excluded` (and
+/// anything nested under it) is skipped rather than cloned: a directory
+/// entirely free of excluded paths is cloned whole (one `clonefile` call on
+/// APFS), a directory containing one is recursed so its clean siblings still
+/// clone whole, and an excluded file or a collapsed ignored directory is
+/// skipped outright — never partially cloned.
+fn clone_clean_tree(
+    source: &Path,
+    destination: &Path,
+    relative: &Path,
+    excluded: &BTreeSet<PathBuf>,
+) -> Result<()> {
+    for entry in
+        fs::read_dir(source).with_context(|| format!("read checkout {}", source.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        if relative.as_os_str().is_empty() && name == ".git" {
+            continue;
+        }
+        let child_relative = relative.join(&name);
+        if excluded.contains(&child_relative) {
+            continue;
+        }
+        let from = entry.path();
+        let to = destination.join(&name);
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            fs::create_dir(&to).with_context(|| format!("create directory {}", to.display()))?;
+            if excluded
+                .iter()
+                .any(|path| path.starts_with(&child_relative))
+            {
+                copy_permissions(&from, &to)?;
+                clone_clean_tree(&from, &to, &child_relative, excluded)?;
+            } else {
+                clone_tree(&from, &to).context("clone clean checkout directory")?;
+            }
+        } else if kind.is_symlink() {
+            let target =
+                fs::read_link(&from).with_context(|| format!("read symlink {}", from.display()))?;
+            create_symlink(&target, &from, &to)?;
+        } else {
+            clone_file(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// The main working tree's own index, as an absolute path — the starting
+/// point `derive_baseline_from_checkout` seeds the derived baseline's index
+/// with, so that unchanged paths keep valid stat data instead of losing it
+/// to a plain `read-tree`.
+fn checkout_own_index_path(main_worktree: &Path) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(main_worktree)
+        .args(["rev-parse", "--path-format=absolute", "--git-path", "index"])
+        .output()
+        .context("resolve checkout index path")?;
+    if !output.status.success() {
+        bail!(
+            "git rev-parse --git-path index failed in {}",
+            main_worktree.display()
+        );
+    }
+    Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()))
+}
+
+/// Derive `commit`'s baseline from the repository's own main working tree
+/// instead of the store: the checkout already holds the tracked content the
+/// store would otherwise recreate from Git objects, so the first baseline
+/// for a repository pays no second physical copy of it. Returns `Ok(true)`
+/// when the derivation succeeded and was verified, `Ok(false)` when there is
+/// no usable checkout to derive from (no main working tree, or it is the
+/// derivation's own destination), and `Err` on any doubt about the result —
+/// the caller falls back to a cached baseline or a full materialization.
+///
+/// Clean tracked content clones straight from the checkout with
+/// copy-on-write (`clone_clean_tree`); the checkout's dirty tracked paths
+/// and everything that differs between its `HEAD` and `commit`
+/// (`tree_diff`) are excluded from that clone and instead resolved against
+/// `commit`'s tree directly, via `git ls-tree` piped into
+/// `update-index --index-info` — a targeted index patch that leaves every
+/// other entry, and its stat data inherited from the checkout's own index,
+/// untouched. That is what lets the final verification trust mtime and size
+/// instead of hashing every file.
+fn derive_baseline_from_checkout(
+    repo: &RepoContext,
+    commit: &str,
+    destination: &Path,
+) -> Result<bool> {
+    let main_worktree = &repo.main_worktree;
+    if !main_worktree.is_dir() || main_worktree.as_path() == destination {
+        return Ok(false);
+    }
+    let is_work_tree = Command::new("git")
+        .arg("-C")
+        .arg(main_worktree)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !is_work_tree {
+        // A bare repository's `main_worktree` falls back to whichever
+        // worktree the command happened to run from — not a stable checkout
+        // to derive from. Unavailable, not a failure.
+        return Ok(false);
+    }
+
+    let status = checkout_status(main_worktree)?;
+    clone_clean_tree(main_worktree, destination, Path::new(""), &status.excluded)
+        .context("clone checkout's clean tracked content")?;
+
+    let mut candidates: Vec<String> = tree_diff(repo, &status.head, commit)?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+    for path in &status.tracked_dirty {
+        candidates.push(path.to_string_lossy().replace('\\', "/"));
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    let index = destination
+        .parent()
+        .context("baseline destination has no parent")?
+        .join("index");
+    let main_index = checkout_own_index_path(main_worktree)?;
+    fs::copy(&main_index, &index).context("adopt checkout index")?;
+
+    let mut present = HashSet::new();
+    if !candidates.is_empty() {
+        let mut ls_tree = Command::new("git");
+        ls_tree
+            .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+            .args(["ls-tree", "-r", "-z", commit, "--"])
+            .args(&candidates);
+        let ls_output = ls_tree
+            .output()
+            .context("list target-tree entries for changed paths")?;
+        if !ls_output.status.success() {
+            bail!(
+                "git ls-tree failed while resolving changed paths against {commit}: {}",
+                String::from_utf8_lossy(&ls_output.stderr)
+            );
+        }
+        for record in ls_output.stdout.split(|byte| *byte == 0) {
+            if record.is_empty() {
+                continue;
+            }
+            let record =
+                std::str::from_utf8(record).context("non-UTF-8 Git path is unsupported")?;
+            let (_, path) = record
+                .split_once('\t')
+                .context("unexpected git ls-tree record")?;
+            present.insert(path.to_owned());
+        }
+
+        if !ls_output.stdout.is_empty() {
+            let mut update_index = Command::new("git");
+            update_index
+                .env("GIT_INDEX_FILE", &index)
+                .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+                .args(["update-index", "-z", "--index-info"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = update_index
+                .spawn()
+                .context("start index update for changed paths")?;
+            {
+                let mut stdin = child.stdin.take().context("update-index stdin")?;
+                stdin.write_all(&ls_output.stdout)?;
+            }
+            let output = child.wait_with_output()?;
+            if !output.status.success() {
+                let _ = fs::remove_file(&index);
+                bail!(
+                    "git update-index --index-info failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        let removed: Vec<&String> = candidates
+            .iter()
+            .filter(|path| !present.contains(path.as_str()))
+            .collect();
+        if !removed.is_empty() {
+            let mut remove = Command::new("git");
+            remove
+                .env("GIT_INDEX_FILE", &index)
+                .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+                .args(["update-index", "-z", "--force-remove", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = remove
+                .spawn()
+                .context("start index removal for deleted paths")?;
+            {
+                let mut stdin = child
+                    .stdin
+                    .take()
+                    .context("update-index --force-remove stdin")?;
+                for path in &removed {
+                    stdin.write_all(path.as_bytes())?;
+                    stdin.write_all(b"\0")?;
+                }
+            }
+            let output = child.wait_with_output()?;
+            if !output.status.success() {
+                let _ = fs::remove_file(&index);
+                bail!(
+                    "git update-index --force-remove failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    let changes: Vec<(char, String)> = candidates
+        .into_iter()
+        .map(|path| {
+            let status = if present.contains(&path) { 'M' } else { 'D' };
+            (status, path)
+        })
+        .collect();
+
+    apply_changes_and_verify(repo, commit, destination, &index, &changes, true)?;
+    Ok(true)
 }
 
 fn materialize_baseline(repo: &RepoContext, commit: &str, destination: &Path) -> Result<()> {
