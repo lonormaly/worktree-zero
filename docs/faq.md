@@ -146,13 +146,25 @@ of.
 
 ## How do I clean up old worktrees?
 
-`wt0 fleet` lists every worktree wt0 knows about with its age, so you can
-see what's still active. `wt0 gc --older-than 24h` (or any duration) is a
-dry run that shows what it would remove; add `--apply` to actually remove
-it — it already refuses anything with uncommitted or unmerged work, so
-there's no way to lose changes this way. A filter that only reaps
-already-merged branches isn't available yet; today, `--delete-branches`
-deletes a reaped worktree's branch too, but only when it's already merged.
+`wt0 fleet --idle 7d` lists every worktree idle at least that long, with
+whether its branch is merged, whether it's dirty, and whether a process is
+still live in it — so you can see what's actually safe to drop before you
+remove anything. `wt0 gc --idle 7d` (or any duration; `--older-than` still
+works as the older name) is a dry run that shows what it would remove; add
+`--apply` to actually remove it — it already refuses anything dirty,
+unmerged, live, or in an unrecognized ignored state, so there's no way to
+lose changes this way.
+
+Add `--merged` for "merged and forgotten": `wt0 gc --merged --idle 0s`
+reaps every worktree whose branch already landed on the default branch,
+is clean, and isn't live — regardless of how old it is. `wt0 gc --merged
+--idle 7d` combines both: merged *and* idle a week. `--owner <id>` narrows
+either to one agent's worktrees, and `--delete-branches` (with `--merged`)
+deletes the branches that were actually reaped.
+
+Want it removed right now instead of a dry run first? `wt0 remove --merged
+[--idle <duration>] [--owner <id>]` applies that same selection
+immediately and prints a receipt for each worktree it removes.
 
 ## Is `doctor`'s "What to do next" list a blocker?
 

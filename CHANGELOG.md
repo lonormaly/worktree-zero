@@ -7,6 +7,26 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Added
 
+- **Fleet management: `wt0 fleet` filters/sorts, `wt0 gc --merged`, bulk
+  `wt0 remove --merged`.** `wt0 fleet` now reports owner, idle time, whether
+  each branch is merged into the default branch, dirty/live status, and
+  size (with `--size`) for every worktree — managed or not — and can filter
+  (`--idle`, `--merged`/`--unmerged`, `--dirty`/`--clean`, `--owner`,
+  `--prefix`, `--managed`/`--unmanaged`) and sort
+  (`--sort idle|branch|size`); the human table stays aligned within 120
+  columns, truncating a long path from the left. `wt0 gc` gains `--merged`
+  ("merged and forgotten" — `--idle 0s` drops the age floor entirely),
+  `--owner`, `--branch`, and `--include-unmanaged` (a plain `git worktree
+  add` checkout still passes every safety check; a reaped one is reported
+  `adopted-for-removal`); `--idle` is the new documented name for
+  `--older-than`, kept as an alias. GC's dry run now groups its report by
+  outcome (`would reap`, `kept: dirty`, `kept: unmerged`, `kept: live`,
+  `kept: unknown ignored state`, `skipped: unmanaged`) instead of one flat
+  list. `wt0 remove --merged [--idle <duration>] [--owner <id>]` applies the
+  same selection and checks immediately, printing one receipt per worktree.
+  No existing safety check changed — selectors only narrow which worktrees
+  are considered. See `docs/lifecycle.md`, "Inspecting the fleet" and
+  "Garbage collection".
 - **`wt0 init` writes the setup `wt0 doctor` recommends.** Three targets,
   each a dry run by default, writing only with `--apply` and never
   overwriting an existing file without `--force`: `wt0 init generated`

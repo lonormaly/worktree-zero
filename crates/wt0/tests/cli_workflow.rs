@@ -1158,6 +1158,197 @@ fn fleet_and_events_report_the_lifecycle() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Fleet management (D16): a fixture with three managed worktrees — one
+/// merged, clean, and idle; one with a real unmerged commit; one dirty —
+/// plus a plain `git worktree add` checkout wt0 doesn't own. Covers
+/// `wt0 fleet --merged`, `wt0 gc --merged --idle 0s`'s dry-run grouping,
+/// and `wt0 gc --include-unmanaged` still refusing a dirty adopted
+/// worktree.
+#[test]
+fn fleet_and_gc_select_by_merged_idle_and_include_unmanaged() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-fleet-mgmt-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    // `--merged`'s default-branch fallback only recognizes `main`/`master`
+    // (this fixture has no `origin`); pin the name so the test doesn't
+    // depend on the environment's `init.defaultBranch`.
+    git(&repo, &["branch", "-m", "main"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let create = |branch: &str, path: &Path| {
+        let output = Command::new(wt0)
+            .current_dir(&repo)
+            .args(["create", branch, "--path"])
+            .arg(path)
+            .output()
+            .expect("create worktree");
+        assert!(
+            output.status.success(),
+            "create {branch}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    let merged = root.join("merged");
+    create("agent/merged", &merged);
+    fs::write(merged.join("feature.txt"), "work\n").expect("write feature file");
+    git(&merged, &["add", "feature.txt"]);
+    git(&merged, &["commit", "-q", "-m", "feature work"]);
+    git(&repo, &["merge", "--ff-only", "-q", "agent/merged"]);
+
+    let unmerged = root.join("unmerged");
+    create("agent/unmerged", &unmerged);
+    fs::write(unmerged.join("wip.txt"), "wip\n").expect("write wip file");
+    git(&unmerged, &["add", "wip.txt"]);
+    git(&unmerged, &["commit", "-q", "-m", "unmerged work"]);
+
+    // Committed work of its own (so it's genuinely unmerged, not just
+    // trivially "merged" for never having diverged — see the `fleet
+    // --merged` assertion below) plus an uncommitted file on top: dirty
+    // wins gc's dry-run bucketing over "unmerged" (dirty is the more
+    // urgent, checked-last-but-reported-first safety veto).
+    let dirty = root.join("dirty");
+    create("agent/dirty", &dirty);
+    fs::write(dirty.join("committed.txt"), "wip\n").expect("write committed file");
+    git(&dirty, &["add", "committed.txt"]);
+    git(&dirty, &["commit", "-q", "-m", "wip, uncommitted on top"]);
+    fs::write(dirty.join("scratch.txt"), "uncommitted\n").expect("write scratch file");
+
+    // A checkout wt0 never created — plain `git worktree add`.
+    let unmanaged = root.join("unmanaged");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "plain/unmanaged",
+            unmanaged.to_str().expect("UTF-8 fixture path"),
+            "HEAD",
+        ],
+    );
+
+    // `fleet --merged --managed` lists exactly the merged worktree among
+    // the three managed ones. (`--managed` sidesteps a real subtlety: `main`
+    // and the plain `git worktree add` checkout never picked up a commit of
+    // their own, so their tip trivially IS an ancestor of the default
+    // branch — the same "vacuously merged" case `git branch --merged`
+    // reports for a branch that never diverged. `dirty` and `unmerged` both
+    // got a real commit of their own above specifically so this assertion
+    // exercises the actual merge-base check, not that trivial case.)
+    //
+    // The unfiltered call also gives every worktree's path exactly as `gc`
+    // and `fleet` themselves report it (sourced from `git worktree list
+    // --porcelain`, always forward-slash even on Windows) — comparing gc's
+    // later text output against THIS instead of a locally built `PathBuf`
+    // sidesteps any Windows short-name/separator mismatch between the two.
+    let fleet_all = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "fleet"])
+        .output()
+        .expect("run fleet");
+    assert!(
+        fleet_all.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&fleet_all.stderr)
+    );
+    let fleet_all: serde_json::Value =
+        serde_json::from_slice(&fleet_all.stdout).expect("fleet JSON");
+    let runtimes = fleet_all["runtimes"].as_array().expect("runtimes");
+    let path_for = |branch: &str| -> String {
+        runtimes
+            .iter()
+            .find(|runtime| runtime["branch"] == branch)
+            .and_then(|runtime| runtime["worktree"].as_str())
+            .unwrap_or_else(|| panic!("no fleet entry for branch {branch}: {runtimes:?}"))
+            .to_owned()
+    };
+    let merged_path = path_for("agent/merged");
+    let unmerged_path = path_for("agent/unmerged");
+    let dirty_path = path_for("agent/dirty");
+    let unmanaged_path = path_for("plain/unmanaged");
+
+    let merged_branches: Vec<&str> = runtimes
+        .iter()
+        .filter(|runtime| runtime["managed"] == true && runtime["merged"] == true)
+        .filter_map(|runtime| runtime["branch"].as_str())
+        .collect();
+    assert_eq!(
+        merged_branches,
+        vec!["agent/merged"],
+        "managed+merged branches: {merged_branches:?}"
+    );
+
+    // `gc --merged --idle 0s` reaps exactly the merged worktree and groups
+    // the other two under the right `kept:` heading.
+    let gc_dry_run = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["gc", "--merged", "--idle", "0s"])
+        .output()
+        .expect("run gc --merged --idle 0s");
+    assert!(
+        gc_dry_run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&gc_dry_run.stderr)
+    );
+    let gc_dry_run = String::from_utf8_lossy(&gc_dry_run.stdout);
+    assert!(
+        gc_dry_run.contains("would reap (1)") && gc_dry_run.contains(&merged_path),
+        "{gc_dry_run}"
+    );
+    assert!(
+        gc_dry_run.contains("kept: dirty") && gc_dry_run.contains(&dirty_path),
+        "{gc_dry_run}"
+    );
+    assert!(
+        gc_dry_run.contains("kept: unmerged") && gc_dry_run.contains(&unmerged_path),
+        "{gc_dry_run}"
+    );
+    assert!(
+        gc_dry_run.contains("skipped: unmanaged") && gc_dry_run.contains(&unmanaged_path),
+        "{gc_dry_run}"
+    );
+
+    // `gc --include-unmanaged` considers the plain checkout but still
+    // refuses it while it's dirty.
+    fs::write(unmanaged.join("dirty.txt"), "uncommitted\n").expect("dirty the plain checkout");
+    let include_unmanaged = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["gc", "--include-unmanaged", "--idle", "0s"])
+        .output()
+        .expect("run gc --include-unmanaged");
+    assert!(
+        include_unmanaged.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&include_unmanaged.stderr)
+    );
+    let include_unmanaged = String::from_utf8_lossy(&include_unmanaged.stdout);
+    assert!(
+        include_unmanaged.contains("kept: dirty") && include_unmanaged.contains(&unmanaged_path),
+        "{include_unmanaged}"
+    );
+    assert!(
+        !include_unmanaged.contains("skipped: unmanaged"),
+        "{include_unmanaged}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 // The FLAM adapter surface: owner identity, a label-safe slug, the owned
 // generated root available to hooks from create onward, a configurable
 // free-disk floor, and orphan events when a checkout vanishes outside wt0.

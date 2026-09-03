@@ -194,7 +194,7 @@ fn main() -> Result<()> {
         Some(Commands::Doctor(args)) => runtime::doctor(args, cli.json),
         Some(Commands::Prepare(args)) => runtime::prepare(args, cli.json),
         Some(Commands::Migrate(args)) => runtime::migrate(args, cli.json),
-        Some(Commands::Fleet(args)) => commands::worktree::fleet(args.json || cli.json),
+        Some(Commands::Fleet(args)) => commands::worktree::fleet(args, cli.json),
         Some(Commands::Events(args)) => events::run(args, cli.json),
         Some(Commands::Mcp(args)) => mcp::run(args),
         Some(Commands::Worktree(cmd)) => commands::worktree::run(cmd, cli.json),

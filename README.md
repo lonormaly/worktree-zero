@@ -249,8 +249,10 @@ and portable skill are the same implementation:
   or double-creating. A different key is refused, never handed someone
   else's runtime.
 - **The fleet map**: `wt0 fleet --json` returns every runtime with branch,
-  worktree, slot, port window, lease age, mode, and owned storage — the one
-  call an orchestrator needs to reason about the swarm. `wt0 events
+  owner, slot, port window, idle time, merged/dirty/live status, mode, and
+  owned storage — the one call an orchestrator needs to reason about the
+  swarm, filterable (`--idle`, `--merged`, `--owner`, `--prefix`,
+  `--unmanaged`, …) and sortable (`--sort idle|branch|size`). `wt0 events
   --follow` streams the append-only lifecycle log (created, reused, removed,
   reaped, adopted).
 - **Concurrency is tested, not assumed**: CI drives 24 simultaneous
@@ -353,6 +355,8 @@ wt0 init generated --apply  # writes .wt0-generated from this repo's own ignored
 wt0 init seed --apply       # writes .wt0-seed from detected caches (Nx, Turbo, Next, node_modules)
 wt0 init tilt --apply       # writes tilt_up.sh / tilt_down.sh, lifecycle hooks, and a Tiltfile snippet
 wt0 create agent/first-task # now create the first thin runtime
+wt0 fleet --idle 7d         # what's been sitting idle a week or more
+wt0 gc --merged --idle 7d   # reap what's idle that long AND already merged (dry run first)
 ```
 
 ### Tilt, Portless and ports
@@ -492,9 +496,14 @@ and more) — lives in [`docs/faq.md`](docs/faq.md), the same text
   outright. See `wt0 faq safety` for exactly what's refused and what's
   reclaimed.
 - **What happens when an agent crashes?** Its lease (a claim it renews every
-  30 seconds) goes stale; `wt0 gc --older-than` reaps the worktree and frees
+  30 seconds) goes stale; `wt0 gc --idle` reaps the worktree and frees
   its port range, and `wt0 prune` recovers a worktree that vanished outside
   wt0 entirely (`rm -rf`, a wiped volume) as a tracked orphan.
+- **How do I clean up old worktrees?** `wt0 fleet --idle 7d` shows what's
+  idle, merged, dirty, and live so you know what's safe to drop; `wt0 gc
+  --merged --idle 0s` reaps everything already merged and forgotten,
+  regardless of age; `wt0 remove --merged` does the same removal
+  immediately. See `wt0 faq cleanup` for every selector.
 - **Is `doctor`'s "what to do next" list a blocker?** No — `wt0 create`
   works regardless. Its exit code reflects only whether dependencies are
   shared and build output is within a safe size budget; the list is a
