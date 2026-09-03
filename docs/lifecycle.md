@@ -388,6 +388,23 @@ file without `--force`:
   [Tilt integration](../integrations/tilt/README.md). Every written file
   carries a two-line header naming `wt0 init tilt` as its source and what to
   edit.
+- **`wt0 init compose`** proposes `compose.wt0.yaml`, an override file that
+  maps every literal host port found under a service's `ports:` in
+  `compose.yaml`/`docker-compose.yml` to a `WT0_<SERVICE>_PORT`-named
+  variable defaulting to today's port (`${WT0_POSTGRES_PORT:-5433}:5432`,
+  say) — one variable per literal port, named from the service. docker
+  compose interpolates `${VAR:-default}` but can't do arithmetic itself, so
+  the actual `WT0_PORT_BASE`-derived value is computed once in
+  `.wt0/hooks/post-create` (see `wt0 init dev`) and exported before `up`
+  runs; `COMPOSE_PROJECT_NAME` needs no override here since `wt0 run`
+  already sets it per runtime. Never rewrites the project's own compose
+  file — merge with `docker compose -f compose.yaml -f compose.wt0.yaml up`.
+- **`wt0 init dev`** proposes a generic `.wt0/hooks/post-create` — no Tilt,
+  no cluster check — that exports `PORT=$WT0_PORT_BASE` and writes
+  `.env.wt0` (`PORT`, `WT0_SLUG`) for any dev script, Procfile/mprocs
+  command, devcontainer `postStartCommand`, or `compose.wt0.yaml` override
+  to source. The tool-agnostic fix for whatever `wt0 doctor`'s
+  "🎛️ Dev environment" block flags that isn't Tilt or docker-compose.
 - **`wt0 init`** with no target prints `doctor`'s own numbered step list —
   the same steps `wt0 doctor`'s report shows — and which `init` target (if
   any) closes each one.
@@ -410,4 +427,31 @@ sharing already carries it. Every reported number is prefixed `≈` and the
 report names its basis (`"estimate": {"basis": "estimated"}` in `--json`);
 a future receipt-backed measurement from a prior `wt0 create` in this exact
 repository would report `"measured"` and drop the `≈`, but nothing in wt0
-persists such a receipt yet.
+persists such a receipt yet. A fourth "saving" figure — `5.2× · −81%` — sits
+beside the two byte figures on each row: the fold and percentage `wt0`
+leaves of "today", computed from the same unrounded bytes (never the
+already-MiB-rounded display strings, to avoid double rounding) and rounded
+for display — one decimal below a 10× fold, a whole number at or above it,
+whole percentages always (`format_saving`). `--json`'s `estimate` carries
+the same rounded figures as `one_fold`/`ten_fold`/`one_saving_pct`/
+`ten_saving_pct`, so the printed table and the JSON can never disagree.
+
+### Not everyone uses Tilt: the "🎛️ Dev environment" block
+
+`wt0 doctor`'s Tilt line generalizes to whatever a project actually boots
+its dev stack with. One entry per tool detected — Tilt, docker-compose, a
+devcontainer (`.devcontainer/devcontainer.json`'s `forwardPorts`), a
+Procfile-style process manager (Procfile, `mprocs.yaml`, or a
+`concurrently` script), Skaffold/Garden/DevSpace, or a plain `package.json`
+dev script (`next dev -p 3000`, `vite --port 3000`, `wrangler dev --port
+3000`) — each with the literal ports/hostnames it hard-codes and the exact
+fix for that tool. Detection is read-only, deliberately approximate line/
+content scanning (never a real YAML/JSONC parse), matching `detect_tilt`'s
+own trade-off: false positives are harmless since this only ever feeds an
+informational report. `--json`'s `dev_environment` array carries
+`{tool, files, literal_ports, literal_hosts, derives_from_wt0, fix}` per
+tool, additive to the existing `tilt` field. When a detected tool's
+literals aren't derived from `WT0_PORT_BASE`/`WT0_SLUG`, `doctor`'s
+numbered step list names the matching `init` target: `wt0 init tilt` for
+Tilt, `wt0 init compose` for docker-compose, `wt0 init dev` for everything
+else.

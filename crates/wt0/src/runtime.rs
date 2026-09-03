@@ -319,6 +319,7 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let tracked = tracked_stats(&root)?;
     let tooling_report = tooling::detect(&root);
     let tilt = tooling::detect_tilt(&root);
+    let dev_tools = tooling::detect_dev_environment(&root);
     let DependencyFacts {
         manager: javascript_manager,
         manager_version,
@@ -515,6 +516,10 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
             "wt0_ten_bytes": estimate.wt0_ten_bytes,
             "with_native_store_each_bytes": estimate.with_native_store_each_bytes,
             "basis": estimate.basis,
+            "one_fold": estimate.one_fold,
+            "ten_fold": estimate.ten_fold,
+            "one_saving_pct": estimate.one_saving_pct,
+            "ten_saving_pct": estimate.ten_saving_pct,
         },
         "tooling": tooling_names,
         "tilt": {
@@ -523,6 +528,14 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
             "literal_hosts": tilt.literal_hosts,
             "derives_from_wt0": tilt.derives_from_wt0,
         },
+        "dev_environment": dev_tools.iter().map(|tool| json!({
+            "tool": tool.tool,
+            "files": tool.files,
+            "literal_ports": tool.literal_ports,
+            "literal_hosts": tool.literal_hosts,
+            "derives_from_wt0": tool.derives_from_wt0,
+            "fix": tool.fix.join(" "),
+        })).collect::<Vec<_>>(),
         "steps": steps,
     });
 
@@ -538,7 +551,7 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
             tooling_names: &tooling_names,
             cow_available,
             estimate: &estimate,
-            tilt: &tilt,
+            dev_tools: &dev_tools,
             generated_total: generated.total(),
             policy_paths,
             seed_paths,
@@ -577,7 +590,7 @@ struct DoctorPrintArgs<'a> {
     tooling_names: &'a [&'static str],
     cow_available: bool,
     estimate: &'a Estimate,
-    tilt: &'a tooling::TiltReport,
+    dev_tools: &'a [tooling::DevTool],
     generated_total: u64,
     policy_paths: usize,
     seed_paths: usize,
@@ -610,7 +623,7 @@ fn print_doctor_report(args: DoctorPrintArgs) {
         tooling_names,
         cow_available,
         estimate,
-        tilt,
+        dev_tools,
         generated_total,
         policy_paths,
         seed_paths,
@@ -656,22 +669,25 @@ fn print_doctor_report(args: DoctorPrintArgs) {
 
     println!("💾 What one agent's worktree costs");
     println!(
-        "                                       today ({})      with wt0",
+        "                                       today ({})   with wt0   saving",
         today_recipe(javascript_manager)
     );
     let (today_one, wt0_one) = format_cost_pair(estimate.today_one_bytes, estimate.wt0_one_bytes);
     println!(
-        "   one worktree, ready to work          ≈ {today_one:<12}                ≈ {wt0_one}"
+        "   one worktree, ready to work          ≈ {today_one:<12}                ≈ {wt0_one:<9} {}",
+        format_saving(estimate.today_one_bytes, estimate.wt0_one_bytes)
     );
     let (today_ten, wt0_ten) = format_cost_pair(estimate.today_ten_bytes, estimate.wt0_ten_bytes);
     println!(
-        "   ten agents                           ≈ {today_ten:<12}                ≈ {wt0_ten}"
+        "   ten agents                           ≈ {today_ten:<12}                ≈ {wt0_ten:<9} {}",
+        format_saving(estimate.today_ten_bytes, estimate.wt0_ten_bytes)
     );
     if let Some(with_store) = estimate.with_native_store_each_bytes {
         println!(
-            "   with {} on (step 1 below)                                ≈ {} each",
+            "   with {} on (step 1 below)      ≈ {:<9} {}",
             shared_store_label(javascript_manager),
-            human_bytes_rounded(with_store)
+            format!("{} each", human_bytes_rounded(with_store)),
+            format_saving(estimate.today_one_bytes, with_store)
         );
     }
     println!(
@@ -693,7 +709,7 @@ fn print_doctor_report(args: DoctorPrintArgs) {
     );
     println!();
 
-    print_tilt_info_line(tilt);
+    print_dev_environment_block(dev_tools);
     print_build_output_line(generated_total, policy_paths);
     println!();
 
@@ -816,23 +832,96 @@ fn format_cost_pair(today: u64, wt0: u64) -> (String, String) {
     }
 }
 
-fn print_tilt_info_line(tilt: &tooling::TiltReport) {
-    if !tilt.detected {
-        println!(
-            "🎛️ Tilt    Not used — for several agents each running a dev stack, Tilt gives every worktree"
-        );
-        println!("           its own ports and hostnames (`wt0 init tilt` starts one).");
-    } else if tilt.derives_from_wt0 {
-        println!("🎛️ Tilt    Already gives each worktree its own ports and hostnames ✅");
+/// The fraction of "today" a byte figure leaves once wt0 (or a native store)
+/// takes over — 0 when `today` is 0 so a repository with no dependencies at
+/// all never divides by zero.
+fn saving_pct(today: u64, wt0: u64) -> f64 {
+    if today == 0 {
+        0.0
     } else {
-        let ports = tilt.literal_ports.len();
-        let hosts = tilt.literal_hosts.len();
+        (today as f64 - wt0 as f64) / today as f64 * 100.0
+    }
+}
+
+/// Folds under 10× keep one decimal (`5.1×`); at or above 10× a decimal reads
+/// as false precision, so it rounds to a whole number (`19×`) — the same
+/// rounding judgment `human_bytes_rounded` already applies to bytes.
+fn round_fold(fold: f64) -> f64 {
+    if fold < 10.0 {
+        (fold * 10.0).round() / 10.0
+    } else {
+        fold.round()
+    }
+}
+
+fn round_pct(pct: f64) -> u64 {
+    pct.round().max(0.0) as u64
+}
+
+/// "5.1× · −81%": how much smaller `wt0` is than `today`, rounded for a
+/// plain-language report. Shared by the printed cost table and
+/// `estimate_cost`'s own `--json` fields (`one_fold`, `ten_fold`,
+/// `one_saving_pct`, `ten_saving_pct`) so the two can never drift apart.
+fn format_saving(today: u64, wt0: u64) -> String {
+    if today == 0 || wt0 == 0 {
+        return "—".to_owned();
+    }
+    let fold = round_fold(today as f64 / wt0 as f64);
+    let pct = round_pct(saving_pct(today, wt0));
+    let digits = if fold < 10.0 { 1 } else { 0 };
+    format!("{fold:.digits$}× · −{pct}%")
+}
+
+/// The unified "🎛️ Dev environment" block: every dev-environment tool this
+/// repository boots a stack with (Tilt is one option among several — not
+/// everyone uses it), each with its own hard-coded ports/hostnames and the
+/// concrete fix for that specific tool. Mirrors the old Tilt-only line's
+/// three-way shape (nothing detected / already collision-free / literals
+/// found) per tool instead of just for Tilt.
+fn print_dev_environment_block(tools: &[tooling::DevTool]) {
+    if tools.is_empty() {
         println!(
-            "🎛️ Tilt    your Tiltfile hard-codes {ports} port{} and {hosts} hostname{} — two agents",
-            if ports == 1 { "" } else { "s" },
-            if hosts == 1 { "" } else { "s" }
+            "🎛️ Dev environment   No dev-environment tool detected; if agents start dev servers,"
         );
-        println!("           running Tilt at once will collide.");
+        println!(
+            "                     take the port from WT0_PORT_BASE (e.g. `next dev -p $WT0_PORT_BASE`)."
+        );
+        return;
+    }
+    println!("🎛️ Dev environment");
+    for tool in tools {
+        let ports = tool.literal_ports.len();
+        let hosts = tool.literal_hosts.len();
+        if tool.derives_from_wt0 {
+            println!(
+                "   {} — already derives ports/names from WT0_PORT_BASE/WT0_SLUG ✅",
+                tool.tool
+            );
+            continue;
+        }
+        if ports == 0 && hosts == 0 {
+            println!("   {} — detected, no hard-coded ports found.", tool.tool);
+            continue;
+        }
+        let mut parts = Vec::new();
+        if ports > 0 {
+            parts.push(format!("{ports} port{}", if ports == 1 { "" } else { "s" }));
+        }
+        if hosts > 0 {
+            parts.push(format!("{hosts} name{}", if hosts == 1 { "" } else { "s" }));
+        }
+        println!(
+            "   {} — {} hard-coded; two agents running it at once will collide.",
+            tool.tool,
+            parts.join(", ")
+        );
+        for (index, line) in tool.fix.iter().enumerate() {
+            if index == 0 {
+                println!("      → {line}");
+            } else {
+                println!("        {line}");
+            }
+        }
     }
 }
 
@@ -893,6 +982,8 @@ fn plain_steps(
                 }
                 "generated state" => generated_over_budget_block(generated_total),
                 "tilt" => tilt_fix_block(),
+                "docker-compose" => compose_fix_block(),
+                "dev environment" => dev_environment_fix_block(),
                 _ => fallback_block(step),
             }
         })
@@ -1042,6 +1133,33 @@ fn tilt_fix_block() -> Vec<String> {
     ]
 }
 
+fn compose_fix_block() -> Vec<String> {
+    vec![
+        "Give this repository's docker-compose setup its own project name and ports per worktree."
+            .to_owned(),
+        "      Run: wt0 init compose (dry run; add --apply to write compose.wt0.yaml).".to_owned(),
+        "      → COMPOSE_PROJECT_NAME=${WT0_SLUG:-local} and host ports derived from WT0_PORT_BASE."
+            .to_owned(),
+    ]
+}
+
+/// Not everyone's dev stack is Tilt or docker-compose — a devcontainer, a
+/// Procfile-style process manager, Skaffold/Garden/DevSpace, or a plain
+/// `package.json` dev script all get the same fix in spirit: read the port
+/// from `WT0_PORT_BASE` instead of hard-coding it. `wt0 init dev` writes the
+/// starter hook; `wt0 doctor`'s own "🎛️ Dev environment" block above names
+/// which tool(s) triggered this step and their exact literal ports.
+fn dev_environment_fix_block() -> Vec<String> {
+    vec![
+        "Give this repository's dev server its own port per worktree instead of a hard-coded one."
+            .to_owned(),
+        "      Run: wt0 init dev (dry run; add --apply to write a starter post-create hook)."
+            .to_owned(),
+        "      → the port comes from WT0_PORT_BASE, so two agents' dev servers never collide."
+            .to_owned(),
+    ]
+}
+
 fn seed_step_block(preview: &[PathBuf]) -> Vec<String> {
     let names = preview
         .iter()
@@ -1176,6 +1294,13 @@ pub(crate) struct Estimate {
     wt0_ten_bytes: u64,
     with_native_store_each_bytes: Option<u64>,
     basis: &'static str,
+    /// `today_one_bytes / wt0_one_bytes`, rounded the same way
+    /// `format_saving` rounds it for the printed table (one decimal below
+    /// 10×, whole above) — see `format_saving`'s doc comment.
+    one_fold: f64,
+    ten_fold: f64,
+    one_saving_pct: u64,
+    ten_saving_pct: u64,
 }
 
 /// `doctor`'s before/after cost table: what one worktree and ten worktrees
@@ -1212,17 +1337,23 @@ fn estimate_cost(
         )
     };
     let today_one_bytes = tracked.bytes + deps_today;
+    let today_ten_bytes = today_one_bytes.saturating_mul(10);
+    let wt0_ten_bytes = wt0_first + wt0_marginal.saturating_mul(9);
 
     Estimate {
         today_one_bytes,
         wt0_one_bytes: wt0_marginal,
-        today_ten_bytes: today_one_bytes.saturating_mul(10),
-        wt0_ten_bytes: wt0_first + wt0_marginal.saturating_mul(9),
+        today_ten_bytes,
+        wt0_ten_bytes,
         with_native_store_each_bytes: (!native)
             .then_some(manager)
             .flatten()
             .map(|_| NATIVE_STORE_WT0_MARGINAL_BYTES),
         basis: "estimated",
+        one_fold: round_fold(today_one_bytes as f64 / wt0_marginal.max(1) as f64),
+        ten_fold: round_fold(today_ten_bytes as f64 / wt0_ten_bytes.max(1) as f64),
+        one_saving_pct: round_pct(saving_pct(today_one_bytes, wt0_marginal)),
+        ten_saving_pct: round_pct(saving_pct(today_ten_bytes, wt0_ten_bytes)),
     }
 }
 
@@ -1325,6 +1456,39 @@ pub(crate) fn doctor_steps(root: &Path) -> Result<Vec<Value>> {
             "title": "tilt",
             "command_or_config": "wt0 init tilt",
             "payoff": "ports and hostnames from WT0_PORT_BASE / WT0_SLUG",
+        }));
+    }
+    // Not everyone uses Tilt — the same collision, and the same fix in
+    // spirit, applies to whichever dev-environment tool a project actually
+    // boots its stack with. One step for docker-compose (its own `init`
+    // target) and, at most, one more step covering every other detected
+    // tool (devcontainer, a Procfile-style process manager, Skaffold/Garden/
+    // DevSpace, a plain dev script) so the list stays short even when a
+    // repository mixes several.
+    let dev_tools = tooling::detect_dev_environment(root);
+    let colliding = |tool: &tooling::DevTool| {
+        !tool.derives_from_wt0 && (!tool.literal_ports.is_empty() || !tool.literal_hosts.is_empty())
+    };
+    if dev_tools
+        .iter()
+        .any(|tool| tool.tool == "docker-compose" && colliding(tool))
+    {
+        steps.push(json!({
+            "order": steps.len() + 1,
+            "title": "docker-compose",
+            "command_or_config": "wt0 init compose",
+            "payoff": "COMPOSE_PROJECT_NAME and host ports derived from WT0_SLUG / WT0_PORT_BASE",
+        }));
+    }
+    if dev_tools
+        .iter()
+        .any(|tool| tool.tool != "Tilt" && tool.tool != "docker-compose" && colliding(tool))
+    {
+        steps.push(json!({
+            "order": steps.len() + 1,
+            "title": "dev environment",
+            "command_or_config": "wt0 init dev",
+            "payoff": "ports read from WT0_PORT_BASE instead of a hard-coded number",
         }));
     }
     Ok(steps)
@@ -3702,6 +3866,61 @@ mod tests {
         assert!(root.join("node_modules/.bun/package@1.0.0").is_symlink());
 
         fs::remove_dir_all(root).expect("remove test fixture");
+    }
+
+    /// The design partner's own worked example (README's real-run output,
+    /// docs/faq.md): 139 MiB → 27 MiB for one worktree — round below a 10×
+    /// fold keeps one decimal, and the percentage is whole.
+    #[test]
+    fn format_saving_rounds_folds_below_ten_to_one_decimal() {
+        let mebibyte = 1024 * 1024;
+        assert_eq!(format_saving(139 * mebibyte, 27 * mebibyte), "5.1× · −81%");
+    }
+
+    /// At or above a 10× fold, a decimal reads as false precision — round to
+    /// a whole number instead, matching `human_bytes_rounded`'s own
+    /// judgment call for byte figures.
+    #[test]
+    fn format_saving_rounds_folds_at_or_above_ten_to_a_whole_number() {
+        let mebibyte = 1024 * 1024;
+        assert_eq!(format_saving(280 * mebibyte, 7 * mebibyte), "40× · −98%");
+    }
+
+    #[test]
+    fn format_saving_never_divides_by_zero() {
+        assert_eq!(format_saving(0, 100), "—");
+        assert_eq!(format_saving(100, 0), "—");
+    }
+
+    #[test]
+    fn round_fold_matches_format_saving_across_the_ten_times_boundary() {
+        assert_eq!(round_fold(9.94), 9.9);
+        assert_eq!(round_fold(9.96), 10.0);
+        assert_eq!(round_fold(10.4), 10.0);
+    }
+
+    /// `estimate_cost`'s own `one_fold`/`one_saving_pct` fields must equal
+    /// what `format_saving` would print for the same two byte figures — the
+    /// printed table and `--json` can never drift apart.
+    #[test]
+    fn estimate_cost_fold_and_pct_fields_match_format_saving() {
+        let tracked = TrackedStats {
+            files: 4_040,
+            bytes: 368 * 1024 * 1024,
+        };
+        let store = Some(NativeStore::None {
+            manager: "bun".to_owned(),
+        });
+        let estimate = estimate_cost(&tracked, Some("bun"), &store, 70_124, 0);
+
+        let rendered = format_saving(estimate.today_one_bytes, estimate.wt0_one_bytes);
+        let from_fields = format!(
+            "{:.digits$}× · −{}%",
+            estimate.one_fold,
+            estimate.one_saving_pct,
+            digits = if estimate.one_fold < 10.0 { 1 } else { 0 }
+        );
+        assert_eq!(rendered, from_fields);
     }
 
     /// `doctor`'s before/after table, worked by hand against the numbers this

@@ -99,13 +99,33 @@ so on — so two agents' worktrees never fight over the same port or URL.
 
 ## What is Tilt, and why does wt0 mention it?
 
-Tilt is a tool some projects use to boot their whole dev stack (a web
+Tilt is one option some projects use to boot their whole dev stack (a web
 server, a database, background workers, …) with one command, behind a
 fixed set of ports and hostnames. That's fine for one person, but if two
 agents each run their own worktree's Tilt setup at the same time and both
 try to use port 3000, one of them fails. `wt0 doctor` flags a Tiltfile that
 hard-codes ports instead of reading `WT0_PORT_BASE`/`WT0_SLUG`, and
-`wt0 init tilt` writes the fix.
+`wt0 init tilt` writes the fix. See the next question — Tilt is far from
+the only dev-environment tool wt0 helps with.
+
+## I don't use Tilt — does wt0 still help?
+
+Yes. Storage sharing, speed, and safe cleanup are completely independent of
+what starts your dev stack — they work the same with no dev-environment
+tool at all. The port/hostname collision problem Tilt gets mentioned for
+isn't Tilt-specific either: it's whatever process starts your dev servers
+reading a fixed port instead of this worktree's own. `wt0 doctor`'s
+"🎛️ Dev environment" block detects several: **docker-compose**
+(`compose.yaml`/`docker-compose.yml`), a **devcontainer**
+(`.devcontainer/devcontainer.json`'s `forwardPorts`), a **Procfile-style
+process manager** (Procfile, `mprocs.yaml`, or a `concurrently` script),
+**Skaffold/Garden/DevSpace**, and a **plain dev script** in `package.json`
+(`next dev -p 3000`, `vite --port 3000`, `wrangler dev --port 3000`, and
+similar). Each gets the same advice — read the port and project name from
+`WT0_PORT_BASE`/`WT0_SLUG` instead of hard-coding them — and its own `init`
+target writes the fix: `wt0 init compose` for docker-compose, `wt0 init
+dev` for everything else (a generic post-create hook exporting
+`PORT=$WT0_PORT_BASE` and a `.env.wt0` your dev script can source).
 
 ## Do I need Tilt, a shared package store, or a build cache to use wt0?
 
@@ -114,9 +134,10 @@ worktree in about a second that shares your tracked files with your main
 checkout. What you don't get without them: a shared package store shrinks
 installed-dependency size from tens/hundreds of MiB to a few MiB per
 worktree; a seeded build cache makes the first build in a new worktree warm
-instead of cold; Tilt (if your project uses it at all) needs `wt0 init tilt`
-to avoid two agents colliding on the same ports. `wt0 doctor` tells you
-which of these apply to your repository and what each one is worth.
+instead of cold; whatever starts your dev servers (Tilt, docker-compose, a
+plain script, …) needs `wt0 init tilt`/`wt0 init compose`/`wt0 init dev` to
+avoid two agents colliding on the same ports. `wt0 doctor` tells you which
+of these apply to your repository and what each one is worth.
 
 ## What does "owner" mean?
 

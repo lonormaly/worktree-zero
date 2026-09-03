@@ -307,18 +307,22 @@ wt0 — Worktree Zero · cheap, isolated Git worktrees for coding agents
    Filesystem: APFS — copy-on-write available ✅ (worktrees share files at no extra disk cost)
 
 💾 What one agent's worktree costs
-                                       today (git worktree add + bun install)      with wt0
-   one worktree, ready to work          ≈ 139 MiB                     ≈ 27 MiB
-   ten agents                           ≈ 1.4 GiB                     ≈ 0.3 GiB
-   with Bun's shared package store on (step 1 below)                                ≈ 7 MiB each
+                                       today (git worktree add + bun install)   with wt0   saving
+   one worktree, ready to work          ≈ 139 MiB                     ≈ 27 MiB    5.2× · −81%
+   ten agents                           ≈ 1.4 GiB                     ≈ 0.3 GiB   4.7× · −79%
+   with Bun's shared package store on (step 1 below)      ≈ 7 MiB each 20× · −95%
    Estimates: this repository's file counts × per-file costs measured on a 236,000-file
    monorepo. `wt0 faq costs` explains.
 
 ⚡ Speed   a worktree is ready in ≈ 1–2 s, and `git status` inside it is instant.
 🔌 Ports   each worktree gets its own 100-port range and a short name, so agents never collide.
 
-🎛️ Tilt    your Tiltfile hard-codes 9 ports and 8 hostnames — two agents
-           running Tilt at once will collide.
+🎛️ Dev environment
+   Tilt — 9 ports, 8 names hard-coded; two agents running it at once will collide.
+      → wt0 init tilt — Tiltfile snippet deriving TILT_PORT from WT0_PORT_BASE
+   docker-compose — 2 ports hard-coded; two agents running it at once will collide.
+      → wt0 init compose — compose.wt0.yaml sets COMPOSE_PROJECT_NAME=${WT0_SLUG:-local}
+        and derives host ports from WT0_PORT_BASE
 🧹 Build output   982 MiB of ignored build files (.nx, dist, …). wt0 never deletes files it has
                   not been told are disposable, so a short list of those folders is needed
                   before `wt0 gc` can reclaim this space.
@@ -338,7 +342,10 @@ wt0 — Worktree Zero · cheap, isolated Git worktrees for coding agents
       running Tilt at the same time don't collide. Run: wt0 init tilt (dry run; add --apply
       to write it).
       → every worktree's Tilt UI, ports, and *.localhost routes become collision-free.
-   4. Start every worktree with a warm build cache instead of a cold one. Run: wt0 init seed --apply
+   4. Give this repository's docker-compose setup its own project name and ports per worktree.
+      Run: wt0 init compose (dry run; add --apply to write compose.wt0.yaml).
+      → COMPOSE_PROJECT_NAME=${WT0_SLUG:-local} and host ports derived from WT0_PORT_BASE.
+   5. Start every worktree with a warm build cache instead of a cold one. Run: wt0 init seed --apply
       → copies .nx/cache from your main checkout into each new worktree, free (copy-on-write).
 
    Then:  wt0 create <branch> --owner <you-or-agent-id>   ·   wt0 fleet   ·   wt0 remove <path>
@@ -354,29 +361,44 @@ wt0 init                    # doctor's steps, and which init target closes each
 wt0 init generated --apply  # writes .wt0-generated from this repo's own ignored build output
 wt0 init seed --apply       # writes .wt0-seed from detected caches (Nx, Turbo, Next, node_modules)
 wt0 init tilt --apply       # writes tilt_up.sh / tilt_down.sh, lifecycle hooks, and a Tiltfile snippet
+wt0 init compose --apply    # writes compose.wt0.yaml, deriving project name and host ports from wt0
+wt0 init dev --apply        # writes a generic post-create hook for any dev server (not just Tilt)
 wt0 create agent/first-task # now create the first thin runtime
 wt0 fleet --idle 7d         # what's been sitting idle a week or more
 wt0 gc --merged --idle 7d   # reap what's idle that long AND already merged (dry run first)
 ```
 
-### Tilt, Portless and ports
+### Dev environments: Tilt, docker-compose, or plain dev servers
 
-A dev stack behind Tilt or `docker compose` pins a UI port and, with
-[Portless](https://github.com/vercel-labs/portless), a set of stable
-`*.localhost` hostnames — great for one human, but two agents' worktrees
-booting the same Tiltfile fight over both. `wt0`'s per-runtime identity
+Not everyone uses Tilt. Whatever starts a project's dev stack — Tilt,
+`docker compose`, a devcontainer, a Procfile-style process manager
+(overmind, foreman, mprocs, `concurrently`), Skaffold/Garden/DevSpace, or a
+plain `next dev`/`vite`/`wrangler dev` script — the fix is the same in
+spirit: read the port and project name from `wt0`'s per-runtime identity
 (`WT0_PORT_BASE`, a disjoint hundred-port window; `WT0_SLUG`, a label-safe
-branch name) exists exactly to close that gap, and two design partners
-already run it in production: FLAM's `.wt0/hooks/post-create` pins every
-listener inside its runtime's own port window
-(`TILT_PORT="$WT0_PORT_BASE"`, `DB_PORT="$((WT0_PORT_BASE + 1))"`, …), and
-Builders Stack's `tilt_up.sh` / `.devops/Tiltfile` derive the Tilt UI port
-from `WT0_PORT_BASE` and suffix every Portless route with `-${WT0_SLUG}`.
-`wt0 init tilt` writes exactly that pattern — boot/stop scripts, lifecycle
-hooks, and a Tiltfile snippet — for a project that doesn't have it yet; see
-the [Tilt integration](integrations/tilt/README.md) for the full extension
-API (`wt0_port`, `wt0_namespace`, `wt0_shared_namespace`, …) and the shared-
-services tier for stacks too heavy to boot fresh per worktree.
+branch name) instead of hard-coding them, so two agents' worktrees never
+fight over the same port, hostname, or container. `wt0 doctor`'s
+"🎛️ Dev environment" block names every tool it detects, the literal
+ports/hostnames each one hard-codes, and the concrete fix for that tool.
+Two design partners already run the Tilt pattern in production: FLAM's
+`.wt0/hooks/post-create` pins every listener inside its runtime's own port
+window (`TILT_PORT="$WT0_PORT_BASE"`, `DB_PORT="$((WT0_PORT_BASE + 1))"`,
+…), and Builders Stack's `tilt_up.sh` / `.devops/Tiltfile` derive the Tilt
+UI port from `WT0_PORT_BASE` and suffix every
+[Portless](https://github.com/vercel-labs/portless) route with
+`-${WT0_SLUG}`. `wt0 init tilt` writes exactly that pattern — boot/stop
+scripts, lifecycle hooks, and a Tiltfile snippet — for a project that
+doesn't have it yet; see the [Tilt integration](integrations/tilt/README.md)
+for the full extension API (`wt0_port`, `wt0_namespace`,
+`wt0_shared_namespace`, …) and the shared-services tier for stacks too heavy
+to boot fresh per worktree. For docker-compose, `wt0 init compose` proposes
+a `compose.wt0.yaml` override mapping each literal host port to a
+`WT0_<SERVICE>_PORT` variable (documented, computed from `WT0_PORT_BASE` in
+a post-create hook — compose interpolates `${VAR:-default}` but can't do
+arithmetic itself); `COMPOSE_PROJECT_NAME` is already set per worktree by
+`wt0 run`. For everything else, `wt0 init dev` writes a generic
+`.wt0/hooks/post-create` that exports `PORT=$WT0_PORT_BASE` and a
+`.env.wt0` any dev script can source.
 
 ## Honest measurement
 
