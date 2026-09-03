@@ -44,6 +44,16 @@ pub(crate) fn live_open_path(root: &Path) -> Result<Option<String>> {
     imp::live_open_path(root)
 }
 
+/// Whether `pid` is currently running, when this platform can tell.
+/// `Some(true)`/`Some(false)` on Unix, from a `ps` probe. `None` on
+/// Windows, where no portable liveness check exists without opening a
+/// process handle — a caller deciding whether to steal an abandoned lock
+/// should treat `None` as "can't tell" and fall back to another signal
+/// (e.g. the lock file's age), never assume either answer.
+pub(crate) fn is_alive_hint(pid: u32) -> Option<bool> {
+    imp::is_alive_hint(pid)
+}
+
 #[cfg(unix)]
 mod imp {
     use anyhow::{bail, Context, Result};
@@ -88,6 +98,10 @@ mod imp {
             .args(["-o", "pid=", "-p", &pid.to_string()])
             .output()
             .is_ok_and(|output| !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    }
+
+    pub(super) fn is_alive_hint(pid: u32) -> Option<bool> {
+        Some(is_alive(pid))
     }
 
     /// `pid` and every ancestor up to init.
@@ -178,6 +192,15 @@ mod imp {
 
     pub(super) fn is_alive(_pid: u32) -> bool {
         true
+    }
+
+    /// No portable liveness check exists here without opening a process
+    /// handle; honestly report "can't tell" rather than the blanket `true`
+    /// [`is_alive`] uses (that default is safe for its own callers, which
+    /// only ever want to *exclude* a live process from a result — never a
+    /// reason to treat an abandoned lock as unstealable forever).
+    pub(super) fn is_alive_hint(_pid: u32) -> Option<bool> {
+        None
     }
 
     /// Windows locks a directory tree that is in use: renaming it fails while

@@ -1366,3 +1366,90 @@ fn a_corrupt_parent_baseline_falls_back_to_a_full_materialization() -> Result<()
     );
     Ok(())
 }
+
+/// The bug this guards against: a waiter that couldn't get the lock within
+/// its bound used to proceed unlocked, racing whatever mutation the lock
+/// guarded (a `git worktree add`/`remove` reading or rewriting the shared
+/// registry mid-write). A generous `stale_after` (an hour, far longer than
+/// this test runs) is portable proof: the lock is fresh, so even the
+/// age-only fallback ([`owner_is_dead`]'s path on a platform with no
+/// liveness check) agrees it isn't stealable — this test doesn't depend on
+/// which signal decided.
+#[test]
+fn state_lock_never_steals_from_a_live_owner_and_errors_with_a_clear_message() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("wt0-statelock-test-{}", Uuid::new_v4()));
+    fs::create_dir_all(&dir)?;
+    let _held = StateLock::acquire_in(
+        &dir,
+        "test.lock",
+        Duration::from_secs(30),
+        Duration::from_secs(3600),
+    )?;
+
+    let error = StateLock::acquire_in(
+        &dir,
+        "test.lock",
+        Duration::from_millis(150),
+        Duration::from_secs(3600),
+    )
+    .expect_err("a lock held by this (live) process must never be silently bypassed");
+    let message = error.to_string();
+    assert!(
+        message.contains("could not acquire the wt0 test lock within"),
+        "{message}"
+    );
+    assert!(message.contains("another wt0 is mid-operation — retry"), "{message}");
+
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// The stronger, Unix-only claim: liveness overrides age entirely, not
+/// just within a generous bound. `stale_after: 0` makes the lock look
+/// "instantly stale" by the pre-fix age-only rule — that a second acquire
+/// still can't steal it proves the recorded owner's confirmed liveness is
+/// what's deciding, not the (deliberately defeated) age check. Unix-only
+/// because Windows's [`crate::process::is_alive_hint`] always returns
+/// `None` (no portable liveness check), so it has no choice but the age
+/// fallback this test sets up to fail.
+#[cfg(unix)]
+#[test]
+fn state_lock_liveness_overrides_a_zero_stale_after() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("wt0-statelock-test-{}", Uuid::new_v4()));
+    fs::create_dir_all(&dir)?;
+    let _held = StateLock::acquire_in(&dir, "test.lock", Duration::from_secs(30), Duration::ZERO)?;
+
+    let error = StateLock::acquire_in(&dir, "test.lock", Duration::from_millis(150), Duration::ZERO)
+        .expect_err("a live owner's lock must never be stolen merely for looking old");
+    assert!(error.to_string().contains("could not acquire"), "{error}");
+
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// A lock left behind by a process that has actually exited is stolen —
+/// not because it's old (`stale_after` here is an hour, far longer than
+/// this test runs), but because its recorded owner is confirmed dead.
+#[cfg(unix)]
+#[test]
+fn state_lock_steals_a_lock_whose_owner_process_is_dead() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("wt0-statelock-test-{}", Uuid::new_v4()));
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("test.lock");
+
+    let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn()?;
+    let dead_pid = child.id();
+    child.wait()?; // reaped: genuinely gone, not a zombie a `ps` probe could see
+    fs::write(&path, dead_pid.to_string())?;
+
+    let lock = StateLock::acquire_in(
+        &dir,
+        "test.lock",
+        Duration::from_secs(5),
+        Duration::from_secs(3600),
+    )?;
+    drop(lock);
+
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}

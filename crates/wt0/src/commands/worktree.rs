@@ -10,7 +10,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -536,7 +536,15 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
     };
 
     let lease = {
-        let _slot_lock = StateLock::slots(&repo.common_git_dir);
+        let _slot_lock = match StateLock::slots(&repo.common_git_dir) {
+            Ok(lock) => lock,
+            Err(error) => {
+                let _ = force_teardown(&repo, &target);
+                let _ =
+                    delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true, None);
+                return Err(error).context("acquire slot lock");
+            }
+        };
         let slot = allocate_slot(&repo)?;
         let port_base = allocate_port_base(&target, slot);
         match mark_managed(
@@ -941,11 +949,13 @@ pub(crate) fn allocate_slot(repo: &RepoContext) -> Result<u64> {
     Ok((0..).find(|slot| !used.contains(slot)).unwrap_or(0))
 }
 
-/// A best-effort cross-process mutex: an exclusive lock file in the state
-/// directory, stolen only when older than its staleness bound so a crashed
-/// holder cannot wedge every future operation. After the bounded wait the
-/// caller proceeds unlocked — a collision is a lesser failure than a wedged
-/// fleet.
+/// A cross-process mutex: an exclusive lock file in the state directory,
+/// recording its holder's pid so a waiter can tell a lock whose owner
+/// crashed (stealable) from one whose owner is merely slow (never
+/// stealable, regardless of age) — a wedged create is recoverable by
+/// retrying; a `git worktree add`/`remove` raced by an unlocked read of the
+/// registry mid-write is not. A waiter that cannot acquire the lock within
+/// its bound gets a clear error instead of ever proceeding unlocked.
 pub(crate) struct StateLock {
     path: PathBuf,
     held: bool,
@@ -954,11 +964,8 @@ pub(crate) struct StateLock {
 impl StateLock {
     /// Serializes slot allocation with the ownership-marker write. The wait
     /// is sized for a large fleet arriving at once: each holder's registry
-    /// read can itself queue behind every in-flight create, so giving up
-    /// early and proceeding unlocked is what would hand two runtimes one
-    /// slot. Crashed holders are covered by the staleness bound, not the
-    /// wait.
-    pub(crate) fn slots(common_git_dir: &Path) -> Self {
+    /// read can itself queue behind every in-flight create.
+    pub(crate) fn slots(common_git_dir: &Path) -> Result<Self> {
         Self::acquire(
             common_git_dir,
             "slot.lock",
@@ -973,27 +980,35 @@ impl StateLock {
     /// each observe the other's half-deleted administrative directory and
     /// fail. Only the registry operations serialize; populate work — CoW
     /// clones and checkouts inside one worktree — stays fully parallel.
-    fn registry(common_git_dir: &Path) -> Self {
+    fn registry(common_git_dir: &Path) -> Result<Self> {
         Self::acquire(
             common_git_dir,
             "registry.lock",
-            Duration::from_secs(30),
+            Duration::from_secs(60),
             Duration::from_secs(60),
         )
     }
 
-    fn acquire(common_git_dir: &Path, name: &str, wait: Duration, stale_after: Duration) -> Self {
+    fn acquire(
+        common_git_dir: &Path,
+        name: &str,
+        wait: Duration,
+        stale_after: Duration,
+    ) -> Result<Self> {
         Self::acquire_in(&state_dir(common_git_dir), name, wait, stale_after)
     }
 
     /// Acquire a lock file in an arbitrary directory — the machine-global
     /// port registry lives outside any one repository's state directory.
+    /// Never returns unlocked: a waiter that exhausts `wait` gets `Err`,
+    /// naming the lock and the bound, so the caller fails loudly (and
+    /// retryably) instead of racing whatever mutation the lock guards.
     pub(crate) fn acquire_in(
         dir: &Path,
         name: &str,
         wait: Duration,
         stale_after: Duration,
-    ) -> Self {
+    ) -> Result<Self> {
         let path = dir.join(name);
         let _ = fs::create_dir_all(dir);
         let deadline = SystemTime::now() + wait;
@@ -1003,30 +1018,60 @@ impl StateLock {
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Self { path, held: true },
+                Ok(mut file) => {
+                    // Best-effort: a waiter that can't read this back (or
+                    // reads it mid-write, seeing no content yet) falls back
+                    // to the age bound in `owner_is_dead` — never assumes
+                    // liveness either way from a write it cannot observe.
+                    let _ = write!(file, "{}", std::process::id());
+                    return Ok(Self { path, held: true });
+                }
                 Err(_) => {
-                    let stale = fs::metadata(&path)
-                        .and_then(|meta| meta.modified())
-                        .ok()
-                        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                        .is_some_and(|age| age > stale_after);
-                    if stale || SystemTime::now() > deadline {
-                        // Steal a stale lock, or proceed unlocked after the
-                        // bounded wait — slot collision is a lesser failure
-                        // than a wedged create.
-                        let _ = fs::remove_file(&path);
-                        if let Ok(_file) = fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&path)
-                        {
-                            return Self { path, held: true };
-                        }
-                        return Self { path, held: false };
+                    // Checked first, unconditionally: if removing a dead
+                    // owner's lock file keeps failing (an unusual
+                    // permissions or filesystem issue), staleness alone
+                    // must never let this loop spin forever without ever
+                    // reaching the wait bound.
+                    if SystemTime::now() >= deadline {
+                        let label = name.strip_suffix(".lock").unwrap_or(name);
+                        bail!(
+                            "could not acquire the wt0 {label} lock within {} s; \
+                             another wt0 is mid-operation — retry",
+                            wait.as_secs()
+                        );
                     }
+                    if Self::owner_is_dead(&path, stale_after) {
+                        let _ = fs::remove_file(&path);
+                    }
+                    // Sleep and loop back around either way: after a steal
+                    // attempt, to race fairly for the now-removed lock
+                    // instead of assuming the removal won it; otherwise, as
+                    // the ordinary wait between polls.
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
+        }
+    }
+
+    /// A lock file is stealable once its recorded owner process is
+    /// confirmed no longer running — never merely because it's old, so a
+    /// legitimately long-running holder (a large CoW clone, a big `git
+    /// worktree add`) is never raced out from under itself. Falls back to
+    /// the age bound only when liveness can't be determined: no pid on
+    /// record (an older wt0's lock file, or a read racing the holder's own
+    /// write) or a platform with no portable liveness check (Windows) — so
+    /// a genuinely abandoned lock still clears eventually everywhere.
+    fn owner_is_dead(path: &Path, stale_after: Duration) -> bool {
+        let pid = fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| contents.trim().parse::<u32>().ok());
+        match pid.and_then(crate::process::is_alive_hint) {
+            Some(alive) => !alive,
+            None => fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .is_some_and(|age| age > stale_after),
         }
     }
 }
@@ -1422,7 +1467,7 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         let _ = fs::remove_dir_all(&state.overlay_dir);
         run_git_common(&repo, [OsStr::new("worktree"), OsStr::new("prune")])?;
     } else {
-        let _registry = StateLock::registry(&repo.common_git_dir);
+        let _registry = StateLock::registry(&repo.common_git_dir)?;
         let mut command = Command::new("git");
         command
             .arg(format!("--git-dir={}", repo.common_git_dir.display()))
@@ -1583,7 +1628,7 @@ fn list(json_output: bool) -> Result<()> {
     let repo = discover_repo(&std::env::current_dir()?)?;
     if !json_output {
         let output = {
-            let _registry = StateLock::registry(&repo.common_git_dir);
+            let _registry = StateLock::registry(&repo.common_git_dir)?;
             git_output_common(&repo, ["worktree", "list"])?
         };
         if !output.status.success() {
@@ -1594,7 +1639,7 @@ fn list(json_output: bool) -> Result<()> {
     }
 
     let output = {
-        let _registry = StateLock::registry(&repo.common_git_dir);
+        let _registry = StateLock::registry(&repo.common_git_dir)?;
         git_output_common(&repo, ["worktree", "list", "--porcelain"])?
     };
     if !output.status.success() {
@@ -2441,7 +2486,7 @@ fn delete_local_branch(
     // `git branch -d/-D` walks the worktree registry to prove the branch is
     // not checked out anywhere, so it needs the same serialization as the
     // registry mutations it races against.
-    let _registry = StateLock::registry(&repo.common_git_dir);
+    let _registry = StateLock::registry(&repo.common_git_dir)?;
     if force {
         return run_branch_delete(repo, branch, true);
     }
@@ -2605,7 +2650,7 @@ struct WorktreeEntry {
 
 fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
     let output = {
-        let _registry = StateLock::registry(&repo.common_git_dir);
+        let _registry = StateLock::registry(&repo.common_git_dir)?;
         git_output_common(repo, ["worktree", "list", "--porcelain"])?
     };
     if !output.status.success() {
@@ -4193,7 +4238,7 @@ fn rollback_created_worktree(repo: &RepoContext, target: &Path, branch: &str) {
 }
 
 fn remove_worktree_force(repo: &RepoContext, target: &Path) -> Result<()> {
-    let _registry = StateLock::registry(&repo.common_git_dir);
+    let _registry = StateLock::registry(&repo.common_git_dir)?;
     let mut command = Command::new("git");
     command
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))
@@ -4210,7 +4255,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let _registry = StateLock::registry(&repo.common_git_dir);
+    let _registry = StateLock::registry(&repo.common_git_dir)?;
     let mut command = Command::new("git");
     command
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))

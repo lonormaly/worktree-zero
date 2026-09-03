@@ -67,6 +67,27 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   the new default reports `mode: cow-clone`. See `docs/faq.md`, "Where does
   a worktree live?" and `docs/lifecycle.md`, "Inspecting the fleet".
 
+### Fixed
+
+- **`StateLock` (the registry/slot/port cross-process mutex) never
+  proceeds unlocked.** Under heavy concurrent load — 24 simultaneous `wt0
+  create` against one repository, CI's own stress job — a waiter that
+  couldn't get the lock within its bound used to steal it (or, if stealing
+  also raced, silently proceed without it), so a `git worktree list`-class
+  read could observe another process's `git worktree add` mid-write and
+  fail with `fatal: failed to read .../worktrees/<name>/commondir`. A lock
+  file now records its holder's pid; a waiter steals it only once that pid
+  is confirmed no longer running — never merely because the file is old,
+  so a legitimately long-running holder (a large CoW clone, a big `git
+  worktree add`) is never raced out from under itself — and falls back to
+  the previous age bound only when liveness can't be determined (no pid on
+  record, or Windows, which has no portable liveness check). A waiter that
+  still can't acquire the lock within its bound now fails with a clear,
+  retryable error (`could not acquire the wt0 registry lock within 60 s;
+  another wt0 is mid-operation — retry`) instead of racing the mutation
+  the lock exists to serialize; the registry lock's wait rose from 30s to
+  60s to match.
+
 ## 0.1.18 — 2026-09-03
 
 ### Added
