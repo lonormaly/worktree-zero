@@ -4,6 +4,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::thread;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
@@ -196,7 +199,27 @@ fn clone_tree_atomically(_source: &Path, _destination: &Path) -> Result<bool> {
 }
 
 fn clone_tree_entries(source: &Path, destination: &Path) -> Result<usize> {
-    let mut cloned = 0;
+    let mut files = Vec::new();
+    let mut symlinks = 0;
+    walk_and_prepare(source, destination, &mut files, &mut symlinks)?;
+    let cloned = files.len() + symlinks;
+    clone_files_concurrently(&files)?;
+    Ok(cloned)
+}
+
+/// Recreate `source`'s directory structure and symlinks inside `destination`
+/// and collect every regular file as a (source, destination) pair for the
+/// caller to clone, tallying symlinks separately since they're recreated
+/// here rather than queued. Single-threaded: `mkdir` and symlinks are cheap,
+/// and only the per-file clone below — a kernel round trip per call (a
+/// Windows `DeviceIoControl`, a Linux `ioctl`) — is worth spreading across
+/// threads.
+fn walk_and_prepare(
+    source: &Path,
+    destination: &Path,
+    files: &mut Vec<(PathBuf, PathBuf)>,
+    symlinks: &mut usize,
+) -> Result<()> {
     for entry in
         fs::read_dir(source).with_context(|| format!("read clone source {}", source.display()))?
     {
@@ -207,18 +230,59 @@ fn clone_tree_entries(source: &Path, destination: &Path) -> Result<usize> {
         if kind.is_dir() {
             fs::create_dir(&to).with_context(|| format!("create directory {}", to.display()))?;
             copy_permissions(&from, &to)?;
-            cloned += clone_tree_entries(&from, &to)?;
+            walk_and_prepare(&from, &to, files, symlinks)?;
         } else if kind.is_symlink() {
             let target =
                 fs::read_link(&from).with_context(|| format!("read symlink {}", from.display()))?;
             create_symlink(&target, &from, &to)?;
-            cloned += 1;
+            *symlinks += 1;
         } else {
-            clone_file(&from, &to)?;
-            cloned += 1;
+            files.push((from, to));
         }
     }
-    Ok(cloned)
+    Ok(())
+}
+
+/// Upper bound on file-clone worker threads. Cloning is a kernel round trip,
+/// not CPU work, so a modest fixed pool hides that latency without spawning
+/// one thread per file or oversubscribing the machine.
+const CLONE_WORKERS: usize = 8;
+
+/// Clone every (source, destination) pair in `files` with a bounded pool of
+/// worker threads pulling from a shared queue. Any single failure fails the
+/// whole clone — no partial result, no silent fallback to a byte copy.
+fn clone_files_concurrently(files: &[(PathBuf, PathBuf)]) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let workers = CLONE_WORKERS
+        .min(files.len())
+        .min(thread::available_parallelism().map_or(1, |n| n.get()));
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if failed.load(Ordering::Relaxed) {
+                    return;
+                }
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some((from, to)) = files.get(index) else {
+                    return;
+                };
+                if let Err(error) = clone_file(from, to) {
+                    failed.store(true, Ordering::Relaxed);
+                    *first_error.lock().unwrap() = Some(error);
+                    return;
+                }
+            });
+        }
+    });
+    match first_error.into_inner().unwrap() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 #[cfg(unix)]
@@ -697,4 +761,73 @@ fn touch(path: &Path) -> Result<()> {
     let contents = fs::read(path)?;
     fs::write(path, contents)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wt0-cow-test-{name}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The parallel clone queue must produce the same tree a serial walk
+    /// would: every file's bytes intact, nested directories recreated, and
+    /// symlinks preserved — regardless of which worker thread claimed which
+    /// file from the shared queue.
+    #[test]
+    fn clone_tree_entries_clones_many_files_and_nested_dirs() -> Result<()> {
+        let source = temp_dir("source");
+        fs::create_dir_all(source.join("a/b"))?;
+        for i in 0..64 {
+            fs::write(source.join(format!("f_{i}.txt")), format!("content {i}"))?;
+        }
+        for i in 0..16 {
+            fs::write(
+                source.join("a/b").join(format!("g_{i}.txt")),
+                format!("nested {i}"),
+            )?;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("f_0.txt", source.join("link"))?;
+
+        let destination = temp_dir("destination");
+        let cloned = clone_tree_entries(&source, &destination)?;
+        assert_eq!(cloned, if cfg!(unix) { 81 } else { 80 });
+
+        for i in 0..64 {
+            assert_eq!(
+                fs::read_to_string(destination.join(format!("f_{i}.txt")))?,
+                format!("content {i}")
+            );
+        }
+        for i in 0..16 {
+            assert_eq!(
+                fs::read_to_string(destination.join("a/b").join(format!("g_{i}.txt")))?,
+                format!("nested {i}")
+            );
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read_link(destination.join("link"))?,
+            Path::new("f_0.txt")
+        );
+
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&destination);
+        Ok(())
+    }
+
+    /// One bad source in the shared queue must fail the whole clone, not
+    /// just that file — no silent partial result.
+    #[test]
+    fn clone_files_concurrently_fails_the_whole_clone_on_one_bad_source() {
+        let destination = temp_dir("destination-fail");
+        let missing = destination.join("does-not-exist.txt");
+        let files = vec![(missing, destination.join("copy.txt"))];
+        assert!(clone_files_concurrently(&files).is_err());
+        let _ = fs::remove_dir_all(&destination);
+    }
 }
