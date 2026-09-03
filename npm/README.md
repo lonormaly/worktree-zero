@@ -26,9 +26,10 @@ the Cargo workspace version being released.
 
 ## Publishing a release
 
-Publishing is automated: the `Publish npm` workflow (`.github/workflows/npm.yml`)
-runs when a GitHub release is published and can be dispatched for any released
-version (`gh workflow run "Publish npm" -f version=0.1.16`). It authenticates
+Publishing is automated: the Release workflow's final `npm` job publishes
+every release (a release created by the workflow's own token cannot trigger a
+separate workflow), and `Publish npm` (`.github/workflows/npm.yml`) can be
+dispatched for any released version (`gh workflow run "Publish npm" -f version=0.1.16`). It authenticates
 with npm Trusted Publishing (GitHub OIDC) — no token, nothing that bypasses
 two-factor auth — and skips versions already on the registry, so re-runs are
 safe. One-time setup: npm only lets a trusted publisher be configured on a

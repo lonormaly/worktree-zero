@@ -13,7 +13,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub(crate) mod cow;
@@ -932,31 +932,53 @@ fn add_cow_worktree(
     target: &Path,
     base: &str,
 ) -> Result<cow::CloneKind> {
+    let mut trace = CreateTrace::new();
+    let result = add_cow_worktree_traced(repo, branch, target, base, &mut trace);
+    trace.emit();
+    result
+}
+
+fn add_cow_worktree_traced(
+    repo: &RepoContext,
+    branch: &str,
+    target: &Path,
+    base: &str,
+    trace: &mut CreateTrace,
+) -> Result<cow::CloneKind> {
     let clone_hint = target.parent().context("worktree path has no parent")?;
-    let baseline = cow::ensure_baseline(repo, base, Some(clone_hint))?;
-    let add_result = run_git_common(
-        repo,
-        [
-            OsStr::new("worktree"),
-            OsStr::new("add"),
-            OsStr::new("--no-checkout"),
-            OsStr::new("-b"),
-            OsStr::new(branch),
-            target.as_os_str(),
-            OsStr::new(base),
-        ],
-    );
+    let baseline = trace.time("baseline", || {
+        cow::ensure_baseline(repo, base, Some(clone_hint))
+    })?;
+    let add_result = trace.time("worktree-add", || {
+        run_git_common(
+            repo,
+            [
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("--no-checkout"),
+                OsStr::new("-b"),
+                OsStr::new(branch),
+                target.as_os_str(),
+                OsStr::new(base),
+            ],
+        )
+    });
     if let Err(error) = add_result {
         return Err(error.context("create linked worktree"));
     }
 
     let populate_result = (|| -> Result<cow::CloneKind> {
-        if !adopt_baseline_index(repo, &baseline, target)? {
-            run_git_at(target, ["read-tree", "HEAD"])
-                .context("initialize linked-worktree index")?;
-        }
-        let clone_kind = cow::clone_tree(&baseline, target).context("clone cached baseline")?;
-        ensure_clean(target).context("verify cloned worktree")?;
+        let clone_kind = trace.time("clone", || -> Result<cow::CloneKind> {
+            if !adopt_baseline_index(repo, &baseline, target)? {
+                run_git_at(target, ["read-tree", "HEAD"])
+                    .context("initialize linked-worktree index")?;
+            }
+            cow::clone_tree(&baseline, target).context("clone cached baseline")
+        })?;
+        trace.note(clone_kind.label());
+        trace.time("status", || {
+            ensure_clean(target).context("verify cloned worktree")
+        })?;
         fs::write(
             source_migration_marker(target)?,
             format!("{base}\n{base}\n"),
@@ -971,6 +993,62 @@ fn add_cow_worktree(
             rollback_created_worktree(repo, target, branch);
             Err(error)
         }
+    }
+}
+
+/// Opt-in phase timing for `wt0 create`'s copy-on-write populate path,
+/// enabled by setting `WT0_TRACE=1`. Disabled (the default), it costs one
+/// env lookup and runs every phase closure unchanged — no timers, no
+/// allocation, no output.
+struct CreateTrace {
+    enabled: bool,
+    phases: Vec<(&'static str, Duration, String)>,
+}
+
+impl CreateTrace {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("WT0_TRACE").is_some_and(|value| value == "1"),
+            phases: Vec::new(),
+        }
+    }
+
+    /// Run `phase`, recording its wall-clock time under `name` when tracing
+    /// is enabled.
+    fn time<T>(&mut self, name: &'static str, phase: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !self.enabled {
+            return phase();
+        }
+        let start = Instant::now();
+        let result = phase()?;
+        self.phases.push((name, start.elapsed(), String::new()));
+        Ok(result)
+    }
+
+    /// Attach a trailing note (e.g. a file count) to the most recently timed
+    /// phase. A no-op when tracing is disabled.
+    fn note(&mut self, note: impl Into<String>) {
+        if let Some(last) = self.phases.last_mut() {
+            last.2 = note.into();
+        }
+    }
+
+    fn emit(&self) {
+        if self.phases.is_empty() {
+            return;
+        }
+        let phases: Vec<String> = self
+            .phases
+            .iter()
+            .map(|(name, elapsed, note)| {
+                if note.is_empty() {
+                    format!("{name} {:.2}s", elapsed.as_secs_f64())
+                } else {
+                    format!("{name} {:.2}s {note}", elapsed.as_secs_f64())
+                }
+            })
+            .collect();
+        eprintln!("wt0: trace create: {}", phases.join(" "));
     }
 }
 

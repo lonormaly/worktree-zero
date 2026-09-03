@@ -5,6 +5,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::thread;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
@@ -161,14 +164,33 @@ fn preserve_modified_time(_source: &Path, _destination: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn preserve_modified_time(source: &Path, destination: &Path) -> Result<()> {
     let modified = fs::metadata(source)?.modified()?;
     // Unix sets times through ownership, so a read handle suffices even for
-    // a read-only file; Windows needs the handle opened for writing.
+    // a read-only file.
     fs::File::options()
         .read(true)
-        .write(cfg!(windows))
+        .open(destination)
+        .and_then(|file| file.set_modified(modified))
+        .with_context(|| format!("preserve modification time on {}", destination.display()))
+}
+
+// reflink-copy's own Windows backend (sys/windows_impl.rs in the
+// reflink-copy 0.1.30 source) never calls SetFileTime and closes its
+// destination handle before `reflink()` returns, so there is no handle to
+// fold this into without forking the dependency — this open cannot be
+// avoided, only made cheaper. SetFileTime only needs FILE_WRITE_ATTRIBUTES
+// access, not the GENERIC_READ | GENERIC_WRITE a plain `.read(true).write(true)`
+// would request, so ask CreateFileW for exactly that instead of the broader
+// (and more expensive to authorize) handle.
+#[cfg(windows)]
+fn preserve_modified_time(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let modified = fs::metadata(source)?.modified()?;
+    fs::File::options()
+        .access_mode(windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES)
         .open(destination)
         .and_then(|file| file.set_modified(modified))
         .with_context(|| format!("preserve modification time on {}", destination.display()))
@@ -180,23 +202,35 @@ fn preserve_modified_time(source: &Path, destination: &Path) -> Result<()> {
 /// without the platform-specific `cp` dependency. On APFS the whole tree is
 /// cloned in one `clonefile` call, which is tens of times faster than
 /// cloning file by file — and, per the measurement in `CloneKind`'s doc
-/// comment, roughly 5x cheaper in filesystem metadata too. Returns which
-/// mechanism actually ran, so a caller building a receipt (or `WT0_TRACE`)
-/// can tell the two apart instead of assuming the cheap path was taken.
+/// comment, roughly 5x cheaper in filesystem metadata too. The entry-by-entry
+/// fallback clones files with a bounded pool of worker threads (see
+/// `clone_files_concurrently`): each clone is a kernel round trip — several
+/// `DeviceIoControl` calls on Windows — so concurrency hides that latency
+/// instead of paying it once per file, serially. Returns which mechanism
+/// actually ran, so a caller building a receipt (or `WT0_TRACE`) can tell
+/// the two apart instead of assuming the cheap path was taken.
 pub(crate) fn clone_tree(source: &Path, destination: &Path) -> Result<CloneKind> {
-    let kind = if clone_tree_atomically(source, destination)? {
-        CloneKind::Directory
+    let (kind, cloned) = if clone_tree_atomically(source, destination)? {
+        (CloneKind::Directory, None)
     } else {
-        clone_tree_entries(source, destination)?;
-        CloneKind::PerFile
+        let cloned = clone_tree_entries(source, destination)?;
+        (CloneKind::PerFile, Some(cloned))
     };
     if trace_enabled() {
-        eprintln!(
-            "wt0 trace: clone {} -> {} ({})",
-            source.display(),
-            destination.display(),
-            kind.label()
-        );
+        match cloned {
+            Some(cloned) => eprintln!(
+                "wt0 trace: clone {} -> {} ({}, {cloned} files)",
+                source.display(),
+                destination.display(),
+                kind.label()
+            ),
+            None => eprintln!(
+                "wt0 trace: clone {} -> {} ({})",
+                source.display(),
+                destination.display(),
+                kind.label()
+            ),
+        }
     }
     Ok(kind)
 }
@@ -244,7 +278,28 @@ fn clone_tree_atomically(_source: &Path, _destination: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn clone_tree_entries(source: &Path, destination: &Path) -> Result<()> {
+fn clone_tree_entries(source: &Path, destination: &Path) -> Result<usize> {
+    let mut files = Vec::new();
+    let mut symlinks = 0;
+    walk_and_prepare(source, destination, &mut files, &mut symlinks)?;
+    let cloned = files.len() + symlinks;
+    clone_files_concurrently(&files)?;
+    Ok(cloned)
+}
+
+/// Recreate `source`'s directory structure and symlinks inside `destination`
+/// and collect every regular file as a (source, destination) pair for the
+/// caller to clone, tallying symlinks separately since they're recreated
+/// here rather than queued. Single-threaded: `mkdir` and symlinks are cheap,
+/// and only the per-file clone below — a kernel round trip per call (a
+/// Windows `DeviceIoControl`, a Linux `ioctl`) — is worth spreading across
+/// threads.
+fn walk_and_prepare(
+    source: &Path,
+    destination: &Path,
+    files: &mut Vec<(PathBuf, PathBuf)>,
+    symlinks: &mut usize,
+) -> Result<()> {
     for entry in
         fs::read_dir(source).with_context(|| format!("read clone source {}", source.display()))?
     {
@@ -255,16 +310,64 @@ fn clone_tree_entries(source: &Path, destination: &Path) -> Result<()> {
         if kind.is_dir() {
             fs::create_dir(&to).with_context(|| format!("create directory {}", to.display()))?;
             copy_permissions(&from, &to)?;
-            clone_tree_entries(&from, &to)?;
+            walk_and_prepare(&from, &to, files, symlinks)?;
         } else if kind.is_symlink() {
             let target =
                 fs::read_link(&from).with_context(|| format!("read symlink {}", from.display()))?;
             create_symlink(&target, &from, &to)?;
+            *symlinks += 1;
         } else {
-            clone_file(&from, &to)?;
+            files.push((from, to));
         }
     }
     Ok(())
+}
+
+/// Upper bound on file-clone worker threads. Each clone spends almost all of
+/// its time blocked in a kernel round trip (`DeviceIoControl` on Windows, an
+/// `ioctl` on Linux) rather than burning CPU, so — unlike a compute-bound
+/// pool — capping this at the core count leaves real concurrency on the
+/// table: measured on a 2-vCPU GitHub-hosted Windows runner, capping workers
+/// at `available_parallelism()` (2) only cut the per-file clone phase from
+/// ~6.5s to ~3.7s for 2002 files, far short of what a kernel-latency-bound
+/// workload should get from more threads in flight. This ceiling is instead
+/// a flat number well past any plausible core count, so oversubscription is
+/// bounded but not by CPU count.
+const CLONE_WORKERS: usize = 64;
+
+/// Clone every (source, destination) pair in `files` with a bounded pool of
+/// worker threads pulling from a shared queue. Any single failure fails the
+/// whole clone — no partial result, no silent fallback to a byte copy.
+fn clone_files_concurrently(files: &[(PathBuf, PathBuf)]) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let workers = CLONE_WORKERS.min(files.len());
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if failed.load(Ordering::Relaxed) {
+                    return;
+                }
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some((from, to)) = files.get(index) else {
+                    return;
+                };
+                if let Err(error) = clone_file(from, to) {
+                    failed.store(true, Ordering::Relaxed);
+                    *first_error.lock().unwrap() = Some(error);
+                    return;
+                }
+            });
+        }
+    });
+    match first_error.into_inner().unwrap() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 #[cfg(unix)]
@@ -1109,4 +1212,97 @@ fn touch(path: &Path) -> Result<()> {
     let contents = fs::read(path)?;
     fs::write(path, contents)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wt0-cow-test-{name}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Whether `dir`'s filesystem can reflink at all. The CI job that runs
+    /// this suite on Windows does so twice: once on plain NTFS (no
+    /// block-cloning primitive — `reflink` fails every time, by design) and
+    /// once on a diskpart-created ReFS volume. This test exercises the
+    /// per-file clone path itself, so it needs to run somewhere reflink
+    /// actually works; on a plain filesystem it has nothing to prove and
+    /// skips rather than failing on an environment it was never about.
+    fn reflink_supported(dir: &Path) -> bool {
+        let source = dir.join(format!(".reflink-probe-{}", Uuid::new_v4()));
+        let destination = dir.join(format!(".reflink-probe-dest-{}", Uuid::new_v4()));
+        let _ = fs::write(&source, b"probe");
+        let supported = reflink_copy::reflink(&source, &destination).is_ok();
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_file(&destination);
+        supported
+    }
+
+    /// The parallel clone queue must produce the same tree a serial walk
+    /// would: every file's bytes intact, nested directories recreated, and
+    /// symlinks preserved — regardless of which worker thread claimed which
+    /// file from the shared queue.
+    #[test]
+    fn clone_tree_entries_clones_many_files_and_nested_dirs() -> Result<()> {
+        if !reflink_supported(&std::env::temp_dir()) {
+            eprintln!(
+                "skipping: {} cannot reflink",
+                std::env::temp_dir().display()
+            );
+            return Ok(());
+        }
+        let source = temp_dir("source");
+        fs::create_dir_all(source.join("a/b"))?;
+        for i in 0..64 {
+            fs::write(source.join(format!("f_{i}.txt")), format!("content {i}"))?;
+        }
+        for i in 0..16 {
+            fs::write(
+                source.join("a/b").join(format!("g_{i}.txt")),
+                format!("nested {i}"),
+            )?;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("f_0.txt", source.join("link"))?;
+
+        let destination = temp_dir("destination");
+        let cloned = clone_tree_entries(&source, &destination)?;
+        assert_eq!(cloned, if cfg!(unix) { 81 } else { 80 });
+
+        for i in 0..64 {
+            assert_eq!(
+                fs::read_to_string(destination.join(format!("f_{i}.txt")))?,
+                format!("content {i}")
+            );
+        }
+        for i in 0..16 {
+            assert_eq!(
+                fs::read_to_string(destination.join("a/b").join(format!("g_{i}.txt")))?,
+                format!("nested {i}")
+            );
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read_link(destination.join("link"))?,
+            Path::new("f_0.txt")
+        );
+
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&destination);
+        Ok(())
+    }
+
+    /// One bad source in the shared queue must fail the whole clone, not
+    /// just that file — no silent partial result.
+    #[test]
+    fn clone_files_concurrently_fails_the_whole_clone_on_one_bad_source() {
+        let destination = temp_dir("destination-fail");
+        let missing = destination.join("does-not-exist.txt");
+        let files = vec![(missing, destination.join("copy.txt"))];
+        assert!(clone_files_concurrently(&files).is_err());
+        let _ = fs::remove_dir_all(&destination);
+    }
 }

@@ -119,3 +119,29 @@ jobs:
             "wt0-${{ matrix.target }}.tar.gz" \
             "wt0-${{ matrix.target }}.tar.gz.sha256" \
             --clobber
+
+  # A release created with the workflow's own token does not fire the
+  # `release: published` event for other workflows (GitHub stops workflows
+  # from triggering each other), so npm publishing runs here, after every
+  # asset is attached, through the same Trusted Publishing (OIDC) path the
+  # standalone Publish npm workflow uses for re-dispatches.
+  npm:
+    needs: [tag, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: npm with trusted-publishing support (11.5.1+)
+        run: npm install -g npm@latest && npm --version
+      - name: Publish worktree-zero and its platform packages
+        run: |
+          tag="${{ needs.tag.outputs.tag }}"
+          npm/publish.sh "${tag#v}"

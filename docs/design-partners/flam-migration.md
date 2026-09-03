@@ -469,6 +469,32 @@ the macOS path clones the whole directory in one call and Linux reflinks
 run at 0.26 s here. M2 (time to a usable workspace) on these two
 filesystems is otherwise not yet measured.
 
+**Follow-up (2026-09-03, run `33746674425`): parallelized the per-file
+clone.** `WT0_TRACE=1` (a new opt-in phase trace on the create path) put
+the 20.2 s inside `cow::clone_tree_entries` itself: baseline and
+`git worktree add` were each well under 100 ms, and `git status` under
+1.2 s. `clone_tree_entries` now clones files with a bounded pool of
+worker threads pulling from a shared queue instead of one file at a
+time (directory walking and symlinks stay single-threaded); a single
+failure still fails the whole clone, no silent fallback to a byte copy.
+Result: the per-file clone phase for the same 2,000-file fixture fell
+from 5.1-7.4 s to 3.4-3.9 s and mean create time from 7.47 s to 4.79 s —
+about **1.5-1.6x**, short of the 5x target this work set out for. Two
+further rounds — raising the worker ceiling from 8 (accidentally capped
+at 2 by `available_parallelism()` on the 2-vCPU CI runner) to 64
+uncapped, then narrowing a Windows-only mtime-preserving re-open to the
+`FILE_WRITE_ATTRIBUTES` access it actually needs instead of a full
+read-write handle — moved the number by less than measurement noise.
+Going from ~2-way to ~64-way concurrency for nearly the same wall time
+says thread count is not the remaining lever: something below the
+application serializes the bulk of the per-file cost, most plausibly
+the ReFS driver's own block-cloning metadata locking or Windows
+Defender's on-close scan (both known to serialize small-file churn on
+GitHub-hosted Windows runners) rather than a Rust-side fix. A
+4,000-file FLAM-sized checkout would now take roughly 8-10 s instead of
+~40 s — better, but the Windows shortfall against native Git is not
+closed.
+
 ### The 2×2 — install × store, ten worktrees (post-D13) (2026-09-03)
 
 The maintainer's question, verbatim: "can you add also pre and post dev

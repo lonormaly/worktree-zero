@@ -165,9 +165,10 @@ jobs:
           TMP: R:\tmp
           TEMP: R:\tmp
         run: cargo test --all
-      # Main only: wt0 create runs ~20 s per worktree on ReFS today (a
-      # per-file clone cost under investigation), so this 4-minute step
-      # would set every PR's critical path. Linux measures on every run.
+      # Main only: wt0 create runs ~5 s per worktree on ReFS today (parallel
+      # per-file clone; see "Gate 7" in flam-migration.md — down from ~20 s,
+      # still short of native's ~1 s), so this step still adds real time to
+      # every PR's critical path. Linux measures on every run.
       - name: Measure M1 (marginal storage per worktree) on ReFS
         if: github.event_name == 'push'
         shell: bash
