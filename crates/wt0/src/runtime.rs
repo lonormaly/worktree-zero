@@ -1,4 +1,5 @@
 use crate::commands::worktree;
+use crate::tooling;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use serde_json::{json, Value};
@@ -10,6 +11,26 @@ use std::time::SystemTime;
 use uuid::Uuid;
 
 const DEFAULT_GENERATED_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// wt0's own whole-tree checkout clone: measured 4,040 tracked files → 1.8 MiB
+/// (~450 B/file) on FLAM, and the first worktree of a base commit now costs
+/// about the same as the marginal one (D13) — see
+/// docs/design-partners/flam-migration.md, "The 2×2".
+const TRACKED_FILE_CLONE_METADATA_BYTES: u64 = 450;
+
+/// Measured combined per-worktree marginal cost (checkout + dependencies)
+/// once a native link-tree store (Bun's global store, pnpm's
+/// content-addressable store) is active — the first worktree lands within
+/// noise of the marginal one there too, so `doctor`'s before/after table uses
+/// one flat figure: docs/design-partners/flam-migration.md, "The 2×2",
+/// 7.13 MiB marginal on FLAM's own 236k-file tree with the store on.
+pub(crate) const NATIVE_STORE_WT0_MARGINAL_BYTES: u64 = 7 * 1024 * 1024;
+
+/// The same scenario without wt0: `git worktree add` still fully copies
+/// tracked files every time, so only the dependency tree benefits from the
+/// store — README's "Bun global store (FLAM)" row (386 MiB) minus the
+/// checkout-only row (380 MiB).
+const NATIVE_STORE_TODAY_DEPS_BYTES: u64 = 6 * 1024 * 1024;
 
 #[derive(Args)]
 pub struct Doctor {
@@ -193,7 +214,7 @@ pub(crate) struct DependencyFacts {
     pub(crate) bun_links_ready: bool,
 }
 
-fn dependency_facts(root: &Path) -> Result<DependencyFacts> {
+pub(crate) fn dependency_facts(root: &Path) -> Result<DependencyFacts> {
     let bun = bun_report(root);
     let manager = javascript_package_manager(root)?;
     let store = manager
@@ -238,7 +259,7 @@ fn dependency_facts(root: &Path) -> Result<DependencyFacts> {
 /// on its own, with nothing for `wt0 prepare` to seal. Shared by `doctor`'s
 /// "seal" action gate and `create`'s dependency classification so the two
 /// never disagree about what counts as native.
-fn is_native_store(store: &Option<NativeStore>) -> bool {
+pub(crate) fn is_native_store(store: &Option<NativeStore>) -> bool {
     matches!(
         store,
         Some(
@@ -274,6 +295,9 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let dependencies = dependency_storage(&root)?;
     let generated = generated_storage(&root)?;
     let bun = bun_report(&root);
+    let tracked = tracked_stats(&root)?;
+    let tooling_report = tooling::detect(&root);
+    let tilt = tooling::detect_tilt(&root);
     let DependencyFacts {
         manager: javascript_manager,
         manager_version,
@@ -293,10 +317,6 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let dependency_adapter_shipped = javascript_manager
         .as_deref()
         .is_none_or(|manager| matches!(manager, "bun" | "npm" | "pnpm" | "yarn"));
-    // A manager's own native link-tree store resolves node_modules on its
-    // own; there is nothing for `wt0 prepare` to seal, so the seal action
-    // below must not fire alongside a "dependencies: native store (...)" line.
-    let native_store_active = is_native_store(&store);
     let mut recommendations: Vec<String> = store
         .as_ref()
         .and_then(|store| native_store_recommendation(&root, store))
@@ -394,6 +414,26 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
         _ => "not yet",
     };
 
+    // The before/after cost table and the numbered step list are read-only
+    // estimates from this repository's own file counts and the per-file
+    // costs measured on FLAM (docs/design-partners/flam-migration.md, "The
+    // 2×2" and "Verification — hoisted node_modules per-worktree cost") —
+    // `doctor` never times a real create just to fill in this table.
+    let node_modules_files_total = if modules.is_dir() {
+        worktree::tree_files(&modules)
+    } else {
+        0
+    };
+    let estimate = estimate_cost(
+        &tracked,
+        javascript_manager.as_deref(),
+        &store,
+        node_modules_files_total,
+        logical_bytes(&modules)?,
+    );
+    let steps = doctor_steps(&root)?;
+    let tooling_names = tooling_report.names();
+
     let report = json!({
         "schema_version": 1,
         "root": root,
@@ -446,67 +486,551 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
             "python_environment_bytes": generated.python,
             "java_build_bytes": generated.java,
             "owned_external_bytes": generated.owned_external,
-        }
+        },
+        "estimate": {
+            "today_one_bytes": estimate.today_one_bytes,
+            "wt0_one_bytes": estimate.wt0_one_bytes,
+            "today_ten_bytes": estimate.today_ten_bytes,
+            "wt0_ten_bytes": estimate.wt0_ten_bytes,
+            "with_native_store_each_bytes": estimate.with_native_store_each_bytes,
+            "basis": estimate.basis,
+        },
+        "tooling": tooling_names,
+        "tilt": {
+            "detected": tilt.detected,
+            "literal_ports": tilt.literal_ports,
+            "literal_hosts": tilt.literal_hosts,
+            "derives_from_wt0": tilt.derives_from_wt0,
+        },
+        "steps": steps,
     });
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("Worktree Zero doctor: {}", root.display());
-        println!("  promise:           {verdict}");
-        println!(
-            "    copy-on-write:   {} ({})",
-            if cow_available { "yes" } else { "no" },
-            crate::capabilities::source_backend()
-        );
-        println!("    dependencies:    {dependency_sharing}");
-        println!("    generated state: {generated_sharing}");
-        if seed_paths > 0 {
-            println!("    seeded caches:   {seed_paths} path(s) in .wt0-seed");
-        }
-        for shortfall in &shortfalls {
-            println!("    shortfall:       {shortfall}");
-        }
-        println!(
-            "  stale dependencies: {}",
-            human_bytes(
-                report["dependencies"]["stale_logical_bytes"]
-                    .as_u64()
-                    .unwrap_or(0)
-            )
-        );
-        println!("  generated state:   {}", human_bytes(generated.total()));
-        println!("  ready:             {}", if ready { "yes" } else { "no" });
-        for recommendation in &recommendations {
-            println!("  recommend: {recommendation}");
-        }
-        if stale > 0 {
-            println!("  action: run a reviewed Worktree Zero dependency repair before agent work");
-        }
-        if !dependency_adapter_shipped {
-            println!(
-                "  action: {} adapter is detected but not shipped yet; refusing a false ready result",
-                javascript_manager.as_deref().unwrap_or("package-manager")
-            );
-        }
-        if dependencies.materialized_store_entries > 0 && !prepared_attached && !native_store_active
-        {
-            println!(
-                "  action: seal the worktree-local post-install files with `wt0 prepare --apply`"
-            );
-        }
-        if !generated_ready {
-            println!(
-                "  action: generated state exceeds the default {}; apply project retention policy",
-                human_bytes(DEFAULT_GENERATED_BUDGET_BYTES)
-            );
-        }
+        print_doctor_report(DoctorPrintArgs {
+            root: &root,
+            tracked: &tracked,
+            javascript_manager: javascript_manager.as_deref(),
+            store: &store,
+            node_modules_files: node_modules_files_total,
+            tooling_names: &tooling_names,
+            cow_available,
+            estimate: &estimate,
+            tilt: &tilt,
+            generated_total: generated.total(),
+            policy_paths,
+            seed_paths,
+            steps: &steps,
+            stale,
+            not_shipped: (!dependency_adapter_shipped).then(|| {
+                javascript_manager
+                    .as_deref()
+                    .unwrap_or("package-manager")
+                    .to_owned()
+            }),
+        });
     }
     if ready {
         Ok(())
     } else {
+        eprintln!("wt0: not ready — {} steps above", steps.len());
         bail!("repository is not ready for a thin agent runtime")
     }
+}
+
+struct DoctorPrintArgs<'a> {
+    root: &'a Path,
+    tracked: &'a TrackedStats,
+    javascript_manager: Option<&'a str>,
+    store: &'a Option<NativeStore>,
+    node_modules_files: u64,
+    tooling_names: &'a [&'static str],
+    cow_available: bool,
+    estimate: &'a Estimate,
+    tilt: &'a tooling::TiltReport,
+    generated_total: u64,
+    policy_paths: usize,
+    seed_paths: usize,
+    steps: &'a [Value],
+    stale: u64,
+    not_shipped: Option<String>,
+}
+
+/// The one-screen before/after report: what this repository costs today,
+/// what it costs with wt0, and the exact steps that close the gap. Numbers
+/// come from `estimate_cost`; see its doc comment for the sources.
+fn print_doctor_report(args: DoctorPrintArgs) {
+    let DoctorPrintArgs {
+        root,
+        tracked,
+        javascript_manager,
+        store,
+        node_modules_files,
+        tooling_names,
+        cow_available,
+        estimate,
+        tilt,
+        generated_total,
+        policy_paths,
+        seed_paths,
+        steps,
+        stale,
+        not_shipped,
+    } = args;
+
+    println!("Worktree Zero doctor — {}\n", root.display());
+
+    let manager_segment = manager_summary(javascript_manager, store)
+        .map(|summary| format!(" · {summary}"))
+        .unwrap_or_default();
+    let modules_segment = if node_modules_files > 0 {
+        format!(" · node_modules {} files", format_count(node_modules_files))
+    } else {
+        String::new()
+    };
+    println!(
+        "  📦 repository    {} tracked in {} files{manager_segment}{modules_segment}",
+        human_bytes(tracked.bytes),
+        format_count(tracked.files)
+    );
+    println!(
+        "  🖥️ filesystem    {} · copy-on-write {}",
+        filesystem_display_name(),
+        if cow_available { "✅" } else { "❌" }
+    );
+    println!(
+        "  🛠️ tooling       {}",
+        if tooling_names.is_empty() {
+            "none detected".to_owned()
+        } else {
+            tooling_names.join(" · ")
+        }
+    );
+    println!();
+
+    println!("  💾 what a worktree costs here                 today                      with wt0");
+    println!(
+        "     one worktree, ready to work                 ≈ {:<12}              ≈ {}",
+        human_bytes(estimate.today_one_bytes),
+        human_bytes(estimate.wt0_one_bytes)
+    );
+    println!(
+        "     ten agents                                   ≈ {:<12}              ≈ {}",
+        human_bytes(estimate.today_ten_bytes),
+        human_bytes(estimate.wt0_ten_bytes)
+    );
+    if let Some(with_store) = estimate.with_native_store_each_bytes {
+        println!(
+            "     with a native link-tree store (one config line)                       ≈ {each} each  ← recommended",
+            each = human_bytes(with_store)
+        );
+    }
+    println!(
+        "     ≈ estimated from this repo's file counts and the per-file costs measured on FLAM (docs/design-partners/flam-migration.md); basis: {}",
+        estimate.basis
+    );
+    println!();
+
+    println!(
+        "  ⚡ speed         {}",
+        if cow_available {
+            "create ≈ 1–2 s (one whole-tree clonefile), first git status instant (adopted index)"
+        } else {
+            "no copy-on-write on this volume — create falls back to a plain git checkout"
+        }
+    );
+    println!("  🔌 ports         every worktree gets a 100-port window (WT0_PORT_BASE) and a slug (WT0_SLUG)");
+    print_tilt_line(tilt);
+    print_generated_line(generated_total, policy_paths);
+    print_seed_line(root, seed_paths);
+    println!();
+
+    if steps.is_empty() {
+        println!("  ✅ ready");
+    } else {
+        println!(
+            "  ❌ not ready — {} step{}",
+            steps.len(),
+            if steps.len() == 1 { "" } else { "s" }
+        );
+        for step in steps {
+            println!(
+                "     {}. {}  {}   {}",
+                step["order"].as_u64().unwrap_or(0),
+                step["title"].as_str().unwrap_or(""),
+                step["command_or_config"].as_str().unwrap_or(""),
+                step["payoff"].as_str().unwrap_or("")
+            );
+        }
+    }
+    if stale > 0 {
+        println!("  action: run a reviewed Worktree Zero dependency repair before agent work");
+    }
+    if let Some(manager) = not_shipped {
+        println!(
+            "  action: {manager} adapter is detected but not shipped yet; refusing a false ready result"
+        );
+    }
+}
+
+fn print_tilt_line(tilt: &tooling::TiltReport) {
+    if !tilt.detected {
+        println!(
+            "  🎛️ tilt          not used — for several agents each with a booted dev stack, Tilt + wt0 gives every worktree its own ports and hostnames (`wt0 init tilt` starts one)"
+        );
+    } else if tilt.derives_from_wt0 {
+        println!("  🎛️ tilt          derives ports and hostnames from wt0 ✅");
+    } else {
+        let ports = if tilt.literal_ports.is_empty() {
+            String::new()
+        } else {
+            format!("port {}", tilt.literal_ports.join(", "))
+        };
+        let hosts = if tilt.literal_hosts.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{}{} hostname{}",
+                if ports.is_empty() { "" } else { " and " },
+                tilt.literal_hosts.len(),
+                if tilt.literal_hosts.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        };
+        println!("  🎛️ tilt          Tiltfile pins {ports}{hosts} → two agents collide");
+        println!(
+            "                   fix: TILT_PORT=\"${{WT0_PORT_BASE}}\", route names \"<role>-${{WT0_SLUG}}\" — `wt0 init tilt` writes it"
+        );
+    }
+}
+
+fn print_generated_line(generated_total: u64, policy_paths: usize) {
+    if policy_paths > 0 {
+        println!(
+            "  🧹 generated     {} reclaimable via {policy_paths} reviewed path(s) in .wt0-generated",
+            human_bytes(generated_total)
+        );
+    } else {
+        println!(
+            "  🧹 generated     {} of build output with no .wt0-generated policy → gc cannot reclaim it — `wt0 init generated` proposes one",
+            human_bytes(generated_total)
+        );
+    }
+}
+
+fn print_seed_line(root: &Path, seed_paths: usize) {
+    if seed_paths > 0 {
+        println!("  📚 seeds         {seed_paths} path(s) in .wt0-seed");
+        return;
+    }
+    let preview = seed_preview(root);
+    if preview.is_empty() {
+        println!("  📚 seeds         no .wt0-seed");
+    } else {
+        println!(
+            "  📚 seeds         no .wt0-seed — `wt0 init seed` proposes {}",
+            preview
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        );
+    }
+}
+
+/// A cheap, best-effort preview of what `wt0 init seed` would propose — the
+/// full candidate scan lives in `init::propose_seed`; this only decides
+/// whether `doctor`'s one-line teaser has something to name.
+fn seed_preview(root: &Path) -> Vec<PathBuf> {
+    let mut preview = Vec::new();
+    for candidate in [".next/cache", ".nx/cache", ".turbo"] {
+        if root.join(candidate).is_dir() {
+            preview.push(PathBuf::from(candidate));
+        }
+        if preview.len() == 2 {
+            break;
+        }
+    }
+    preview
+}
+
+fn manager_summary(manager: Option<&str>, store: &Option<NativeStore>) -> Option<String> {
+    let manager = manager?;
+    let label = match manager {
+        "bun" => "Bun",
+        "npm" => "npm",
+        "yarn" => "Yarn",
+        "pnpm" => "pnpm",
+        other => other,
+    };
+    Some(match store {
+        Some(NativeStore::BunGlobalStore) => format!("{label}, global store"),
+        Some(NativeStore::Pnpm) => format!("{label}, content-addressable store"),
+        Some(NativeStore::YarnPnpmLinker) => format!("{label}, nodeLinker: pnpm"),
+        Some(NativeStore::YarnPnp) => format!("{label}, PnP"),
+        _ => format!("{label}, hoisted (no global store)"),
+    })
+}
+
+fn filesystem_display_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "APFS"
+    } else if cfg!(target_os = "linux") {
+        "this filesystem"
+    } else if cfg!(target_os = "windows") {
+        "ReFS/Dev Drive"
+    } else {
+        "this filesystem"
+    }
+}
+
+fn format_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::new();
+    for (index, digit) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped.chars().rev().collect()
+}
+
+/// Tracked-file count and total logical bytes at `root`, from `git ls-files`
+/// sizes — the "today" checkout cost `doctor`'s before/after table starts
+/// from, and the file count wt0's own clone metadata (`TRACKED_FILE_CLONE_METADATA_BYTES`)
+/// scales by.
+struct TrackedStats {
+    files: u64,
+    bytes: u64,
+}
+
+fn tracked_stats(root: &Path) -> Result<TrackedStats> {
+    let output = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(root)
+        .output()
+        .context("list tracked files")?;
+    if !output.status.success() {
+        bail!("git ls-files failed while sizing the tracked checkout");
+    }
+    let mut files = 0;
+    let mut bytes = 0;
+    for raw in output.stdout.split(|byte| *byte == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let relative = std::str::from_utf8(raw).context("non-UTF-8 tracked path is unsupported")?;
+        files += 1;
+        bytes += fs::symlink_metadata(root.join(relative))
+            .map(|metadata| {
+                if metadata.is_file() {
+                    metadata.len()
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+    }
+    Ok(TrackedStats { files, bytes })
+}
+
+/// What one worktree's dependency tree costs today (plain `git worktree add`
+/// plus the manager's own install) and with wt0's own clone, given this
+/// repository's package-manager classification. Measured constants only —
+/// `doctor` is read-only and never times a live install.
+fn install_cost_bytes(
+    manager: Option<&str>,
+    store: &Option<NativeStore>,
+    node_modules_bytes: u64,
+    node_modules_files: u64,
+) -> (u64, u64) {
+    let Some(manager) = manager else {
+        return (0, 0);
+    };
+    if is_native_store(store) {
+        return (
+            NATIVE_STORE_TODAY_DEPS_BYTES,
+            NATIVE_STORE_WT0_MARGINAL_BYTES,
+        );
+    }
+    let today = match manager {
+        // No filesystem sharing at all between checkouts: npm and Yarn
+        // classic copy the tree's real bytes every time (README's "npm
+        // hoisted"/"Yarn classic" rows).
+        "npm" | "yarn" => node_modules_bytes,
+        // Same-volume-cache clonefile managers (Bun with no store) still pay
+        // the ~2 KB/file metadata floor for a hoisted tree this size
+        // (flam-migration.md, "What most users pay today").
+        _ => node_modules_files * worktree::NATIVE_INSTALL_FILE_METADATA_BYTES,
+    };
+    let wt0 = node_modules_files * worktree::CLONED_FILE_METADATA_BYTES;
+    (today, wt0)
+}
+
+pub(crate) struct Estimate {
+    today_one_bytes: u64,
+    wt0_one_bytes: u64,
+    today_ten_bytes: u64,
+    wt0_ten_bytes: u64,
+    with_native_store_each_bytes: Option<u64>,
+    basis: &'static str,
+}
+
+/// `doctor`'s before/after cost table: what one worktree and ten worktrees
+/// cost today versus with wt0, and — when no native link-tree store is
+/// active yet — what a native store would bring the wt0 figure down to.
+/// `basis` is always `"estimated"` today: nothing in this repository yet
+/// persists a measured physical-delta receipt from a previous `wt0 create`
+/// for `doctor` to prefer instead.
+fn estimate_cost(
+    tracked: &TrackedStats,
+    manager: Option<&str>,
+    store: &Option<NativeStore>,
+    node_modules_files: u64,
+    node_modules_bytes: u64,
+) -> Estimate {
+    let (deps_today, deps_wt0_marginal) =
+        install_cost_bytes(manager, store, node_modules_bytes, node_modules_files);
+    let checkout_marginal_wt0 = tracked.files * TRACKED_FILE_CLONE_METADATA_BYTES;
+    let native = is_native_store(store);
+
+    // Without a native store, wt0's dependency cost comes from a sealed
+    // prepared environment: the first worktree of an environment key
+    // additionally pays the one-time seal, measured at ≈2x the marginal cost
+    // per worktree after (flam-migration.md, "Verification" — B1 178.6 MiB
+    // vs. B2/B3 ≈89 MiB). With a native store, first and marginal land
+    // within noise of each other (2×2 table: 7.0 MiB vs. 7.13 MiB) — no
+    // doubling.
+    let (wt0_marginal, wt0_first) = if native {
+        (deps_wt0_marginal, deps_wt0_marginal)
+    } else {
+        (
+            checkout_marginal_wt0 + deps_wt0_marginal,
+            checkout_marginal_wt0 + deps_wt0_marginal.saturating_mul(2),
+        )
+    };
+    let today_one_bytes = tracked.bytes + deps_today;
+
+    Estimate {
+        today_one_bytes,
+        wt0_one_bytes: wt0_marginal,
+        today_ten_bytes: today_one_bytes.saturating_mul(10),
+        wt0_ten_bytes: wt0_first + wt0_marginal.saturating_mul(9),
+        with_native_store_each_bytes: (!native)
+            .then_some(manager)
+            .flatten()
+            .map(|_| NATIVE_STORE_WT0_MARGINAL_BYTES),
+        basis: "estimated",
+    }
+}
+
+fn native_store_step(manager: &str) -> (&'static str, String) {
+    match manager {
+        "bun" => (
+            "bunfig.toml",
+            "[install] linker = \"isolated\", globalStore = true  (Bun ≥ 1.3.14)".to_owned(),
+        ),
+        "yarn" => (".yarnrc.yml", "nodeLinker: pnpm".to_owned()),
+        "npm" => (
+            "package manager",
+            "migrate to pnpm (`corepack use pnpm@latest`) or Bun with globalStore = true"
+                .to_owned(),
+        ),
+        other => (
+            "package manager",
+            format!("switch {other} to a link-tree store"),
+        ),
+    }
+}
+
+/// The ordered list of concrete next actions: what `wt0 doctor`'s before/
+/// after report shows as its numbered steps, and what `wt0 init` (no target)
+/// reuses to say which `init` targets close them. Each entry names a
+/// `wt0 init` target, a one-line package-manager config change, or
+/// `wt0 prepare --apply` — never a bare diagnosis with nothing to run.
+pub(crate) fn doctor_steps(root: &Path) -> Result<Vec<Value>> {
+    let DependencyFacts {
+        manager,
+        store,
+        manager_ready,
+        ..
+    } = dependency_facts(root)?;
+    let generated = generated_storage(root)?;
+    let policy_paths = worktree::project_generated_policy(root)
+        .map(|paths| paths.len())
+        .unwrap_or(0);
+    let tracked = tracked_stats(root)?;
+    let modules = root.join("node_modules");
+    let node_modules_files = if modules.is_dir() {
+        worktree::tree_files(&modules)
+    } else {
+        0
+    };
+    let tilt = tooling::detect_tilt(root);
+
+    let mut steps = Vec::new();
+    if let Some(manager) = manager.as_deref() {
+        if !is_native_store(&store) {
+            let (title, command) = native_store_step(manager);
+            let before = node_modules_files * worktree::CLONED_FILE_METADATA_BYTES;
+            let checkout_marginal = tracked.files * TRACKED_FILE_CLONE_METADATA_BYTES;
+            let after = NATIVE_STORE_WT0_MARGINAL_BYTES.saturating_sub(checkout_marginal);
+            steps.push(json!({
+                "order": steps.len() + 1,
+                "title": title,
+                "command_or_config": command,
+                "payoff": format!("{} → {} per worktree", human_bytes(before), human_bytes(after)),
+            }));
+        } else if !manager_ready {
+            steps.push(json!({
+                "order": steps.len() + 1,
+                "title": "dependencies",
+                "command_or_config": "wt0 prepare --apply",
+                "payoff": "seals a private copy-on-write dependency environment for this worktree",
+            }));
+        }
+    }
+    let generated_ready = generated.total() <= DEFAULT_GENERATED_BUDGET_BYTES;
+    if policy_paths == 0 {
+        steps.push(json!({
+            "order": steps.len() + 1,
+            "title": "generated state",
+            "command_or_config": "wt0 init generated   then review .wt0-generated",
+            "payoff": if generated.total() > 0 {
+                format!("gc can reclaim {}", human_bytes(generated.total()))
+            } else {
+                "gc can review generated state safely".to_owned()
+            },
+        }));
+    } else if !generated_ready {
+        // A policy already exists but the reviewed paths still exceed the
+        // default budget — `wt0 init generated` has nothing new to propose;
+        // what's missing is trimming or raising the retention policy itself.
+        steps.push(json!({
+            "order": steps.len() + 1,
+            "title": "generated state",
+            "command_or_config": "apply project retention policy (trim .wt0-generated or `wt0 gc --apply`)",
+            "payoff": format!(
+                "{} exceeds the {} default budget",
+                human_bytes(generated.total()),
+                human_bytes(DEFAULT_GENERATED_BUDGET_BYTES)
+            ),
+        }));
+    }
+    if tilt.detected && !tilt.derives_from_wt0 {
+        steps.push(json!({
+            "order": steps.len() + 1,
+            "title": "tilt",
+            "command_or_config": "wt0 init tilt",
+            "payoff": "ports and hostnames from WT0_PORT_BASE / WT0_SLUG",
+        }));
+    }
+    Ok(steps)
 }
 
 pub fn migrate(args: Migrate, json_output: bool) -> Result<()> {
@@ -2879,6 +3403,128 @@ mod tests {
         .expect("apply prepare");
         assert!(!root.join("node_modules/.old_modules-ab12").exists());
         assert!(root.join("node_modules/.bun/package@1.0.0").is_symlink());
+
+        fs::remove_dir_all(root).expect("remove test fixture");
+    }
+
+    /// `doctor`'s before/after table, worked by hand against the numbers this
+    /// crate's own `wt0 doctor` printed for itself and against
+    /// docs/design-partners/flam-migration.md's "The 2×2": 368 MiB tracked
+    /// across 4,040 files, Bun hoisted with no global store, node_modules
+    /// 70,124 files — today ≈ 505 MiB (368 + 70,124×2 KiB), wt0 ≈ 28.5 MiB
+    /// (4,040×450 B + 70,124×400 B), and the native-store recommendation
+    /// citing the flat measured marginal.
+    #[test]
+    fn estimate_cost_matches_the_worked_example() {
+        let tracked = TrackedStats {
+            files: 4_040,
+            bytes: 368 * 1024 * 1024,
+        };
+        let store = Some(NativeStore::None {
+            manager: "bun".to_owned(),
+        });
+        let estimate = estimate_cost(&tracked, Some("bun"), &store, 70_124, 0);
+
+        let expected_today =
+            368 * 1024 * 1024 + 70_124 * worktree::NATIVE_INSTALL_FILE_METADATA_BYTES;
+        assert_eq!(estimate.today_one_bytes, expected_today);
+        assert!(
+            (505.0 - estimate.today_one_bytes as f64 / (1024.0 * 1024.0)).abs() < 3.0,
+            "{} MiB",
+            estimate.today_one_bytes / (1024 * 1024)
+        );
+
+        let expected_wt0 = 4_040 * TRACKED_FILE_CLONE_METADATA_BYTES
+            + 70_124 * worktree::CLONED_FILE_METADATA_BYTES;
+        assert_eq!(estimate.wt0_one_bytes, expected_wt0);
+        assert!(
+            (28.5 - estimate.wt0_one_bytes as f64 / (1024.0 * 1024.0)).abs() < 1.0,
+            "{} MiB",
+            estimate.wt0_one_bytes / (1024 * 1024)
+        );
+
+        assert_eq!(estimate.today_ten_bytes, estimate.today_one_bytes * 10);
+        // Ten wt0 worktrees cost far less than a tenth of ten native ones.
+        assert!(estimate.wt0_ten_bytes * 10 < estimate.today_ten_bytes);
+        assert_eq!(
+            estimate.with_native_store_each_bytes,
+            Some(NATIVE_STORE_WT0_MARGINAL_BYTES)
+        );
+        assert_eq!(estimate.basis, "estimated");
+    }
+
+    #[test]
+    fn install_cost_is_a_full_copy_for_npm_and_yarn_without_a_native_store() {
+        for manager in ["npm", "yarn"] {
+            let (today, wt0) = install_cost_bytes(Some(manager), &None, 100 * 1024 * 1024, 5_000);
+            assert_eq!(today, 100 * 1024 * 1024, "{manager}");
+            assert_eq!(
+                wt0,
+                5_000 * worktree::CLONED_FILE_METADATA_BYTES,
+                "{manager}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_cost_is_flat_and_small_once_a_native_store_is_active() {
+        let store = Some(NativeStore::Pnpm);
+        let (today, wt0) = install_cost_bytes(Some("pnpm"), &store, 999_999_999, 999_999);
+        assert_eq!(today, NATIVE_STORE_TODAY_DEPS_BYTES);
+        assert_eq!(wt0, NATIVE_STORE_WT0_MARGINAL_BYTES);
+    }
+
+    #[test]
+    fn install_cost_is_zero_with_no_javascript_manager() {
+        assert_eq!(install_cost_bytes(None, &None, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn doctor_steps_recommends_a_native_store_and_a_generated_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "wt0-doctor-steps-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create fixture root");
+        fs::write(root.join(".gitignore"), "node_modules/\n.next/\n").expect("write gitignore");
+        fs::write(root.join("bun.lock"), "{}\n").expect("write lockfile");
+        fs::write(root.join("package.json"), "{\"name\":\"fixture\"}\n").expect("write manifest");
+        fs::create_dir_all(root.join("node_modules/pkg")).expect("create node_modules");
+        fs::write(root.join("node_modules/pkg/index.js"), "1\n").expect("write package file");
+        fs::create_dir_all(root.join(".next")).expect("create build output");
+        fs::write(root.join(".next/build-id"), "abc\n").expect("write build output");
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "test@example.com"][..],
+            &["config", "user.name", "Test User"][..],
+            &["add", "-f", ".gitignore", "bun.lock", "package.json"][..],
+            &["commit", "-q", "-m", "fixture"][..],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .expect("prepare doctor-steps fixture")
+                .success());
+        }
+
+        let steps = doctor_steps(&root).expect("doctor steps");
+        assert!(
+            steps.iter().any(|step| step["title"] == "bunfig.toml"),
+            "{steps:?}"
+        );
+        assert!(
+            steps.iter().any(|step| step["title"] == "generated state"),
+            "{steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|step| step["title"] == "tilt"),
+            "no Tiltfile in the fixture: {steps:?}"
+        );
 
         fs::remove_dir_all(root).expect("remove test fixture");
     }

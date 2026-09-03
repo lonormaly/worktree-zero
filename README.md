@@ -264,6 +264,69 @@ Hermes, Slack agents, and any other MCP client call the same lifecycle — see
 configuration. Wrappers may translate transport, but must not reimplement
 cleanup or weaken a refusal.
 
+### First run
+
+`wt0 doctor` is the one command that answers whether the promise holds here —
+a before/after cost table, the tooling it detected, and the exact steps that
+close the gap. A real run against a design partner's repository, example:
+
+```text
+Worktree Zero doctor — /path/to/your-repo
+
+  📦 repository    1.6 MiB tracked in 316 files · Bun, hoisted (no global store) · node_modules 70,124 files
+  🖥️ filesystem    APFS · copy-on-write ✅
+  🛠️ tooling       Nx · Tilt · Portless · docker-compose
+
+  💾 what a worktree costs here                 today                      with wt0
+     one worktree, ready to work                 ≈ 138.6 MiB                 ≈ 26.9 MiB
+     ten agents                                   ≈ 1.35 GiB                  ≈ 295.6 MiB
+     with a native link-tree store (one config line)                       ≈ 7.0 MiB each  ← recommended
+     ≈ estimated from this repo's file counts and the per-file costs measured on FLAM (docs/design-partners/flam-migration.md); basis: estimated
+
+  ⚡ speed         create ≈ 1–2 s (one whole-tree clonefile), first git status instant (adopted index)
+  🔌 ports         every worktree gets a 100-port window (WT0_PORT_BASE) and a slug (WT0_SLUG)
+  🎛️ tilt          Tiltfile pins port 1355, 8765, … and 8 hostnames → two agents collide
+                   fix: TILT_PORT="${WT0_PORT_BASE}", route names "<role>-${WT0_SLUG}" — `wt0 init tilt` writes it
+  🧹 generated     981.7 MiB of build output with no .wt0-generated policy → gc cannot reclaim it — `wt0 init generated` proposes one
+  📚 seeds         no .wt0-seed — `wt0 init seed` proposes .nx/cache
+
+  ❌ not ready — 3 steps
+     1. bunfig.toml  [install] linker = "isolated", globalStore = true  (Bun ≥ 1.3.14)   26.8 MiB → 6.9 MiB per worktree
+     2. generated state  wt0 init generated   then review .wt0-generated   gc can reclaim 981.7 MiB
+     3. tilt  wt0 init tilt   ports and hostnames from WT0_PORT_BASE / WT0_SLUG
+```
+
+`wt0 init` writes the setup `doctor` just recommended, instead of you (or an
+agent) copying it by hand — a dry run by default, `--apply` to write, and it
+never overwrites an existing file without `--force`:
+
+```bash
+wt0 init                    # doctor's steps, and which init target closes each
+wt0 init generated --apply  # writes .wt0-generated from this repo's own ignored build output
+wt0 init seed --apply       # writes .wt0-seed from detected caches (Nx, Turbo, Next, node_modules)
+wt0 init tilt --apply       # writes tilt_up.sh / tilt_down.sh, lifecycle hooks, and a Tiltfile snippet
+wt0 create agent/first-task # now create the first thin runtime
+```
+
+### Tilt, Portless and ports
+
+A dev stack behind Tilt or `docker compose` pins a UI port and, with
+[Portless](https://github.com/vercel-labs/portless), a set of stable
+`*.localhost` hostnames — great for one human, but two agents' worktrees
+booting the same Tiltfile fight over both. `wt0`'s per-runtime identity
+(`WT0_PORT_BASE`, a disjoint hundred-port window; `WT0_SLUG`, a label-safe
+branch name) exists exactly to close that gap, and two design partners
+already run it in production: FLAM's `.wt0/hooks/post-create` pins every
+listener inside its runtime's own port window
+(`TILT_PORT="$WT0_PORT_BASE"`, `DB_PORT="$((WT0_PORT_BASE + 1))"`, …), and
+Builders Stack's `tilt_up.sh` / `.devops/Tiltfile` derive the Tilt UI port
+from `WT0_PORT_BASE` and suffix every Portless route with `-${WT0_SLUG}`.
+`wt0 init tilt` writes exactly that pattern — boot/stop scripts, lifecycle
+hooks, and a Tiltfile snippet — for a project that doesn't have it yet; see
+the [Tilt integration](integrations/tilt/README.md) for the full extension
+API (`wt0_port`, `wt0_namespace`, `wt0_shared_namespace`, …) and the shared-
+services tier for stacks too heavy to boot fresh per worktree.
+
 ## Honest measurement
 
 “Zero” is a measured direction, not a claim that bytes do not exist. Every
@@ -407,8 +470,24 @@ Worktree Zero is not stable until a new agent integration can:
   (per-file cloning; the CI receipt shows the current number). NTFS falls
   back to a plain checkout and says so.
 - **Is `doctor` "not ready" a blocker?** No — `create` works regardless;
-  "ready" means dependencies are shared and generated state has a retention
-  policy. `create` now prints the next step when it isn't.
+  `ready`/the exit code mean dependencies are shared and generated state is
+  within budget. `doctor`'s "❌ not ready — N steps" header is a broader
+  worklist — it also counts a Tilt setup that doesn't yet derive ports from
+  wt0, which does not block `ready`. `create` prints the next step when
+  dependencies or generated state aren't there yet, and `wt0 init` writes
+  every step's fix.
+- **What's an owner?** A free-form label — an agent id, a person, a CI job —
+  passed as `--owner` or `$WT0_OWNER`, stored in the runtime's lease, shown
+  by `wt0 fleet`, and exported to lifecycle hooks as `WT0_OWNER`. Projects
+  stamp it into external resources: FLAM's `.wt0/hooks/post-create` records
+  it alongside the runtime id so a tenant database or namespace can be traced
+  back to who created it.
+- **Does wt0 create databases?** No. wt0 gives every runtime an id, a slug,
+  and a port window — nothing project-specific. A project's own
+  `post-create` hook creates a per-runtime database or namespace from those
+  identities (FLAM's does: `createdb`/tenant provisioning keyed by
+  `WT0_RUNTIME_ID`), and `pre-remove` retires it. See
+  [project lifecycle hooks](docs/lifecycle.md#project-lifecycle-hooks).
 - **What is simgit?** The copy-on-write engine wt0 started from, included
   under its MIT license with history; wt0 adds everything around it (see
   [Origins](#origins) below).

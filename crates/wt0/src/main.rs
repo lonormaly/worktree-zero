@@ -37,19 +37,69 @@ mod capabilities;
 mod commands;
 mod events;
 mod hooks;
+mod init;
 mod mcp;
 mod process;
 mod runtime;
+mod tooling;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+
+/// The top-level `--help` body, grouped by what an agent needs first. clap
+/// 4's derive has no per-subcommand heading — `Command` only offers one
+/// heading override for the whole "Commands:" block
+/// (`Command::subcommand_help_heading`) — so this is applied via
+/// `Command::override_help` in `main` instead of a `#[command(...)]`
+/// attribute. Keep this in sync with the `Commands` enum below when a
+/// subcommand is added, renamed, or moved between groups.
+const GROUPED_HELP: &str = "\
+Copy-on-write Git worktrees for agent fleets — a usable checkout in ~1 s and
+a few MiB, ports that never collide, cleanup that never loses work. Start
+with: wt0 doctor
+
+Usage: wt0 [OPTIONS] <COMMAND>
+
+Start here:
+  doctor  Inspect dependency sharing and generated runtime storage
+  init    Propose or write the setup `doctor` recommends
+  create  Create a thin linked checkout
+  run     Create a thin runtime and run a command inside it
+  remove  Remove a linked runtime safely
+
+Fleet:
+  list       List linked runtimes
+  fleet      Show every runtime with its lease, slot, and storage — the fleet view
+  gc         Reap eligible abandoned runtimes
+  prune      Remove stale source baselines and Git registrations
+  heartbeat  Refresh the ownership lease for a running agent worktree
+  events     Read or follow the append-only lifecycle event log
+
+Dependencies:
+  prepare  Prepare package-manager state for a thin runtime
+  migrate  Audit or safely migrate existing linked runtimes
+  repair   Repair interrupted overlay-backed runtimes
+
+Integration:
+  mcp           Serve the same lifecycle over the Model Context Protocol
+  capabilities  Discover storage, package-manager, build-tool, and agent-host adapters
+
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --json     Output machine-readable JSON
+  -h, --help     Print help
+  -V, --version  Print version
+";
 
 /// One complete, thin development runtime for coding agents.
 #[derive(Parser)]
 #[command(
     name = "wt0",
     version,
-    about = "Thin, isolated development runtimes for coding agents"
+    about = "Copy-on-write Git worktrees for agent fleets — a usable checkout \
+             in ~1 s and a few MiB, ports that never collide, cleanup that \
+             never loses work. Start with: wt0 doctor"
 )]
 struct Cli {
     /// Output machine-readable JSON.
@@ -60,10 +110,15 @@ struct Cli {
     command: Commands,
 }
 
+// Ordered and grouped for `--help`'s custom `Cli::GROUPED_HELP` listing below
+// (clap 4's derive has no per-subcommand heading — see that constant's doc
+// comment): Start here, Fleet, Dependencies, Integration.
 #[derive(Subcommand)]
 enum Commands {
-    /// Discover storage, package-manager, build-tool, and agent-host adapters.
-    Capabilities(capabilities::Capabilities),
+    /// Inspect dependency sharing and generated runtime storage.
+    Doctor(runtime::Doctor),
+    /// Propose or write the setup `doctor` recommends.
+    Init(init::Init),
     /// Create a thin linked checkout.
     Create(commands::worktree::WorktreeAdd),
     /// Create a thin runtime and run a command inside it.
@@ -72,35 +127,37 @@ enum Commands {
     Remove(commands::worktree::WorktreeRemove),
     /// List linked runtimes.
     List(commands::worktree::WorktreeList),
+    /// Show every runtime with its lease, slot, and storage — the fleet view.
+    Fleet(commands::worktree::WorktreeFleet),
     /// Reap eligible abandoned runtimes.
     Gc(commands::worktree::WorktreeGc),
-    /// Repair interrupted overlay-backed runtimes.
-    Repair(commands::worktree::WorktreeRepair),
-    /// Refresh the ownership lease for a running agent worktree.
-    Heartbeat(commands::worktree::WorktreeHeartbeat),
     /// Remove stale source baselines and Git registrations.
     Prune(commands::worktree::WorktreePrune),
-    /// Inspect dependency sharing and generated runtime storage.
-    Doctor(runtime::Doctor),
+    /// Refresh the ownership lease for a running agent worktree.
+    Heartbeat(commands::worktree::WorktreeHeartbeat),
+    /// Read or follow the append-only lifecycle event log.
+    Events(events::Events),
     /// Prepare package-manager state for a thin runtime.
     Prepare(runtime::Prepare),
     /// Audit or safely migrate existing linked runtimes.
     Migrate(runtime::Migrate),
-    /// Show every runtime with its lease, slot, and storage — the fleet view.
-    Fleet(commands::worktree::WorktreeFleet),
-    /// Read or follow the append-only lifecycle event log.
-    Events(events::Events),
+    /// Repair interrupted overlay-backed runtimes.
+    Repair(commands::worktree::WorktreeRepair),
     /// Serve the same lifecycle over the Model Context Protocol.
     Mcp(mcp::Mcp),
+    /// Discover storage, package-manager, build-tool, and agent-host adapters.
+    Capabilities(capabilities::Capabilities),
     /// Compatibility namespace for the imported source engine.
     #[command(hide = true, subcommand)]
     Worktree(commands::worktree::Worktree),
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().override_help(GROUPED_HELP).get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     match cli.command {
         Commands::Capabilities(args) => capabilities::run(args, cli.json),
+        Commands::Init(args) => init::run(args, cli.json),
         Commands::Create(args) => {
             commands::worktree::run(commands::worktree::Worktree::Add(args), cli.json)
         }
