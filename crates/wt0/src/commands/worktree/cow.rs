@@ -164,14 +164,33 @@ fn preserve_modified_time(_source: &Path, _destination: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn preserve_modified_time(source: &Path, destination: &Path) -> Result<()> {
     let modified = fs::metadata(source)?.modified()?;
     // Unix sets times through ownership, so a read handle suffices even for
-    // a read-only file; Windows needs the handle opened for writing.
+    // a read-only file.
     fs::File::options()
         .read(true)
-        .write(cfg!(windows))
+        .open(destination)
+        .and_then(|file| file.set_modified(modified))
+        .with_context(|| format!("preserve modification time on {}", destination.display()))
+}
+
+// reflink-copy's own Windows backend (sys/windows_impl.rs in the
+// reflink-copy 0.1.30 source) never calls SetFileTime and closes its
+// destination handle before `reflink()` returns, so there is no handle to
+// fold this into without forking the dependency — this open cannot be
+// avoided, only made cheaper. SetFileTime only needs FILE_WRITE_ATTRIBUTES
+// access, not the GENERIC_READ | GENERIC_WRITE a plain `.read(true).write(true)`
+// would request, so ask CreateFileW for exactly that instead of the broader
+// (and more expensive to authorize) handle.
+#[cfg(windows)]
+fn preserve_modified_time(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let modified = fs::metadata(source)?.modified()?;
+    fs::File::options()
+        .access_mode(windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES)
         .open(destination)
         .and_then(|file| file.set_modified(modified))
         .with_context(|| format!("preserve modification time on {}", destination.display()))
