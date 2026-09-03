@@ -2479,10 +2479,15 @@ fn create_json(wt0: &str, repo: &Path, branch: &str, path: Option<&Path>) -> ser
     serde_json::from_slice(&output.stdout).expect("create JSON")
 }
 
+/// `--force`, like every other fixture teardown in this file: on a plain
+/// filesystem (no reflinks) wt0 populates a worktree as an overlay mount,
+/// and a mount point can't be torn down by a later `fs::remove_dir_all` on
+/// the fixture root (`Os { code: 16, kind: ResourceBusy }`) — only `wt0
+/// remove` unmounts it first.
 fn remove_ok(wt0: &str, repo: &Path, worktree: &Path) {
     let output = Command::new(wt0)
         .current_dir(repo)
-        .args(["remove"])
+        .args(["remove", "--force"])
         .arg(worktree)
         .output()
         .expect("remove worktree");
@@ -2559,6 +2564,7 @@ fn env_var_overrides_the_default_worktrees_container() {
     let worktree = PathBuf::from(receipt["worktree"].as_str().expect("worktree path"));
     assert_eq!(worktree, custom.join("env-override-branch"));
 
+    remove_ok(wt0, &repo, &worktree);
     fs::remove_dir_all(&root).expect("remove fixture");
 }
 
@@ -2584,6 +2590,7 @@ fn checked_in_config_overrides_the_default_worktrees_container() {
             .join("config-override-branch")
     );
 
+    remove_ok(wt0, &repo, &worktree);
     fs::remove_dir_all(&root).expect("remove fixture");
 }
 
@@ -2617,6 +2624,7 @@ fn explicit_path_wins_over_every_worktrees_container_override() {
     let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).expect("create JSON");
     assert_eq!(receipt["worktree"], explicit.to_string_lossy().as_ref());
 
+    remove_ok(wt0, &repo, &explicit);
     fs::remove_dir_all(&root).expect("remove fixture");
 }
 
@@ -2648,6 +2656,7 @@ fn create_warns_but_does_not_refuse_a_path_inside_git() {
         "the worktree is still created at the requested path"
     );
 
+    remove_ok(wt0, &repo, &nested);
     fs::remove_dir_all(&root).expect("remove fixture");
 }
 
@@ -2682,6 +2691,7 @@ fn fleet_and_doctor_notice_a_worktree_left_inside_git() {
         "doctor stderr: {doctor_stderr}"
     );
 
+    remove_ok(wt0, &repo, &nested);
     fs::remove_dir_all(&root).expect("remove fixture");
 }
 
