@@ -976,6 +976,7 @@ pub(crate) fn allocate_slot(repo: &RepoContext) -> Result<u64> {
 /// retrying; a `git worktree add`/`remove` raced by an unlocked read of the
 /// registry mid-write is not. A waiter that cannot acquire the lock within
 /// its bound gets a clear error instead of ever proceeding unlocked.
+#[derive(Debug)]
 pub(crate) struct StateLock {
     path: PathBuf,
     held: bool,
