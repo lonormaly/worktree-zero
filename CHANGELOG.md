@@ -3,6 +3,43 @@
 All notable changes to Worktree Zero. Versions follow semantic versioning;
 pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
+## Unreleased
+
+### Added
+
+- **The cost table shows the saving as a fold and a percentage.** A fourth
+  column — `5.2× · −81%` for `≈ 139 MiB → ≈ 27 MiB` — sits beside the "with
+  wt0" figure on the one-worktree, ten-agent, and shared-store rows,
+  computed from the same unrounded bytes the byte figures come from (never
+  the already-rounded MiB/GiB strings). Folds round to one decimal below
+  10× and a whole number at or above it; percentages are always whole.
+  `--json`'s `estimate` gains four additive keys — `one_fold`, `ten_fold`,
+  `one_saving_pct`, `ten_saving_pct` — computed the same way, so the printed
+  table and the JSON can never disagree.
+- **Not everyone uses Tilt: `wt0 doctor` detects docker-compose,
+  devcontainers, Procfile-style process managers, Skaffold/Garden/DevSpace,
+  and plain dev scripts too.** A new "🎛️ Dev environment" block replaces
+  the Tilt-only line with one entry per tool this repository actually boots
+  a dev stack with — docker-compose (`compose.yaml`/`docker-compose.yml`,
+  literal `ports:` host mappings and `container_name:`), a devcontainer
+  (`.devcontainer/devcontainer.json`'s `forwardPorts`), a Procfile-style
+  process manager (Procfile, `mprocs.yaml`, or a `concurrently` script),
+  Skaffold/Garden/DevSpace, and a plain `package.json` dev script (`next dev
+  -p 3000`, `vite --port 3000`, `wrangler dev --port 3000`) — each with its
+  own literal ports/hostnames and the concrete fix for that tool. `wt0 init
+  compose` proposes a `compose.wt0.yaml` override mapping each literal host
+  port to a `WT0_<SERVICE>_PORT` variable (computed from `WT0_PORT_BASE` in
+  a post-create hook, since compose interpolates `${VAR:-default}` but
+  can't do arithmetic itself); `wt0 init dev` proposes a generic
+  `.wt0/hooks/post-create` exporting `PORT=$WT0_PORT_BASE` and a `.env.wt0`
+  for everything else. `doctor`'s numbered step list names the matching
+  `init` target for whichever tool is detected and not yet deriving from
+  `WT0_PORT_BASE`/`WT0_SLUG`. `--json` gains an additive `dev_environment`
+  array (`{tool, files, literal_ports, literal_hosts, derives_from_wt0,
+  fix}`); the existing `tilt` field is unchanged. See `docs/faq.md`, "I
+  don't use Tilt — does wt0 still help?" and `docs/lifecycle.md`, "Not
+  everyone uses Tilt".
+
 ## 0.1.18 — 2026-09-03
 
 ### Added
@@ -52,39 +89,6 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   numbered step list, each naming the exact `wt0 init` target or config
   change that closes it. `--json` gains four additive keys —
   `estimate`, `tooling`, `tilt`, `steps` — every existing key is unchanged.
-- **The cost table shows the saving as a fold and a percentage.** A fourth
-  column — `5.2× · −81%` for `≈ 139 MiB → ≈ 27 MiB` — sits beside the "with
-  wt0" figure on the one-worktree, ten-agent, and shared-store rows,
-  computed from the same unrounded bytes the byte figures come from (never
-  the already-rounded MiB/GiB strings). Folds round to one decimal below
-  10× and a whole number at or above it; percentages are always whole.
-  `--json`'s `estimate` gains four additive keys — `one_fold`, `ten_fold`,
-  `one_saving_pct`, `ten_saving_pct` — computed the same way, so the printed
-  table and the JSON can never disagree.
-- **Not everyone uses Tilt: `wt0 doctor` detects docker-compose,
-  devcontainers, Procfile-style process managers, Skaffold/Garden/DevSpace,
-  and plain dev scripts too.** A new "🎛️ Dev environment" block replaces
-  the Tilt-only line with one entry per tool this repository actually boots
-  a dev stack with — docker-compose (`compose.yaml`/`docker-compose.yml`,
-  literal `ports:` host mappings and `container_name:`), a devcontainer
-  (`.devcontainer/devcontainer.json`'s `forwardPorts`), a Procfile-style
-  process manager (Procfile, `mprocs.yaml`, or a `concurrently` script),
-  Skaffold/Garden/DevSpace, and a plain `package.json` dev script (`next dev
-  -p 3000`, `vite --port 3000`, `wrangler dev --port 3000`) — each with its
-  own literal ports/hostnames and the concrete fix for that tool. `wt0 init
-  compose` proposes a `compose.wt0.yaml` override mapping each literal host
-  port to a `WT0_<SERVICE>_PORT` variable (computed from `WT0_PORT_BASE` in
-  a post-create hook, since compose interpolates `${VAR:-default}` but
-  can't do arithmetic itself); `wt0 init dev` proposes a generic
-  `.wt0/hooks/post-create` exporting `PORT=$WT0_PORT_BASE` and a `.env.wt0`
-  for everything else. `doctor`'s numbered step list names the matching
-  `init` target for whichever tool is detected and not yet deriving from
-  `WT0_PORT_BASE`/`WT0_SLUG`. `--json` gains an additive `dev_environment`
-  array (`{tool, files, literal_ports, literal_hosts, derives_from_wt0,
-  fix}`); the existing `tilt` field is unchanged. See `docs/faq.md`, "I
-  don't use Tilt — does wt0 still help?" and `docs/lifecycle.md`, "Not
-  everyone uses Tilt".
-
 ### Changed
 
 - **`wt0`'s own `--help` leads with `wt0 doctor`, grouped by what an agent
