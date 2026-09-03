@@ -249,12 +249,15 @@ and portable skill are the same implementation:
   or double-creating. A different key is refused, never handed someone
   else's runtime.
 - **The fleet map**: `wt0 fleet --json` returns every runtime with branch,
-  owner, slot, port window, idle time, merged/dirty/live status, mode, and
-  owned storage — the one call an orchestrator needs to reason about the
-  swarm, filterable (`--idle`, `--merged`, `--owner`, `--prefix`,
-  `--unmanaged`, …) and sortable (`--sort idle|branch|size`). `wt0 events
-  --follow` streams the append-only lifecycle log (created, reused, removed,
-  reaped, adopted).
+  owner, slot, port window, idle time, mode, and owned storage — cheap by
+  default (no `git`, no `lsof`, no tree walk), filterable (`--idle`,
+  `--owner`, `--prefix`, `--unmanaged`, …) and sortable (`--sort
+  idle|branch|size`). Merged/dirty/live status and size are opt-in
+  (`--merged`/`--dirty`/`--live`/`--size`, or `--facts` for all four) since
+  each spawns a process or walks a tree — the one call an orchestrator
+  needs to reason about the swarm without paying for facts it won't use.
+  `wt0 events --follow` streams the append-only lifecycle log (created,
+  reused, removed, reaped, adopted).
 - **Concurrency is tested, not assumed**: CI drives 24 simultaneous
   creates and removes against one repository on Linux, macOS, and Windows —
   and runs the same suite on ReFS and loopback Btrfs volumes so the CoW

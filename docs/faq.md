@@ -182,10 +182,12 @@ of.
 
 ## How do I clean up old worktrees?
 
-`wt0 fleet --idle 7d` lists every worktree idle at least that long, with
-whether its branch is merged, whether it's dirty, and whether a process is
-still live in it — so you can see what's actually safe to drop before you
-remove anything. `wt0 gc --idle 7d` (or any duration; `--older-than` still
+`wt0 fleet --idle 7d --facts` lists every worktree idle at least that long,
+with whether its branch is merged, whether it's dirty, and whether a
+process is still live in it — so you can see what's actually safe to drop
+before you remove anything (`--facts` opts into those; a plain `wt0 fleet`
+skips them since each spawns `git` or `lsof`). `wt0 gc --idle 7d` (or any
+duration; `--older-than` still
 works as the older name) is a dry run that shows what it would remove; add
 `--apply` to actually remove it — it already refuses anything dirty,
 unmerged, live, or in an unrecognized ignored state, so there's no way to
