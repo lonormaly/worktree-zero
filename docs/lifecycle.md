@@ -31,8 +31,8 @@ lines from a real run, right after `wt0 create agent/add-tests` and
 `wt0 create agent/fix-checkout`:
 
 ```text
-/Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-add-tests-99c97ab6     87194d1 [agent/add-tests]
-/Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-fix-checkout-9b8dc285  87194d1 [agent/fix-checkout]
+/Users/shaisnir/Development/worktree-zero-worktrees/agent-add-tests-99c97ab6     87194d1 [agent/add-tests]
+/Users/shaisnir/Development/worktree-zero-worktrees/agent-fix-checkout-9b8dc285  87194d1 [agent/fix-checkout]
 ```
 
 `wt0 fleet` is the control view: every Worktree Zero runtime — and every
@@ -47,8 +47,8 @@ progress:
 Worktree Zero fleet: 3 worktree(s)
   BRANCH              OWNER  SLOT  PORTS   IDLE  MERGED  DIRTY  LIVE  MODE       PATH
   master (main)       -      -     -       0s    yes     no     yes   unmanaged  /Users/shaisnir/Development/worktree-zero
-  agent/add-tests     -      0     22800+  2s    yes     no     no    cow-clone  /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-add-tests-99c97ab6
-  agent/fix-checkout  -      1     22900+  2s    no      no     no    cow-clone  /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-fix-checkout-9b8dc285
+  agent/add-tests     -      0     22800+  2s    yes     no     no    cow-clone  /Users/shaisnir/Development/worktree-zero-worktrees/agent-add-tests-99c97ab6
+  agent/fix-checkout  -      1     22900+  2s    no      no     no    cow-clone  /Users/shaisnir/Development/worktree-zero-worktrees/agent-fix-checkout-9b8dc285
 ```
 
 The table stays aligned and at most 120 columns; a long PATH is truncated
@@ -70,8 +70,16 @@ worktree's generated-state plus logical `node_modules` size, which is not
 free — it walks the tree — so it's opt-in.
 
 Both worktrees above were created without `--path`: by default a worktree
-lives under `<repo>/.git/wt0/worktrees/<slug>/`, inside the repository's own
-`.git` directory, so nothing is added beside your checkout.
+lives under `<parent>/<repo-name>-worktrees/<slug>/`, a sibling directory
+next to the repository — same volume, so copy-on-write still applies, but
+outside the repository's own tree, so a bundler or watcher's stock "ignore
+.git" rule can't hide it (the old default, `<repo>/.git/wt0/worktrees/`, hit
+exactly that: Vite's `server.fs.deny` 403ed every module under `.git`,
+breaking Storybook previews — see docs/design-partners/flam-migration.md).
+Override with `--path`, `WT0_WORKTREES_DIR`, or a `worktrees_dir` line in a
+checked-in `.wt0/config`. Existing worktrees left over at the old default
+keep working: `list`/`fleet`/`remove`/`gc` all find a worktree through
+Git's own registry, never by assuming its path.
 
 ### Orphans: a checkout that vanished outside wt0
 
@@ -255,9 +263,9 @@ list, each group with its paths, only shown when non-empty:
 
 ```text
 would reap (1)
-  /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-add-tests-99c97ab6
+  /Users/shaisnir/Development/worktree-zero-worktrees/agent-add-tests-99c97ab6
 kept: unmerged (1)
-  /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-fix-checkout-9b8dc285
+  /Users/shaisnir/Development/worktree-zero-worktrees/agent-fix-checkout-9b8dc285
 run again with --apply to remove; wt0 fleet --idle 7d to see the rest
 ```
 

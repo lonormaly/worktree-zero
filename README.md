@@ -503,10 +503,12 @@ and more) — lives in [`docs/faq.md`](docs/faq.md), the same text
   refuses the bare name `wt0` as too similar to existing short packages —
   but the installed command is still `wt0`. Use `npx worktree-zero …` or
   `npm i -g worktree-zero`.
-- **Where does a worktree live?** Under `<repo>/.git/wt0/worktrees/<slug>/`
-  by default, so nothing is added beside your checkout; pass `--path` to put
-  it anywhere. Editors that skip dot-directories in their file tree need to
-  be pointed at it explicitly.
+- **Where does a worktree live?** Under
+  `<parent>/<repo-name>-worktrees/<slug>/` by default — a sibling directory
+  next to your checkout, same volume (copy-on-write still applies) but
+  outside the repository's own tree, so no bundler or watcher's stock
+  "ignore .git" rule hides it. Override with `--path`, `WT0_WORKTREES_DIR`,
+  or a `worktrees_dir` line in a checked-in `.wt0/config`.
 - **What does a worktree cost?** The checkout is a copy-on-write clone — a
   few MiB regardless of checkout size (see the table above and `wt0 doctor`
   for this repository's own numbers). Installed dependencies cost what your

@@ -27,6 +27,99 @@ fn branch_names_become_unique_safe_path_components() {
 }
 
 #[test]
+fn default_worktrees_container_is_a_sibling_named_after_the_repo() {
+    assert_eq!(
+        default_worktrees_container(Path::new("/Users/example/Development/my-repo")),
+        Path::new("/Users/example/Development/my-repo-worktrees")
+    );
+}
+
+#[test]
+fn default_worktrees_container_falls_back_when_the_repo_root_has_no_parent() {
+    assert_eq!(
+        default_worktrees_container(Path::new("/")),
+        Path::new("/repo-worktrees")
+    );
+}
+
+#[test]
+fn is_inside_git_dir_matches_by_path_component_not_string_prefix() {
+    let common = Path::new("/repo/.git");
+    assert!(is_inside_git_dir(
+        Path::new("/repo/.git/wt0/worktrees/x"),
+        common
+    ));
+    assert!(is_inside_git_dir(common, common));
+    assert!(!is_inside_git_dir(Path::new("/repo/worktrees/x"), common));
+    // ".gitx" shares a string prefix with ".git" but is a different directory.
+    assert!(!is_inside_git_dir(Path::new("/repo/.gitx/x"), common));
+}
+
+#[test]
+fn git_nested_notice_names_the_path_and_the_reason() {
+    let notice = git_nested_notice(Path::new("/repo/.git/wt0/worktrees/agent"));
+    assert!(notice.starts_with("/repo/.git/wt0/worktrees/agent inside .git"));
+    assert!(notice.contains("Vite, Storybook, watchers"));
+    assert!(notice.contains("--path outside .git"));
+}
+
+#[test]
+fn configured_worktrees_dir_reads_the_first_matching_line_and_skips_comments() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("wt0-config-test-{}", Uuid::new_v4()));
+    fs::create_dir_all(dir.join(".wt0"))?;
+    fs::write(
+        dir.join(".wt0/config"),
+        "# a comment\n\nworktrees_dir = \"../sandboxes\"\nworktrees_dir = \"unused-second-line\"\n",
+    )?;
+    assert_eq!(
+        configured_worktrees_dir(&dir),
+        Some(PathBuf::from("../sandboxes"))
+    );
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[test]
+fn configured_worktrees_dir_is_none_without_the_file_or_key() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("wt0-config-test-{}", Uuid::new_v4()));
+    // No `.wt0/config` at all.
+    assert_eq!(configured_worktrees_dir(&dir), None);
+    fs::create_dir_all(dir.join(".wt0"))?;
+    fs::write(dir.join(".wt0/config"), "other_key = \"x\"\n")?;
+    assert_eq!(configured_worktrees_dir(&dir), None);
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[test]
+fn cleanup_worktrees_container_removes_only_once_empty_and_never_the_wrong_dir() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let container = worktrees_container(&repo);
+    fs::create_dir_all(&container)?;
+    let a = container.join("a");
+    let b = container.join("b");
+    fs::create_dir_all(&a)?;
+    fs::create_dir_all(&b)?;
+
+    fs::remove_dir_all(&a)?;
+    cleanup_worktrees_container(&repo, &a);
+    assert!(container.is_dir(), "container still holds `b`, must survive");
+
+    // A removed path whose parent isn't the container at all must never
+    // trigger cleanup, however empty the real container happens to be.
+    let elsewhere = fixture.root.join("unrelated");
+    fs::create_dir_all(&elsewhere)?;
+    cleanup_worktrees_container(&repo, &elsewhere);
+    assert!(container.is_dir(), "cleanup must ignore an unrelated parent");
+
+    fs::remove_dir_all(&b)?;
+    cleanup_worktrees_container(&repo, &b);
+    assert!(!container.exists(), "an empty container is removed");
+    Ok(())
+}
+
+#[test]
 fn parse_duration_accepts_units_and_rejects_overflow() {
     assert_eq!(parse_duration("90s").unwrap(), Duration::from_secs(90));
     assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));

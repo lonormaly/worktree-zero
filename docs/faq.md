@@ -25,9 +25,14 @@ is still `wt0`. Use `npx worktree-zero …` or `npm i -g worktree-zero`.
 
 ## Where does a worktree live?
 
-Under `<repo>/.git/wt0/worktrees/<name>/` by default, so nothing is added
-beside your checkout; pass `--path` to put it anywhere. Editors that skip
-dot-directories in their file tree need to be pointed at it explicitly.
+Under `<parent>/<repo-name>-worktrees/<name>/` by default — a sibling
+directory next to your checkout, on the same volume (so copy-on-write still
+applies) but outside the repository's own tree. Earlier versions defaulted
+to `<repo>/.git/wt0/worktrees/<name>/`; that nested a worktree's files under
+`.git`, and a bundler or watcher with a stock "ignore .git" rule (Vite's
+`server.fs.deny`, for one) would silently hide everything under it. Override
+the default with `--path`, the `WT0_WORKTREES_DIR` environment variable, or
+a `worktrees_dir` line in a checked-in `.wt0/config`.
 
 ## What does a worktree cost, and why is the first one bigger?
 

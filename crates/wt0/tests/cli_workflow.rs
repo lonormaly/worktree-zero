@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 // Only used by the crash-recovery helpers below, which are unix-only (they
@@ -2429,6 +2429,256 @@ fn create_derives_the_baseline_from_the_base_checkout() {
         String::from_utf8_lossy(&removed.stderr)
     );
     fs::remove_dir_all(root).expect("remove fixture");
+}
+
+/// A fresh, canonicalized fixture root (D19): every path built from it
+/// matches what git itself reports, sidestepping the macOS `/var` →
+/// `/private/var` symlink that would otherwise make a plain string-prefix
+/// path comparison fail intermittently.
+fn temp_root(label: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-{label}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create fixture root");
+    dunce::canonicalize(&root).expect("canonicalize fixture root")
+}
+
+/// An initialized, single-commit repository under `root/repo` (D19 fixtures).
+fn init_repo(root: &Path) -> PathBuf {
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    repo
+}
+
+/// Runs `wt0 --json create <branch> [--path <path>]` and returns the parsed
+/// receipt, asserting success first so a failure shows git/wt0's stderr
+/// instead of a JSON-parse panic.
+fn create_json(wt0: &str, repo: &Path, branch: &str, path: Option<&Path>) -> serde_json::Value {
+    let mut command = Command::new(wt0);
+    command.current_dir(repo).args(["--json", "create", branch]);
+    if let Some(path) = path {
+        command.arg("--path").arg(path);
+    }
+    let output = command.output().expect("create worktree");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("create JSON")
+}
+
+fn remove_ok(wt0: &str, repo: &Path, worktree: &Path) {
+    let output = Command::new(wt0)
+        .current_dir(repo)
+        .args(["remove"])
+        .arg(worktree)
+        .output()
+        .expect("remove worktree");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The default worktrees container for a fixture repo: a sibling directory
+/// named `<repo-name>-worktrees` next to it (D19).
+fn default_container(repo: &Path) -> PathBuf {
+    let name = repo.file_name().expect("repo has a name").to_str().expect("utf-8 name");
+    repo.parent()
+        .expect("repo has a parent")
+        .join(format!("{name}-worktrees"))
+}
+
+#[test]
+fn default_path_container_is_created_on_demand_and_removed_only_once_empty() {
+    let root = temp_root("default-container");
+    let repo = init_repo(&root);
+    let container = default_container(&repo);
+    assert!(
+        !container.exists(),
+        "the container must not exist before the first create"
+    );
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let first = create_json(wt0, &repo, "default-path-one", None);
+    let second = create_json(wt0, &repo, "default-path-two", None);
+    let first_worktree = PathBuf::from(first["worktree"].as_str().expect("worktree path"));
+    let second_worktree = PathBuf::from(second["worktree"].as_str().expect("worktree path"));
+    assert_eq!(first_worktree, container.join("default-path-one"));
+    assert_eq!(second_worktree, container.join("default-path-two"));
+    assert!(container.is_dir(), "the container is created on demand");
+
+    remove_ok(wt0, &repo, &first_worktree);
+    assert!(
+        container.is_dir(),
+        "the container must survive while it still holds the second worktree"
+    );
+
+    remove_ok(wt0, &repo, &second_worktree);
+    assert!(!container.exists(), "an empty container is removed");
+
+    fs::remove_dir_all(&root).expect("remove fixture");
+}
+
+#[test]
+fn env_var_overrides_the_default_worktrees_container() {
+    let root = temp_root("env-override");
+    let repo = init_repo(&root);
+    let custom = root.join("custom-container");
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let mut command = Command::new(wt0);
+    command
+        .current_dir(&repo)
+        .env("WT0_WORKTREES_DIR", &custom)
+        .args(["--json", "create", "env-override-branch"]);
+    let output = command.output().expect("create with WT0_WORKTREES_DIR");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).expect("create JSON");
+    let worktree = PathBuf::from(receipt["worktree"].as_str().expect("worktree path"));
+    assert_eq!(worktree, custom.join("env-override-branch"));
+
+    fs::remove_dir_all(&root).expect("remove fixture");
+}
+
+#[test]
+fn checked_in_config_overrides_the_default_worktrees_container() {
+    let root = temp_root("config-override");
+    let repo = init_repo(&root);
+    fs::create_dir_all(repo.join(".wt0")).expect("create .wt0 dir");
+    fs::write(
+        repo.join(".wt0/config"),
+        "# checked-in default for this repository's worktrees\nworktrees_dir = \"configured-container\"\n",
+    )
+    .expect("write .wt0/config");
+    git(&repo, &["add", ".wt0/config"]);
+    git(&repo, &["commit", "-q", "-m", "configure worktrees_dir"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let receipt = create_json(wt0, &repo, "config-override-branch", None);
+    let worktree = PathBuf::from(receipt["worktree"].as_str().expect("worktree path"));
+    assert_eq!(
+        worktree,
+        root.join("configured-container")
+            .join("config-override-branch")
+    );
+
+    fs::remove_dir_all(&root).expect("remove fixture");
+}
+
+#[test]
+fn explicit_path_wins_over_every_worktrees_container_override() {
+    let root = temp_root("path-wins");
+    let repo = init_repo(&root);
+    fs::create_dir_all(repo.join(".wt0")).expect("create .wt0 dir");
+    fs::write(
+        repo.join(".wt0/config"),
+        "worktrees_dir = \"configured-container\"\n",
+    )
+    .expect("write .wt0/config");
+    git(&repo, &["add", ".wt0/config"]);
+    git(&repo, &["commit", "-q", "-m", "configure worktrees_dir"]);
+    let explicit = root.join("explicit-path");
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let output = Command::new(wt0)
+        .current_dir(&repo)
+        .env("WT0_WORKTREES_DIR", root.join("env-container"))
+        .args(["--json", "create", "path-wins-branch", "--path"])
+        .arg(&explicit)
+        .output()
+        .expect("create with --path");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).expect("create JSON");
+    assert_eq!(receipt["worktree"], explicit.to_string_lossy().as_ref());
+
+    fs::remove_dir_all(&root).expect("remove fixture");
+}
+
+#[test]
+fn create_warns_but_does_not_refuse_a_path_inside_git() {
+    let root = temp_root("git-nested-create");
+    let repo = init_repo(&root);
+    let nested = repo.join(".git/wt0/worktrees/legacy");
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let output = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["create", "git-nested-branch", "--path"])
+        .arg(&nested)
+        .output()
+        .expect("create inside .git");
+    assert!(
+        output.status.success(),
+        "a worktree inside .git must warn, not refuse — stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("inside .git") && stderr.contains("--path outside .git"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        nested.is_dir(),
+        "the worktree is still created at the requested path"
+    );
+
+    fs::remove_dir_all(&root).expect("remove fixture");
+}
+
+#[test]
+fn fleet_and_doctor_notice_a_worktree_left_inside_git() {
+    let root = temp_root("git-nested-notice");
+    let repo = init_repo(&root);
+    let nested = repo.join(".git/wt0/worktrees/legacy");
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    create_json(wt0, &repo, "git-nested-notice-branch", Some(&nested));
+
+    let fleet = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["fleet"])
+        .output()
+        .expect("fleet");
+    let fleet_stderr = String::from_utf8_lossy(&fleet.stderr);
+    assert!(
+        fleet_stderr.contains("inside .git"),
+        "fleet stderr: {fleet_stderr}"
+    );
+
+    let doctor = Command::new(wt0)
+        .current_dir(&nested)
+        .args(["doctor"])
+        .output()
+        .expect("doctor");
+    let doctor_stderr = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        doctor_stderr.contains("inside .git"),
+        "doctor stderr: {doctor_stderr}"
+    );
+
+    fs::remove_dir_all(&root).expect("remove fixture");
 }
 
 /// `git` output on every platform; missing keys yield an empty string.

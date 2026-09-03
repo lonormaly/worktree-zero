@@ -40,6 +40,33 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   don't use Tilt — does wt0 still help?" and `docs/lifecycle.md`, "Not
   everyone uses Tilt".
 
+### Changed
+
+- **A new worktree's default location moved out of `.git`, and out of the
+  repository's tree entirely.** `create`/`run` with no `--path` now use
+  `<parent>/<repo-name>-worktrees/<slug>` — a sibling directory next to the
+  checkout, same volume (copy-on-write still applies) but outside the
+  repository's own tree — instead of `<repo>/.git/wt0/worktrees/<slug>`.
+  FLAM found the old default broke Storybook previews inside a wt0
+  worktree: Vite's default `server.fs.deny` includes `**/.git/**`, so it
+  403ed every module under `.git` (see
+  `docs/design-partners/flam-migration.md`); any tool with a stock "ignore
+  .git" rule — other bundlers, watchers, scanners — mishandled it the same
+  way, and a worktree nested inside the checkout's own tree also showed up
+  in that checkout's `git status` and got swept by its `tsconfig`/Nx/Jest
+  globs. Override the new default with `--path` (unchanged), the
+  `WT0_WORKTREES_DIR` environment variable (absolute, or relative to the
+  repository's parent), or a `worktrees_dir` line in a checked-in
+  `.wt0/config`. `.git/wt0` is unaffected — it remains wt0's own state
+  (baselines, environments, registry) regardless of where checkouts land.
+  A worktree left over at the old default keeps working exactly as before
+  (`list`/`fleet`/`remove`/`gc` all find it through Git's own registry, not
+  by path); `fleet` and `doctor` now call one out with a one-line notice,
+  and `create --path` warns (without refusing) when an explicit path still
+  lands inside `.git`. Verified on this machine: a real `wt0 create` into
+  the new default reports `mode: cow-clone`. See `docs/faq.md`, "Where does
+  a worktree live?" and `docs/lifecycle.md`, "Inspecting the fleet".
+
 ## 0.1.18 — 2026-09-03
 
 ### Added
