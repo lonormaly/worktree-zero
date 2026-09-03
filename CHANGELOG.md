@@ -39,6 +39,41 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   fix}`); the existing `tilt` field is unchanged. See `docs/faq.md`, "I
   don't use Tilt — does wt0 still help?" and `docs/lifecycle.md`, "Not
   everyone uses Tilt".
+- **macOS release binaries are signed with a Developer ID and notarized.**
+  A freshly downloaded (or freshly copied) ad-hoc-signed `wt0` binary was
+  measured hanging at `_dyld_start` for minutes on first launch under
+  Gatekeeper — an already-launched copy of the exact same bytes ran
+  instantly. `.github/workflows/release.yml`'s two `*-apple-darwin` build
+  jobs now codesign with a Developer ID certificate (`--timestamp --options
+  runtime`) and notarize with `xcrun notarytool submit --wait`
+  (`scripts/sign-and-notarize-macos.sh`) before packaging, so the
+  `.tar.gz.sha256` covers the signed bytes; verification uses `codesign
+  --verify --deep --strict` and `spctl -a -t exec`, since `xcrun stapler`
+  doesn't apply to a bare binary. The step is a no-op — release still
+  ships, with a clear job-summary notice — when the six `APPLE_*` secrets
+  aren't set, so a fork (or this repository before they're added) keeps
+  releasing. See `docs/release.md` for the required secrets and the
+  release pipeline end to end.
+- **`lsof` sweeps are bounded, not indefinite.** wt0's own liveness checks
+  (`process.rs`: `live_open_path`, `foreign_working_directory`,
+  `live_working_directories_by_pid`) can call a full-system `lsof`, which
+  was measured taking minutes on a loaded machine and made `wt0 remove`/
+  `gc`/`migrate` look hung. Every `lsof` call is now killed and refused
+  after `WT0_LSOF_TIMEOUT` seconds (default 20, `-w -S 2` set on the call
+  itself) with a distinct error — "could not prove no live process within
+  Ns (lsof); retry, raise WT0_LSOF_TIMEOUT, or pass --force" — that every
+  caller already propagates as a refusal, never as "no process found".
+- **`wt0 doctor` flags Next.js + Turbopack on Bun's global store.** Building
+  with Turbopack (the `next build` default since Next 15) can fail against
+  Bun's global virtual store — "Symlink … points out of the filesystem
+  root" (vercel/next.js#94432), reproduced on this project's own CI — and
+  Bun's global store is the only shared-store shape wt0 ever recommends
+  for Bun. `doctor` now surfaces a `known_issues` entry (JSON, additive)
+  and a one-line note in the plain report whenever a repository uses both,
+  naming both workarounds: `next build --webpack` (verified) or
+  `turbopack.root` pointed at a directory containing the store (did not
+  fix it in testing). See `docs/faq.md`, "What does \"shared package
+  store\" mean…".
 
 ### Changed
 

@@ -63,6 +63,16 @@ into it — usually a fraction of a plain install's size, and it's what makes
 `wt0 doctor`'s "with wt0" column so small. wt0 detects which mode your
 project is in and prints the one config line that turns a store on.
 
+**Known issue:** Next.js building with Turbopack (the `next build` default
+since Next 15) can fail against Bun's global virtual store — "Symlink …
+points out of the filesystem root"
+([vercel/next.js#94432](https://github.com/vercel/next.js/issues/94432)),
+reproduced on this project's own CI. `wt0 doctor` flags this whenever a
+repository uses Next.js and Bun together. Two workarounds: run
+`next build --webpack` (verified fix), or set `turbopack.root` to a
+directory that contains the store — in testing that did not fix it, so
+prefer `--webpack` until the upstream issue is resolved.
+
 ## What is a build cache, and what does `wt0 init seed` do?
 
 A build cache is the folder your build tool leaves behind so it doesn't

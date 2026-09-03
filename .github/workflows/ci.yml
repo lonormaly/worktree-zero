@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Shellcheck integration and benchmark scripts
-        run: shellcheck tests/*.sh integrations/tilt/examples/*.sh npm/*.sh
+        run: shellcheck tests/*.sh integrations/tilt/examples/*.sh npm/*.sh scripts/*.sh
       - name: Plugin manifest versions match the workspace version
         run: |
           version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
