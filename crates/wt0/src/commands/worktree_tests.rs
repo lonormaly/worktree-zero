@@ -1282,44 +1282,86 @@ fn needed_facts_track_individual_filters_and_the_facts_flag() {
         merged: true,
         ..Default::default()
     });
-    assert_eq!(merged, NeededFacts { merged: true, ..Default::default() });
+    assert_eq!(
+        merged,
+        NeededFacts {
+            merged: true,
+            ..Default::default()
+        }
+    );
     assert_eq!(merged.names(), vec!["merged"]);
 
     let unmerged = NeededFacts::for_args(&WorktreeFleet {
         unmerged: true,
         ..Default::default()
     });
-    assert_eq!(unmerged, NeededFacts { merged: true, ..Default::default() });
+    assert_eq!(
+        unmerged,
+        NeededFacts {
+            merged: true,
+            ..Default::default()
+        }
+    );
 
     let dirty = NeededFacts::for_args(&WorktreeFleet {
         dirty: true,
         ..Default::default()
     });
-    assert_eq!(dirty, NeededFacts { dirty: true, ..Default::default() });
+    assert_eq!(
+        dirty,
+        NeededFacts {
+            dirty: true,
+            ..Default::default()
+        }
+    );
 
     let clean = NeededFacts::for_args(&WorktreeFleet {
         clean: true,
         ..Default::default()
     });
-    assert_eq!(clean, NeededFacts { dirty: true, ..Default::default() });
+    assert_eq!(
+        clean,
+        NeededFacts {
+            dirty: true,
+            ..Default::default()
+        }
+    );
 
     let live = NeededFacts::for_args(&WorktreeFleet {
         live: true,
         ..Default::default()
     });
-    assert_eq!(live, NeededFacts { live: true, ..Default::default() });
+    assert_eq!(
+        live,
+        NeededFacts {
+            live: true,
+            ..Default::default()
+        }
+    );
 
     let size = NeededFacts::for_args(&WorktreeFleet {
         size: true,
         ..Default::default()
     });
-    assert_eq!(size, NeededFacts { size: true, ..Default::default() });
+    assert_eq!(
+        size,
+        NeededFacts {
+            size: true,
+            ..Default::default()
+        }
+    );
 
     let sort_size = NeededFacts::for_args(&WorktreeFleet {
         sort: Some(FleetSort::Size),
         ..Default::default()
     });
-    assert_eq!(sort_size, NeededFacts { size: true, ..Default::default() });
+    assert_eq!(
+        sort_size,
+        NeededFacts {
+            size: true,
+            ..Default::default()
+        }
+    );
 
     // Cheap filters (`--idle`, `--owner`, `--prefix`, `--managed`,
     // `--unmanaged`) narrow the candidate set but never trigger a fact.
@@ -1412,7 +1454,11 @@ fn fleet_merged_filter_computes_only_the_merged_fact_for_survivors() -> Result<(
     )?;
     assert_eq!(outcome.needed.names(), vec!["merged"]);
     assert_eq!(
-        outcome.rows.iter().map(|row| row.path.clone()).collect::<Vec<_>>(),
+        outcome
+            .rows
+            .iter()
+            .map(|row| row.path.clone())
+            .collect::<Vec<_>>(),
         vec![merged]
     );
     let row = &outcome.rows[0];
@@ -1444,7 +1490,10 @@ fn fleet_facts_flag_computes_every_fact() -> Result<()> {
             ..Default::default()
         },
     )?;
-    assert_eq!(outcome.needed.names(), vec!["merged", "dirty", "live", "size"]);
+    assert_eq!(
+        outcome.needed.names(),
+        vec!["merged", "dirty", "live", "size"]
+    );
     assert_eq!(outcome.rows.len(), 1);
     let row = &outcome.rows[0];
     assert!(row.merged.is_some());
@@ -1480,10 +1529,7 @@ fn gc_merged_selector_skips_unmanaged_before_computing_dirty() -> Result<()> {
         },
     )?;
     assert!(outcome.reaped.is_empty());
-    assert_eq!(
-        outcome.skipped,
-        vec![(plain, "unowned".to_owned())]
-    );
+    assert_eq!(outcome.skipped, vec![(plain, "unowned".to_owned())]);
     Ok(())
 }
 
@@ -1504,10 +1550,13 @@ fn list_json_entries_report_ownership_fields() -> Result<()> {
     add_git_worktree(&repo, "plain/unmanaged", &plain, &base)?;
 
     let entries = list_json_entries(&repo)?;
+    // `git worktree list --porcelain` reports forward-slash paths even on
+    // Windows; compare as `Path`s (component-wise, separator-insensitive)
+    // rather than raw strings so this doesn't depend on that convention.
     let find = |path: &Path| -> serde_json::Value {
         entries
             .iter()
-            .find(|entry| entry["worktree"].as_str() == Some(path.to_string_lossy().as_ref()))
+            .find(|entry| entry["worktree"].as_str().map(Path::new) == Some(path))
             .unwrap_or_else(|| panic!("no entry for {}", path.display()))
             .clone()
     };

@@ -1629,7 +1629,11 @@ fn list_json_entries(repo: &RepoContext) -> Result<Vec<serde_json::Value>> {
     let mut entries = Vec::new();
     let mut current = serde_json::Map::new();
     let mut push_entry = |mut record: serde_json::Map<String, serde_json::Value>| {
-        if let Some(path) = record.get("worktree").and_then(|v| v.as_str()).map(PathBuf::from) {
+        if let Some(path) = record
+            .get("worktree")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+        {
             let managed = is_managed(&path);
             let lease = managed.then(|| stored_lease(&path).ok()).flatten();
             record.insert("managed".to_owned(), json!(managed));
@@ -1923,10 +1927,9 @@ fn compute_fleet_rows(repo: &RepoContext, args: &WorktreeFleet) -> Result<FleetO
             if needed.dirty {
                 match worktree_dirty(&row.path, Some(FACT_GIT_TIMEOUT)) {
                     Ok(value) => row.dirty = Some(value),
-                    Err(error) => warnings.push(format!(
-                        "dirty: {} — {error:#}",
-                        row.path.display()
-                    )),
+                    Err(error) => {
+                        warnings.push(format!("dirty: {} — {error:#}", row.path.display()))
+                    }
                 }
             }
             if needed.merged {
@@ -2723,9 +2726,13 @@ fn origin_default_ref(repo: &RepoContext, timeout: Option<Duration>) -> Option<S
     }
     for candidate in ["origin/main", "origin/master"] {
         let candidate_ref = format!("refs/remotes/{candidate}");
-        if git_output_common_timed(repo, ["rev-parse", "--verify", "--quiet", &candidate_ref], timeout)
-            .ok()
-            .is_some_and(|output| output.status.success())
+        if git_output_common_timed(
+            repo,
+            ["rev-parse", "--verify", "--quiet", &candidate_ref],
+            timeout,
+        )
+        .ok()
+        .is_some_and(|output| output.status.success())
         {
             return Some(candidate.to_owned());
         }
@@ -2746,9 +2753,13 @@ fn default_branch_ref(repo: &RepoContext, timeout: Option<Duration>) -> Option<S
     }
     for candidate in ["main", "master"] {
         let candidate_ref = format!("refs/heads/{candidate}");
-        if git_output_common_timed(repo, ["rev-parse", "--verify", "--quiet", &candidate_ref], timeout)
-            .ok()
-            .is_some_and(|output| output.status.success())
+        if git_output_common_timed(
+            repo,
+            ["rev-parse", "--verify", "--quiet", &candidate_ref],
+            timeout,
+        )
+        .ok()
+        .is_some_and(|output| output.status.success())
         {
             return Some(candidate_ref);
         }
@@ -2765,9 +2776,12 @@ fn default_branch_ref(repo: &RepoContext, timeout: Option<Duration>) -> Option<S
 fn is_branch_merged(repo: &RepoContext, branch: &str, timeout: Option<Duration>) -> Option<bool> {
     let tip = branch_tip(repo, branch, timeout)?;
     let default_ref = default_branch_ref(repo, timeout)?;
-    let output =
-        git_output_common_timed(repo, ["merge-base", "--is-ancestor", &tip, &default_ref], timeout)
-            .ok()?;
+    let output = git_output_common_timed(
+        repo,
+        ["merge-base", "--is-ancestor", &tip, &default_ref],
+        timeout,
+    )
+    .ok()?;
     Some(output.status.success())
 }
 

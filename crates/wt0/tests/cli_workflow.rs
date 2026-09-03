@@ -1256,9 +1256,12 @@ fn fleet_and_gc_select_by_merged_idle_and_include_unmanaged() {
     // --porcelain`, always forward-slash even on Windows) — comparing gc's
     // later text output against THIS instead of a locally built `PathBuf`
     // sidesteps any Windows short-name/separator mismatch between the two.
+    // `--facts` is required: `fleet` is cheap by default and otherwise
+    // leaves `merged` (and every other expensive fact) `null` for every
+    // row, without filtering any of them out.
     let fleet_all = Command::new(wt0)
         .current_dir(&repo)
-        .args(["--json", "fleet"])
+        .args(["--json", "fleet", "--facts"])
         .output()
         .expect("run fleet");
     assert!(
