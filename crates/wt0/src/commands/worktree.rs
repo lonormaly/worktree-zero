@@ -1756,10 +1756,10 @@ pub fn fleet(args: WorktreeFleet, global_json: bool) -> Result<()> {
     });
 
     match args.sort {
-        Some(FleetSort::Idle) => rows.sort_by(|a, b| b.idle.cmp(&a.idle)),
+        Some(FleetSort::Idle) => rows.sort_by_key(|row| std::cmp::Reverse(row.idle)),
         Some(FleetSort::Branch) => rows.sort_by(|a, b| a.branch.cmp(&b.branch)),
         Some(FleetSort::Size) => {
-            rows.sort_by(|a, b| b.size_bytes.unwrap_or(0).cmp(&a.size_bytes.unwrap_or(0)))
+            rows.sort_by_key(|row| std::cmp::Reverse(row.size_bytes.unwrap_or(0)))
         }
         None => {}
     }

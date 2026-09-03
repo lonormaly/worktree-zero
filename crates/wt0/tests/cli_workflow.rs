@@ -545,6 +545,15 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?}");
 }
 
+/// `git worktree list --porcelain` (what `wt0 gc`/`fleet`/`list` read their
+/// paths from) always reports forward-slash paths, even on Windows, while
+/// `Path::display()` on Windows renders the native backslash form — so a
+/// path from `git`-sourced CLI text output must be compared in this form,
+/// not `PathBuf::display()`'s.
+fn forward_slashes(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
 #[cfg(unix)]
 #[test]
 fn create_runs_the_post_create_hook_and_rolls_back_when_it_fails() {
@@ -1058,21 +1067,20 @@ fn fleet_and_gc_select_by_merged_idle_and_include_unmanaged() {
     );
     let gc_dry_run = String::from_utf8_lossy(&gc_dry_run.stdout);
     assert!(
-        gc_dry_run.contains("would reap (1)") && gc_dry_run.contains(&merged.display().to_string()),
+        gc_dry_run.contains("would reap (1)") && gc_dry_run.contains(&forward_slashes(&merged)),
         "{gc_dry_run}"
     );
     assert!(
-        gc_dry_run.contains("kept: dirty") && gc_dry_run.contains(&dirty.display().to_string()),
+        gc_dry_run.contains("kept: dirty") && gc_dry_run.contains(&forward_slashes(&dirty)),
         "{gc_dry_run}"
     );
     assert!(
-        gc_dry_run.contains("kept: unmerged")
-            && gc_dry_run.contains(&unmerged.display().to_string()),
+        gc_dry_run.contains("kept: unmerged") && gc_dry_run.contains(&forward_slashes(&unmerged)),
         "{gc_dry_run}"
     );
     assert!(
         gc_dry_run.contains("skipped: unmanaged")
-            && gc_dry_run.contains(&unmanaged.display().to_string()),
+            && gc_dry_run.contains(&forward_slashes(&unmanaged)),
         "{gc_dry_run}"
     );
 
@@ -1092,7 +1100,7 @@ fn fleet_and_gc_select_by_merged_idle_and_include_unmanaged() {
     let include_unmanaged = String::from_utf8_lossy(&include_unmanaged.stdout);
     assert!(
         include_unmanaged.contains("kept: dirty")
-            && include_unmanaged.contains(&unmanaged.display().to_string()),
+            && include_unmanaged.contains(&forward_slashes(&unmanaged)),
         "{include_unmanaged}"
     );
     assert!(
