@@ -23,6 +23,21 @@ The npm package is `worktree-zero` — the registry refuses the bare name
 `wt0` as too similar to existing short packages — but the installed command
 is still `wt0`. Use `npx worktree-zero …` or `npm i -g worktree-zero`.
 
+## `wt0` (or any freshly built/downloaded binary) hangs the first time it runs on macOS.
+
+That's Gatekeeper, not wt0: macOS's `syspolicyd` evaluates a binary the
+first time it launches, and if `syspolicyd` is itself busy — a loaded Mac
+running many builds at once can pin it near 100% CPU for a long time —
+every first launch queues behind it, whether it's ad-hoc signed or not.
+Reproduced with a program that does nothing but print a string: a fresh
+`rustc`-compiled binary hung for 30+ minutes on first run while
+`syspolicyd` was saturated, at 0% CPU the whole time. An already-launched
+copy of the exact same bytes runs instantly afterward. Release binaries of
+`wt0` itself are signed with a Developer ID and notarized (see
+`docs/release.md`) precisely so they skip this first-launch check —
+notarizing doesn't un-stick a saturated `syspolicyd` for everything else on
+your machine, but it does mean `wt0` isn't one of the things waiting on it.
+
 ## Where does a worktree live?
 
 Under `<repo>/.git/wt0/worktrees/<name>/` by default, so nothing is added

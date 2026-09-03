@@ -56,6 +56,22 @@ those. Verification instead uses `codesign --verify --deep --strict` and
 `spctl -a -t exec -vv`, and the notarization submission ID is recorded in
 the job's summary.
 
+**The observable symptom, and why it's worse on a busy Mac:** `syspolicyd`
+(Gatekeeper's policy daemon) evaluates a binary the first time it runs; if
+`syspolicyd` is itself saturated — reproduced here at ~100% CPU for over
+half an hour with many agents each compiling and launching binaries at
+once — every first launch queues behind it, ad-hoc-signed or not. A
+minimal, wt0-unrelated repro made this concrete: `rustc -O hello.rs -o
+hello && ./hello` (a program that only prints a string) hung for 30+
+minutes on first run on the same machine, with 0% CPU the whole time —
+proof the delay is Gatekeeper's queue, not wt0's code or a compile
+problem. In short: **a freshly built or downloaded binary can hang at
+first launch on macOS while `syspolicyd` is busy; a notarized release
+binary skips the heavy first-launch path** that ad-hoc signing doesn't.
+Notarizing release assets doesn't fix a saturated `syspolicyd` for
+everyone on the machine, but it does mean `wt0`'s own release binary is
+no longer one of the things queuing behind it.
+
 **Required secrets** (repository → Settings → Secrets and variables →
 Actions):
 
