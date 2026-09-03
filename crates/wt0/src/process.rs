@@ -233,16 +233,27 @@ mod ancestry_tests {
     use super::*;
 
     // The invoker's own shell chain must never count as a foreign occupant:
-    // a test process whose cwd is `root` is exactly `cd root && wt0 …`.
+    // a live process whose cwd is `root` and whose ancestry includes this
+    // test process is exactly `cd root && wt0 …`, one level down. A spawned
+    // child proves the same ancestry-exclusion property as this process's
+    // own cwd would, without calling `std::env::set_current_dir` — which
+    // would mutate process-global state and race every other test's
+    // subprocess spawns running concurrently in this same test binary.
     #[test]
     fn own_ancestry_is_not_a_foreign_working_directory() {
         let root = std::env::temp_dir().join(format!("wt0-ancestry-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create fixture");
         let root = dunce::canonicalize(&root).expect("canonicalize");
-        let previous = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("enter fixture");
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&root)
+            .spawn()
+            .expect("spawn a descendant holding the fixture as its cwd");
         let result = foreign_working_directory(&root);
-        std::env::set_current_dir(previous).expect("leave fixture");
+        let _ = child.kill();
+        let _ = child.wait();
+
         assert_eq!(result.expect("probe").as_deref(), None);
         let own = imp::ancestor_pids();
         assert!(own.contains(&std::process::id()));
