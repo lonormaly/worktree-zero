@@ -346,10 +346,24 @@ worktree 0.14 s. Directory `clonefile` of the 230k-file Builders Stack
 `node_modules` took 12 s on the loaded laptop; removing it took 65 s.
 
 Not yet measured here: builds, tests, and dev servers inside the
-worktrees (gate 2), crash-recovery reaping (gate 5). M3 (real-fleet reclaim,
+worktrees (gate 2). M3 (real-fleet reclaim,
 12.2 GiB) and the booted-stack round trip are recorded above; M4/M5 are
 covered by the concurrency suite and the Team session's round trip; M6
 waits on the adapter landing on FLAM `main`.
+
+### Gate 5 — crash recovery, proven (2026-09-02)
+
+`crashed_agent_runtime_is_reaped_and_its_resources_released`
+(`crates/wt0/tests/cli_workflow.rs`) SIGKILLs a whole `wt0 run` process
+tree mid-`sleep` — no exit hook, no graceful heartbeat stop — and checks
+recovery against `docs/lifecycle.md` exactly: the worktree, lease, and port
+claim survive untouched; `wt0 gc --ephemeral --apply` removes it, retires
+its generated root, retains its branch, and hands the freed slot and port
+window to the next runtime; and a second crash whose checkout is `rm -rf`'d
+is recovered by identity through `wt0 prune`'s `orphaned_runtimes` and an
+`orphaned` event. It also surfaced and fixed a real bug: `ports::allocate`/
+`release` compared paths without canonicalizing, so a symlinked temp root
+(macOS's `/var` -> `/private/var`) silently leaked the port claim past gc.
 
 #### What most users pay today (2026-09-02)
 

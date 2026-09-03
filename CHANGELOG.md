@@ -7,6 +7,14 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Added
 
+- **Crash recovery is proven, not just documented.** A new integration test
+  (`crashed_agent_runtime_is_reaped_and_its_resources_released`) SIGKILLs a
+  whole `wt0 run` process tree mid-command and checks the aftermath against
+  `docs/lifecycle.md`: the worktree, lease, and port claim survive
+  untouched; `wt0 gc --ephemeral --apply` reclaims all of it and hands the
+  freed slot and port window to the next runtime; and a checkout that then
+  vanishes via `rm -rf` is recovered by identity through `wt0 prune`.
+
 - **On npm the package is `worktree-zero`** (`npm i -g worktree-zero`, `npx
   worktree-zero doctor`; the command is still `wt0`): the registry refuses
   the bare name `wt0` as too similar to existing short packages.
@@ -113,6 +121,18 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   optimization (`cow.rs`'s `clone_tree_atomically`), which cuts the
   metadata cost per cloned file roughly 5x. The README's fourth row and
   caveat now state 89 MiB (marginal) / 179 MiB (first worktree) plainly.
+
+### Fixed
+
+- **A crashed or `rm -rf`'d worktree's port window is reliably released.**
+  `ports::allocate`/`release` compared a worktree path against the one Git's
+  own worktree registry reports, which is already fully resolved; on a
+  machine where the path crosses a symlink (macOS's `/var` -> `/private/var`
+  is the common case — most temp directories), the comparison silently
+  never matched, so `wt0 gc`/`remove`/`prune` never released the claim and
+  the window stayed reserved for up to the 60-second grace period. Both
+  sides now compare canonically, the same way `wt0 create`'s own
+  idempotency check already does.
 
 ## 0.1.16 — 2026-09-02
 

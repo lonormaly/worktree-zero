@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn cli_reports_the_pinned_release_version() {
@@ -1642,4 +1642,427 @@ fn git_stdout_any(repo: &Path, args: &[&str]) -> String {
         .output()
         .expect("run git");
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+// A crashed agent runs no exit hook and stops no heartbeat early — the
+// process just disappears. This proves wt0 recovers regardless: the
+// worktree, its lease, and its port claim survive exactly as the docs
+// promise until `gc` reaps them, and a checkout that vanishes entirely
+// (`rm -rf`) is recovered by identity at `prune` time.
+#[cfg(unix)]
+#[test]
+fn crashed_agent_runtime_is_reaped_and_its_resources_released() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-crash-recovery-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    let machine = root.join("machine-state");
+    fs::create_dir_all(&machine).expect("create machine-state fixture");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    // wt0's own receipts root state under the repository's real path — see
+    // the `worktree_real` comment below for why that can differ here.
+    let repo_real = fs::canonicalize(&repo).expect("canonicalize repository path");
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let worktree = root.join("crashed");
+    // Mode doesn't matter for this half: `gc --apply` (via `force_teardown`)
+    // already unmounts an overlay worktree itself before removing it.
+    let (runtime_id, slot, port_base, _mode) = spawn_and_crash_agent(
+        wt0,
+        &repo,
+        &machine,
+        &root,
+        "agent/crash-1",
+        "crash-agent",
+        &worktree,
+    );
+
+    // The crash left nothing to clean up: the checkout, its lease, and its
+    // machine-global port claim are exactly what a live runtime's would be.
+    assert!(worktree.exists(), "crashed worktree must still exist");
+    // `git worktree list` (which `gc` reads from) and the port registry
+    // (which stores canonically) both report the real path — on macOS that
+    // resolves the temp directory's `/var` -> `/private/var` symlink —
+    // while `wt0 create`'s own receipts echo the literal `--path` argument
+    // back unchanged; the assertions below need the former.
+    let worktree_real = fs::canonicalize(&worktree).expect("canonicalize crashed worktree path");
+    let fleet = run_wt0(wt0, &repo, &machine, &["--json", "fleet"]);
+    let runtime = managed_runtime(&fleet, "agent/crash-1");
+    assert_eq!(runtime["runtime_id"], runtime_id.as_str());
+    assert_eq!(runtime["slot"], slot);
+    assert_eq!(runtime["port_base"], port_base);
+    let claim: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(machine.join("ports").join(format!("{port_base}.json")))
+            .expect("port claim survives the crash"),
+    )
+    .expect("claim JSON");
+    assert_eq!(claim["worktree"], worktree_real.to_string_lossy().as_ref());
+    let generated_root = repo.join(".git/wt0/generated").join(&runtime_id);
+    assert!(
+        generated_root.is_dir(),
+        "the owned generated root survives the crash"
+    );
+
+    // Dry run reports the crashed runtime as reclaimable...
+    let dry_run = run_wt0(
+        wt0,
+        &repo,
+        &machine,
+        &["--json", "gc", "--ephemeral", "--older-than", "0s"],
+    );
+    let reaped: Vec<&str> = dry_run["reaped"]
+        .as_array()
+        .expect("reaped array")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    assert!(
+        reaped.contains(&worktree_real.to_string_lossy().as_ref()),
+        "dry-run reaped: {reaped:?}"
+    );
+
+    // ...and --apply removes it and releases everything it held.
+    let applied = run_wt0(
+        wt0,
+        &repo,
+        &machine,
+        &[
+            "--json",
+            "gc",
+            "--ephemeral",
+            "--older-than",
+            "0s",
+            "--apply",
+        ],
+    );
+    let reaped: Vec<&str> = applied["reaped"]
+        .as_array()
+        .expect("reaped array")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    assert!(
+        reaped.contains(&worktree_real.to_string_lossy().as_ref()),
+        "apply reaped: {reaped:?}"
+    );
+    assert!(!worktree.exists(), "gc must remove the crashed worktree");
+    assert!(
+        !generated_root.exists(),
+        "gc must retire the owned generated root"
+    );
+    // Without --delete-branches the docs promise the branch survives.
+    let branch_kept = Command::new("git")
+        .current_dir(&repo)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/agent/crash-1",
+        ])
+        .status()
+        .expect("inspect branch");
+    assert!(
+        branch_kept.success(),
+        "gc without --delete-branches must retain the branch"
+    );
+
+    let events = run_wt0(wt0, &repo, &machine, &["--json", "events"]);
+    let kinds_for_runtime: Vec<&str> = events["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|event| event["runtime_id"] == runtime_id.as_str())
+        .filter_map(|event| event["event"].as_str())
+        .collect();
+    assert!(
+        kinds_for_runtime.contains(&"created"),
+        "{kinds_for_runtime:?}"
+    );
+    assert!(
+        kinds_for_runtime.contains(&"reaped"),
+        "{kinds_for_runtime:?}"
+    );
+
+    // The slot and port window gc just freed go to the next runtime — which
+    // doubles as the fixture for the rm -rf / prune path below.
+    let worktree2 = root.join("orphaned");
+    let (runtime_id2, slot2, port_base2, mode2) = spawn_and_crash_agent(
+        wt0,
+        &repo,
+        &machine,
+        &root,
+        "agent/crash-2",
+        "crash-agent-2",
+        &worktree2,
+    );
+    assert_eq!(slot2, slot, "the reaped slot must be reused");
+    assert_eq!(
+        port_base2, port_base,
+        "the released port window must be reused"
+    );
+
+    if mode2 == "overlay" {
+        // On a filesystem without reflinks (plain ext4 — most Linux CI
+        // runners) wt0 falls back to a fuse-overlayfs mount for the
+        // worktree, and a mount point cannot be `rm -rf`'d out from under
+        // wt0 (EBUSY) — that is a filesystem property, not something a
+        // crash changes. The orphan / `rm -rf` recovery path below is
+        // exercised on the CoW and plain git-checkout runners instead; here
+        // just tear the mount down through wt0 so it does not outlive the
+        // fixture and trip the same EBUSY in the cleanup below.
+        let removed = Command::new(wt0)
+            .current_dir(&repo)
+            .env("WT0_MACHINE_STATE", &machine)
+            .args(["remove", "--force"])
+            .arg(&worktree2)
+            .output()
+            .expect("remove overlay worktree");
+        assert!(
+            removed.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&removed.stderr)
+        );
+    } else {
+        fs::remove_dir_all(&worktree2).expect("simulate rm -rf of the crashed checkout");
+        let pruned = run_wt0(wt0, &repo, &machine, &["--json", "prune"]);
+        let orphans = pruned["orphaned_runtimes"].as_array().expect("orphans");
+        let orphan = orphans
+            .iter()
+            .find(|orphan| orphan["runtime_id"] == runtime_id2.as_str())
+            .unwrap_or_else(|| panic!("no orphan for {runtime_id2}: {orphans:?}"));
+        assert_eq!(orphan["owner"], "crash-agent-2");
+        assert_eq!(orphan["slot"], slot2);
+        assert_eq!(orphan["port_base"], port_base2);
+        let generated_root2 = repo_real.join(".git/wt0/generated").join(&runtime_id2);
+        assert_eq!(
+            orphan["generated_root"],
+            generated_root2.to_string_lossy().as_ref()
+        );
+
+        let events = run_wt0(wt0, &repo, &machine, &["--json", "events"]);
+        let orphaned_event = events["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .find(|event| {
+                event["event"] == "orphaned" && event["runtime_id"] == runtime_id2.as_str()
+            });
+        assert!(
+            orphaned_event.is_some(),
+            "no orphaned event for {runtime_id2}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Starts `wt0 run` with a long-lived child, waits for its lease to be
+/// published in the fleet, then SIGKILLs the whole process tree without
+/// letting anything clean up — an agent vanishing mid-run the way a crash or
+/// an OOM kill leaves it, not a graceful shutdown. Returns the runtime's
+/// identity, slot, port window, and populate mode so the caller can assert
+/// on exactly what a crash is supposed to leave behind (mode matters
+/// because an overlay-backed worktree, wt0's fallback where reflinks are
+/// unavailable — plain ext4, most Linux CI runners — is a mount point that
+/// cannot simply be deleted out from under it).
+#[cfg(unix)]
+fn spawn_and_crash_agent(
+    wt0: &str,
+    repo: &Path,
+    machine: &Path,
+    log_dir: &Path,
+    branch: &str,
+    owner: &str,
+    worktree: &Path,
+) -> (String, u64, u64, String) {
+    let label = branch.replace('/', "-");
+    let stdout = fs::File::create(log_dir.join(format!("{label}.stdout")))
+        .expect("create captured stdout log");
+    let stderr_path = log_dir.join(format!("{label}.stderr"));
+    let stderr = fs::File::create(&stderr_path).expect("create captured stderr log");
+    let mut child = Command::new(wt0)
+        .current_dir(repo)
+        .env("WT0_MACHINE_STATE", machine)
+        .args(["run", branch, "--owner", owner, "--path"])
+        .arg(worktree)
+        .args(["--", "sh", "-c", "sleep 300"])
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .expect("spawn wt0 run");
+
+    // `wt0 run` prints "worktree: ..." to stderr right after its call to
+    // `create_worktree` returns — which is also where marking the worktree
+    // ephemeral happens, strictly before the agent command is spawned.
+    // That, not "some descendant process exists", is the correct signal to
+    // wait for: `create_worktree` itself spawns many short-lived `git`
+    // subprocesses on the way there, any one of which would satisfy a
+    // "some descendant exists" check well before ephemeral-marking is
+    // actually done, letting a kill race ahead of it and leave a worktree
+    // `gc --ephemeral` silently skips.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("wt0 run for {branch} exited with {status} before printing its startup line");
+        }
+        if fs::read_to_string(&stderr_path).is_ok_and(|captured| captured.contains("worktree: ")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "wt0 run for {branch} never printed its startup line within 30s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let runtime = loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("wt0 run for {branch} exited with {status} before its lease was published");
+        }
+        let fleet = run_wt0(wt0, repo, machine, &["--json", "fleet"]);
+        if let Some(runtime) = fleet["runtimes"].as_array().and_then(|runtimes| {
+            runtimes
+                .iter()
+                .find(|runtime| runtime["branch"] == branch && runtime["managed"] == true)
+        }) {
+            break runtime.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runtime for {branch} never registered within 30s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let runtime_id = runtime["runtime_id"]
+        .as_str()
+        .expect("runtime id")
+        .to_owned();
+    let slot = runtime["slot"].as_u64().expect("slot");
+    let port_base = runtime["port_base"].as_u64().expect("port_base");
+    let mode = runtime["mode"].as_str().expect("mode").to_owned();
+
+    kill_tree(&mut child);
+
+    (runtime_id, slot, port_base, mode)
+}
+
+/// The one managed runtime for `branch` in a `fleet --json` receipt.
+#[cfg(unix)]
+fn managed_runtime<'a>(fleet: &'a serde_json::Value, branch: &str) -> &'a serde_json::Value {
+    fleet["runtimes"]
+        .as_array()
+        .expect("runtimes")
+        .iter()
+        .find(|runtime| runtime["branch"] == branch && runtime["managed"] == true)
+        .unwrap_or_else(|| panic!("no managed runtime for {branch} in {fleet}"))
+}
+
+/// Runs a `wt0` subcommand against `repo` with a private machine-state
+/// directory and parses its JSON receipt.
+#[cfg(unix)]
+fn run_wt0(wt0: &str, repo: &Path, machine: &Path, args: &[&str]) -> serde_json::Value {
+    let output = Command::new(wt0)
+        .current_dir(repo)
+        .env("WT0_MACHINE_STATE", machine)
+        .args(args)
+        .output()
+        .expect("run wt0");
+    assert!(
+        output.status.success(),
+        "wt0 {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "wt0 {args:?} JSON: {error}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+/// Every live descendant of `pid`, discovered before any kill so a process
+/// reparented mid-teardown is never missed.
+#[cfg(unix)]
+fn descendant_pids(pid: u32) -> Vec<u32> {
+    let mut all = Vec::new();
+    let mut frontier = vec![pid];
+    while let Some(current) = frontier.pop() {
+        let Ok(output) = Command::new("pgrep")
+            .args(["-P", &current.to_string()])
+            .output()
+        else {
+            continue;
+        };
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Ok(child) = line.trim().parse::<u32>() {
+                all.push(child);
+                frontier.push(child);
+            }
+        }
+    }
+    all
+}
+
+#[cfg(unix)]
+fn is_alive(pid: u32) -> bool {
+    // `.output()` rather than `.status()`: a dead pid is the expected steady
+    // state at the end of the poll loop below, and `kill -0` writes "No
+    // such process" to stderr every time it finds one — noise this capture
+    // discards instead of spamming the test log.
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// SIGKILLs `child` and every descendant of it — a `wt0 run` process tree —
+/// and blocks until all of them are confirmed dead, so nothing is left
+/// holding its working directory inside the worktree by the time `gc` looks.
+/// `child` is killed and reaped through its own handle rather than polled
+/// with `kill -0`: a killed process a parent has not `wait`ed on is a
+/// zombie, and `kill -0` reports a zombie's PID as alive until it is reaped.
+#[cfg(unix)]
+fn kill_tree(child: &mut std::process::Child) {
+    let pid = child.id();
+    let targets = descendant_pids(pid);
+    for target in &targets {
+        // A target may already be gone (e.g. `sh` exec'd into `sleep`,
+        // leaving no separate process); `.output()` swallows the resulting
+        // "No such process" instead of spamming the test log with it.
+        let _ = Command::new("kill")
+            .args(["-9", &target.to_string()])
+            .output();
+    }
+    let _ = child.kill();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                assert!(Instant::now() < deadline, "wt0 process {pid} did not die");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!("wait for wt0 process {pid}: {error}"),
+        }
+    }
+    while targets.iter().any(|&target| is_alive(target)) {
+        assert!(
+            Instant::now() < deadline,
+            "process tree rooted at {pid} did not die: {targets:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
