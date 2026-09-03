@@ -3,7 +3,7 @@
 All notable changes to Worktree Zero. Versions follow semantic versioning;
 pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
-## 0.1.17 — 2026-09-03
+## Unreleased
 
 ### Added
 
@@ -32,6 +32,26 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   numbered step list, each naming the exact `wt0 init` target or config
   change that closes it. `--json` gains four additive keys —
   `estimate`, `tooling`, `tilt`, `steps` — every existing key is unchanged.
+
+### Changed
+
+- **`wt0`'s own `--help` leads with `wt0 doctor`, grouped by what an agent
+  needs first.** The top-level `about` line changed from "Thin, isolated
+  development runtimes for coding agents" to "Copy-on-write Git worktrees
+  for agent fleets — a usable checkout in ~1 s and a few MiB, ports that
+  never collide, cleanup that never loses work. Start with: wt0 doctor", and
+  `--help` now groups subcommands under **Start here** (`doctor`, `init`,
+  `create`, `run`, `remove`), **Fleet** (`list`, `fleet`, `gc`, `prune`,
+  `heartbeat`, `events`), **Dependencies** (`prepare`, `migrate`, `repair`),
+  and **Integration** (`mcp`, `capabilities`).
+- **`wt0 doctor`'s human-readable output is a redesigned before/after
+  report** (see "Added" above); its JSON schema is unchanged except for the
+  four additive keys.
+
+## 0.1.17 — 2026-09-03
+
+### Added
+
 - **Crash recovery is proven, not just documented.** A new integration test
   (`crashed_agent_runtime_is_reaped_and_its_resources_released`) SIGKILLs a
   whole `wt0 run` process tree mid-command and checks the aftermath against
@@ -76,18 +96,6 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Changed
 
-- **`wt0`'s own `--help` leads with `wt0 doctor`, grouped by what an agent
-  needs first.** The top-level `about` line changed from "Thin, isolated
-  development runtimes for coding agents" to "Copy-on-write Git worktrees
-  for agent fleets — a usable checkout in ~1 s and a few MiB, ports that
-  never collide, cleanup that never loses work. Start with: wt0 doctor", and
-  `--help` now groups subcommands under **Start here** (`doctor`, `init`,
-  `create`, `run`, `remove`), **Fleet** (`list`, `fleet`, `gc`, `prune`,
-  `heartbeat`, `events`), **Dependencies** (`prepare`, `migrate`, `repair`),
-  and **Integration** (`mcp`, `capabilities`).
-- **`wt0 doctor`'s human-readable output is a redesigned before/after
-  report** (see "Added" above); its JSON schema is unchanged except for the
-  four additive keys.
 - **The first worktree of a base commit now costs about what the second
   does.** `wt0 create` derives the baseline from the repository's own main
   working tree (when it is clean enough to trust — dirty, untracked, and
