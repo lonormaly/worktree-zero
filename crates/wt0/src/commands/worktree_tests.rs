@@ -103,18 +103,24 @@ fn cleanup_worktrees_container_removes_only_once_empty_and_never_the_wrong_dir()
     fs::create_dir_all(&b)?;
 
     fs::remove_dir_all(&a)?;
-    cleanup_worktrees_container(&repo, &a);
-    assert!(container.is_dir(), "container still holds `b`, must survive");
+    cleanup_worktrees_container(&container, &a);
+    assert!(
+        container.is_dir(),
+        "container still holds `b`, must survive"
+    );
 
     // A removed path whose parent isn't the container at all must never
     // trigger cleanup, however empty the real container happens to be.
     let elsewhere = fixture.root.join("unrelated");
     fs::create_dir_all(&elsewhere)?;
-    cleanup_worktrees_container(&repo, &elsewhere);
-    assert!(container.is_dir(), "cleanup must ignore an unrelated parent");
+    cleanup_worktrees_container(&container, &elsewhere);
+    assert!(
+        container.is_dir(),
+        "cleanup must ignore an unrelated parent"
+    );
 
     fs::remove_dir_all(&b)?;
-    cleanup_worktrees_container(&repo, &b);
+    cleanup_worktrees_container(&container, &b);
     assert!(!container.exists(), "an empty container is removed");
     Ok(())
 }

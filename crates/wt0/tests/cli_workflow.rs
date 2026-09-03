@@ -2496,7 +2496,11 @@ fn remove_ok(wt0: &str, repo: &Path, worktree: &Path) {
 /// The default worktrees container for a fixture repo: a sibling directory
 /// named `<repo-name>-worktrees` next to it (D19).
 fn default_container(repo: &Path) -> PathBuf {
-    let name = repo.file_name().expect("repo has a name").to_str().expect("utf-8 name");
+    let name = repo
+        .file_name()
+        .expect("repo has a name")
+        .to_str()
+        .expect("utf-8 name");
     repo.parent()
         .expect("repo has a parent")
         .join(format!("{name}-worktrees"))
