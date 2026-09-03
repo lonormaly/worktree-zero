@@ -1398,7 +1398,10 @@ fn state_lock_never_steals_from_a_live_owner_and_errors_with_a_clear_message() -
         message.contains("could not acquire the wt0 test lock within"),
         "{message}"
     );
-    assert!(message.contains("another wt0 is mid-operation — retry"), "{message}");
+    assert!(
+        message.contains("another wt0 is mid-operation — retry"),
+        "{message}"
+    );
 
     let _ = fs::remove_dir_all(&dir);
     Ok(())
@@ -1419,8 +1422,13 @@ fn state_lock_liveness_overrides_a_zero_stale_after() -> Result<()> {
     fs::create_dir_all(&dir)?;
     let _held = StateLock::acquire_in(&dir, "test.lock", Duration::from_secs(30), Duration::ZERO)?;
 
-    let error = StateLock::acquire_in(&dir, "test.lock", Duration::from_millis(150), Duration::ZERO)
-        .expect_err("a live owner's lock must never be stolen merely for looking old");
+    let error = StateLock::acquire_in(
+        &dir,
+        "test.lock",
+        Duration::from_millis(150),
+        Duration::ZERO,
+    )
+    .expect_err("a live owner's lock must never be stolen merely for looking old");
     assert!(error.to_string().contains("could not acquire"), "{error}");
 
     let _ = fs::remove_dir_all(&dir);
