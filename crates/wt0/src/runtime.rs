@@ -641,15 +641,17 @@ fn print_doctor_report(args: DoctorPrintArgs) {
     if !tooling_names.is_empty() {
         println!("   {}", tooling_names.join(" · "));
     }
-    println!(
-        "   Filesystem: {} — {}",
-        filesystem_display_name(),
-        if cow_available {
-            "copy-on-write available ✅ (worktrees share files at no extra disk cost)"
-        } else {
-            "no copy-on-write here ❌ (each worktree copies the full checkout instead of sharing it)"
-        }
-    );
+    // Two lines, not one: `filesystem_display_name()` returns "this
+    // filesystem" on Linux (longer than "APFS"/"ReFS/Dev Drive"), which
+    // pushed the single-line version past 100 columns in CI.
+    println!("   Filesystem: {}", filesystem_display_name());
+    if cow_available {
+        println!("   Copy-on-write available ✅ — worktrees share files at no extra disk cost.");
+    } else {
+        println!(
+            "   No copy-on-write here ❌ — each worktree copies the full checkout instead of sharing it."
+        );
+    }
     println!();
 
     println!("💾 What one agent's worktree costs");
@@ -683,7 +685,7 @@ fn print_doctor_report(args: DoctorPrintArgs) {
         if cow_available {
             "a worktree is ready in ≈ 1–2 s, and `git status` inside it is instant."
         } else {
-            "without copy-on-write, `wt0 create` falls back to a plain `git checkout` — every file is copied."
+            "without copy-on-write, `wt0 create` falls back to a plain checkout — every file is copied."
         }
     );
     println!(
