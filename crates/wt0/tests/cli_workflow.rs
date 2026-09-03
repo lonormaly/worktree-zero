@@ -276,6 +276,252 @@ fn migrate_apply_converts_a_clean_existing_worktree_and_is_idempotent() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// `wt0 doctor`'s before/after report: the new `estimate`/`tooling`/`tilt`/
+/// `steps` JSON keys are additive (every existing key from before this
+/// feature stays put — `wt0_metadata_advice_names_both_costs` and the other
+/// doctor tests above still assert on `dependencies.recommendations`
+/// directly), and a Tiltfile with a hard-coded port with no `WT0_PORT_BASE`
+/// reference produces both a `tilt` step and a matching `steps[].title`.
+#[test]
+fn doctor_before_after_report_adds_estimate_tooling_and_steps() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-doctor-before-after-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    fs::write(repo.join("bun.lock"), "{}\n").expect("write lockfile");
+    fs::write(repo.join("package.json"), "{\"name\":\"fixture\"}\n").expect("write manifest");
+    fs::create_dir_all(repo.join("node_modules/pkg")).expect("create node_modules");
+    fs::write(repo.join("node_modules/pkg/index.js"), "1\n").expect("write package file");
+    fs::write(
+        repo.join("Tiltfile"),
+        "k8s_resource('web', port_forwards='10350:3000')\n",
+    )
+    .expect("write Tiltfile");
+    git(
+        &repo,
+        &[
+            "add",
+            "-f",
+            ".gitignore",
+            "bun.lock",
+            "package.json",
+            "Tiltfile",
+        ],
+    );
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let doctor = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "doctor"])
+        .output()
+        .expect("doctor");
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)
+        .unwrap_or_else(|_| panic!("doctor JSON: {}", String::from_utf8_lossy(&doctor.stderr)));
+
+    assert!(
+        doctor["estimate"]["today_one_bytes"].as_u64().is_some(),
+        "{doctor}"
+    );
+    assert!(
+        doctor["estimate"]["wt0_one_bytes"].as_u64().is_some(),
+        "{doctor}"
+    );
+    assert!(
+        doctor["estimate"]["today_ten_bytes"].as_u64().unwrap()
+            >= 10 * doctor["estimate"]["today_one_bytes"].as_u64().unwrap(),
+        "{doctor}"
+    );
+    assert_eq!(doctor["estimate"]["basis"], "estimated", "{doctor}");
+    assert!(
+        doctor["estimate"]["with_native_store_each_bytes"]
+            .as_u64()
+            .is_some(),
+        "no native store active yet, so a recommendation is expected: {doctor}"
+    );
+
+    assert_eq!(doctor["tilt"]["detected"], true, "{doctor}");
+    assert_eq!(doctor["tilt"]["derives_from_wt0"], false, "{doctor}");
+    assert!(
+        doctor["tilt"]["literal_ports"]
+            .as_array()
+            .expect("literal_ports")
+            .iter()
+            .any(|port| port == "10350"),
+        "{doctor}"
+    );
+
+    let steps = doctor["steps"].as_array().expect("steps");
+    assert!(
+        steps.iter().any(|step| step["title"] == "bunfig.toml"),
+        "{doctor}"
+    );
+    assert!(steps.iter().any(|step| step["title"] == "tilt"), "{doctor}");
+
+    // The original keys this feature must not disturb.
+    assert!(
+        doctor["dependencies"]["recommendations"].is_array(),
+        "{doctor}"
+    );
+    assert!(doctor["promise"]["verdict"].is_string(), "{doctor}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// `wt0 init generated|seed|tilt`: dry run by default, writes only with
+/// `--apply`, and never overwrites an existing file without `--force`.
+#[test]
+fn wt0_init_targets_propose_apply_and_refuse_overwrite() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-init-targets-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join(".gitignore"), "dist/\n").expect("write gitignore");
+    fs::create_dir_all(repo.join("dist")).expect("create build output");
+    fs::write(repo.join("dist/bundle.js"), "1\n").expect("write build output");
+    fs::create_dir_all(repo.join(".nx/cache")).expect("create nx cache");
+    fs::write(repo.join(".nx/cache/marker"), "1\n").expect("write nx cache file");
+    git(&repo, &["add", "-f", ".gitignore"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+
+    // --- generated: dry run reports the proposal, writes nothing ----------
+    let dry_run = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "init", "generated"])
+        .output()
+        .expect("init generated dry run");
+    assert!(
+        dry_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&dry_run.stdout).expect("init generated JSON");
+    assert_eq!(receipt["applied"], false, "{receipt}");
+    assert!(
+        receipt["proposed_paths"]
+            .as_array()
+            .expect("proposed_paths")
+            .iter()
+            .any(|path| path == "dist"),
+        "{receipt}"
+    );
+    assert!(!repo.join(".wt0-generated").exists());
+
+    // --- generated: --apply writes it ---------------------------------------
+    let applied = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "init", "generated", "--apply"])
+        .output()
+        .expect("init generated --apply");
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert!(repo.join(".wt0-generated").is_file());
+    let contents = fs::read_to_string(repo.join(".wt0-generated")).expect("read policy");
+    assert!(contents.contains("dist"), "{contents}");
+
+    // --- generated: --apply again without --force refuses -----------------
+    let refused = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["init", "generated", "--apply"])
+        .output()
+        .expect("init generated --apply refusal");
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--force"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // --- generated: --apply --force overwrites -----------------------------
+    let forced = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["init", "generated", "--apply", "--force"])
+        .output()
+        .expect("init generated --apply --force");
+    assert!(
+        forced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+
+    // --- seed: proposes the Nx cache, writes with --apply -------------------
+    let seed_dry_run = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "init", "seed"])
+        .output()
+        .expect("init seed dry run");
+    let seed_receipt: serde_json::Value =
+        serde_json::from_slice(&seed_dry_run.stdout).expect("init seed JSON");
+    assert!(
+        seed_receipt["proposed"]
+            .as_array()
+            .expect("proposed")
+            .iter()
+            .any(|entry| entry["path"] == ".nx/cache"),
+        "{seed_receipt}"
+    );
+    assert!(!repo.join(".wt0-seed").exists());
+    let seed_applied = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["init", "seed", "--apply"])
+        .output()
+        .expect("init seed --apply");
+    assert!(seed_applied.status.success());
+    assert!(repo.join(".wt0-seed").is_file());
+
+    // --- tilt: writes boot scripts marked executable ------------------------
+    let tilt_applied = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["init", "tilt", "--apply"])
+        .output()
+        .expect("init tilt --apply");
+    assert!(
+        tilt_applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tilt_applied.stderr)
+    );
+    assert!(repo.join("tilt_up.sh").is_file());
+    assert!(repo.join("tilt_down.sh").is_file());
+    assert!(repo.join(".wt0/hooks/post-create").is_file());
+    assert!(repo.join(".wt0/hooks/pre-remove").is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(repo.join("tilt_up.sh"))
+            .expect("tilt_up.sh metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "tilt_up.sh must be executable");
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 fn git_stdout(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")

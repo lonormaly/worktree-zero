@@ -3,6 +3,51 @@
 All notable changes to Worktree Zero. Versions follow semantic versioning;
 pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
+## Unreleased
+
+### Added
+
+- **`wt0 init` writes the setup `wt0 doctor` recommends.** Three targets,
+  each a dry run by default, writing only with `--apply` and never
+  overwriting an existing file without `--force`: `wt0 init generated`
+  proposes `.wt0-generated` from this repository's own ignored build output;
+  `wt0 init seed` proposes `.wt0-seed` from detected caches (Nx, Turbo,
+  Next, and `node_modules` when no native store makes it cheaper to
+  install); `wt0 init tilt` writes `tilt_up.sh`/`tilt_down.sh`, lifecycle
+  hooks, and a Tiltfile snippet that derives ports and Portless routes from
+  `WT0_PORT_BASE`/`WT0_SLUG` — the pattern FLAM's `.wt0/hooks/post-create`
+  and Builders Stack's `tilt_up.sh`/`.devops/Tiltfile` already run in
+  production. `wt0 init` with no target prints `doctor`'s own step list and
+  which target closes each step. See `docs/lifecycle.md`, "Setup: `wt0
+  init`".
+- **`wt0 doctor` is a before/after report, not a status readout.** A new
+  cost table estimates what one worktree and ten cost today versus with wt0
+  — tracked-file and `node_modules` file counts from this repository,
+  per-file costs measured on FLAM (`docs/design-partners/flam-migration.md`,
+  "The 2×2" and "Verification — hoisted node_modules per-worktree cost") —
+  plus detected tooling (Next.js, Nx, Turbo, Cargo, Tilt, Portless,
+  docker-compose, Kubernetes manifests) and a Tilt-collision check: a
+  Tiltfile with hard-coded ports/hostnames and no `WT0_PORT_BASE`/`WT0_SLUG`
+  reference is called out by name, with the fix. The report ends with a
+  numbered step list, each naming the exact `wt0 init` target or config
+  change that closes it. `--json` gains four additive keys —
+  `estimate`, `tooling`, `tilt`, `steps` — every existing key is unchanged.
+
+### Changed
+
+- **`wt0`'s own `--help` leads with `wt0 doctor`, grouped by what an agent
+  needs first.** The top-level `about` line changed from "Thin, isolated
+  development runtimes for coding agents" to "Copy-on-write Git worktrees
+  for agent fleets — a usable checkout in ~1 s and a few MiB, ports that
+  never collide, cleanup that never loses work. Start with: wt0 doctor", and
+  `--help` now groups subcommands under **Start here** (`doctor`, `init`,
+  `create`, `run`, `remove`), **Fleet** (`list`, `fleet`, `gc`, `prune`,
+  `heartbeat`, `events`), **Dependencies** (`prepare`, `migrate`, `repair`),
+  and **Integration** (`mcp`, `capabilities`).
+- **`wt0 doctor`'s human-readable output is a redesigned before/after
+  report** (see "Added" above); its JSON schema is unchanged except for the
+  four additive keys.
+
 ## 0.1.17 — 2026-09-03
 
 ### Added

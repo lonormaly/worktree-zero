@@ -260,3 +260,63 @@ hook so unattended `gc` cannot hang. On Windows the same events resolve to
 `.cmd`, `.bat`, or `.ps1` files. `wt0 capabilities` reports which hooks a
 repository ships. With hooks checked in, most projects no longer need a
 wrapper script around `wt0`.
+
+## Setup: `wt0 init`
+
+`wt0 doctor` diagnoses; `wt0 init <target>` writes the fix, so an agent never
+has to hand-author `.wt0-generated`, `.wt0-seed`, or a Tilt boot script from
+documentation. Every target is a dry run by default — it prints what it
+would write — and only writes with `--apply`, never overwriting an existing
+file without `--force`:
+
+- **`wt0 init generated`** proposes `.wt0-generated` (see "Reviewing
+  additional generated paths" above) from directories that both exist and
+  are matched by the repository's own `.gitignore` among a fixed list of
+  known build-output names (`.next`, `.nx`, `.turbo`, `dist`, `build`,
+  `coverage`, `target`, `.wrangler`, `storybook-static`, `.cache`, `out`) —
+  at the root and one level into `apps/*`, `services/*`, `libs/*`,
+  `packages/*`. `.env*`, `.dev.vars`, `secrets`, and `*.pem` are never
+  proposed, matching the same sensitivity rule the policy file itself
+  enforces.
+- **`wt0 init seed`** proposes `.wt0-seed` (see "Seeding" above) from
+  detected caches — `.nx/cache`, `.turbo`, `.next/cache` (root and
+  per-workspace) — each with a one-line comment explaining why it is safe to
+  clone from a live base checkout, and `node_modules` only when no native
+  link-tree store is already active for the detected package manager (a
+  native store is cheaper to install than to clone; see the seed gate's
+  fourth condition above).
+- **`wt0 init tilt`** writes `tilt_up.sh` / `tilt_down.sh` (from
+  [`integrations/tilt/examples`](../integrations/tilt/examples), embedded in
+  the binary) marked executable, `.wt0/hooks/post-create` /
+  `pre-remove` when a repository doesn't already have them, and a Tiltfile
+  snippet — printed always, appended with `--apply` only when a Tiltfile
+  exists — that derives a `TILT_PORT` from `WT0_PORT_BASE` and (when
+  Portless is detected) a per-worktree route helper suffixed with
+  `WT0_SLUG`, the same pattern FLAM's `.wt0/hooks/post-create` and Builders
+  Stack's `tilt_up.sh`/`.devops/Tiltfile` already run in production; see the
+  [Tilt integration](../integrations/tilt/README.md). Every written file
+  carries a two-line header naming `wt0 init tilt` as its source and what to
+  edit.
+- **`wt0 init`** with no target prints `doctor`'s own numbered step list —
+  the same steps `wt0 doctor`'s report shows — and which `init` target (if
+  any) closes each one.
+
+### `doctor`'s before/after estimate
+
+The cost table in `wt0 doctor`'s report (today vs. with wt0, one worktree and
+ten) is computed, never measured live — `doctor` is read-only and never
+times a real `create`. It combines this repository's own tracked-file count
+and `node_modules` file count with per-file costs measured on FLAM
+(`docs/design-partners/flam-migration.md`, "The 2×2" and "Verification —
+hoisted node_modules per-worktree cost"): wt0's own checkout clone at ~450 B
+of filesystem metadata per tracked file, its dependency clone at ~400 B per
+`node_modules` file (`CLONED_FILE_METADATA_BYTES`), a native per-file install
+at ~2 KB per file (`NATIVE_INSTALL_FILE_METADATA_BYTES`) for npm/Yarn's own
+full-copy install or a same-volume-cache manager with no store, and a flat
+~6–7 MiB once a native link-tree store (pnpm, Bun's global store) is active
+— that scenario no longer scales with file count, since the manager's own
+sharing already carries it. Every reported number is prefixed `≈` and the
+report names its basis (`"estimate": {"basis": "estimated"}` in `--json`);
+a future receipt-backed measurement from a prior `wt0 create` in this exact
+repository would report `"measured"` and drop the `≈`, but nothing in wt0
+persists such a receipt yet.
