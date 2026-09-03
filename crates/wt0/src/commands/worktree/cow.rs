@@ -1200,12 +1200,36 @@ mod tests {
         dir
     }
 
+    /// Whether `dir`'s filesystem can reflink at all. The CI job that runs
+    /// this suite on Windows does so twice: once on plain NTFS (no
+    /// block-cloning primitive — `reflink` fails every time, by design) and
+    /// once on a diskpart-created ReFS volume. This test exercises the
+    /// per-file clone path itself, so it needs to run somewhere reflink
+    /// actually works; on a plain filesystem it has nothing to prove and
+    /// skips rather than failing on an environment it was never about.
+    fn reflink_supported(dir: &Path) -> bool {
+        let source = dir.join(format!(".reflink-probe-{}", Uuid::new_v4()));
+        let destination = dir.join(format!(".reflink-probe-dest-{}", Uuid::new_v4()));
+        let _ = fs::write(&source, b"probe");
+        let supported = reflink_copy::reflink(&source, &destination).is_ok();
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_file(&destination);
+        supported
+    }
+
     /// The parallel clone queue must produce the same tree a serial walk
     /// would: every file's bytes intact, nested directories recreated, and
     /// symlinks preserved — regardless of which worker thread claimed which
     /// file from the shared queue.
     #[test]
     fn clone_tree_entries_clones_many_files_and_nested_dirs() -> Result<()> {
+        if !reflink_supported(&std::env::temp_dir()) {
+            eprintln!(
+                "skipping: {} cannot reflink",
+                std::env::temp_dir().display()
+            );
+            return Ok(());
+        }
         let source = temp_dir("source");
         fs::create_dir_all(source.join("a/b"))?;
         for i in 0..64 {
