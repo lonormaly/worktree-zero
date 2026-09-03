@@ -1,0 +1,20 @@
+{
+  "name": "wt0-win32-x64",
+  "version": "0.0.0-dev",
+  "description": "wt0 prebuilt binary for Windows (x86_64). Installed automatically as an optional dependency of the wt0 package -- do not install directly.",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/wt0.exe"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lonormaly/worktree-zero.git"
+  },
+  "homepage": "https://github.com/lonormaly/worktree-zero"
+}

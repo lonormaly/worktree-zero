@@ -209,6 +209,11 @@ namespace, database, and generated root; a normal removal leaving no orphan
 
 ## After
 
+Whether an install *after* create stays a delta or rewrites a seeded or
+prepared tree — the natural follow-up to M1's storage numbers — is measured
+separately in [`drift.md`](drift.md): delta-only in every scenario tested,
+with one state-tracking gap in the attached-prepared-environment case.
+
 ### M1 + M2 — 1, 4, and 10 usable worktrees on an isolated volume (2026-09-02)
 
 Instrument: a dedicated 16 GiB APFS sparse image (`hdiutil`), so every
@@ -229,8 +234,10 @@ global-store links as the base.
 
 Marginal cost per additional usable worktree: **native 509 MiB, wt0
 8.7 MiB** (98.3% less) — inside the ≤15–20 MiB bar the Team session set as
-the go/no-go threshold. The first wt0 worktree pays the one-time baseline
-plus the first seal and costs the same as a native one.
+the go/no-go threshold. At the time of this measurement the first wt0
+worktree paid the one-time baseline plus the first seal and cost the same
+as a native one; D13, below, removes that cost by deriving both from the
+base checkout instead of a second physical copy.
 
 **Time (M2), honestly: no advantage.** Per-worktree wall clock varied
 widely on both sides (native 8–90 s, mean 39 s; wt0 14–88 s, mean 40 s).
@@ -239,8 +246,107 @@ With Bun's global store already warm, wt0's Bun path still runs
 create-plus-prepare is roughly a native install plus a fast clone. The
 storage promise is kept; a time promise is not made by these numbers.
 
+### After — D13 — the first worktree (2026-09-02)
+
+The M1 table above showed the first wt0 worktree of a base commit costing
+*more* than every one after it: 517 MiB, against 8.7 MiB marginal for
+worktrees two through ten. That 517 MiB was two one-time *second physical
+copies* of data the base checkout already held — `materialize_baseline`
+wrote the commit's tree fresh from Git objects instead of cloning the live
+checkout, and `wt0 prepare`'s first seal installed into empty air instead
+of cloning the checkout's own `node_modules`. D13 derives the baseline from
+the repository's main working tree when it is clean enough to trust
+(`cow.rs::derive_baseline_from_checkout`, tried before the cached-baseline
+derivation gap #6 already had), and seals a first prepared environment from
+the base checkout's `node_modules` the same way
+(`runtime.rs::seed_node_modules_from_base`). Same instrument, same isolated
+16 GiB APFS sparse image, FLAM at `origin/main` `be2d1c13`, Bun 1.3.14, wt0
+built from this branch:
+
+| Worktrees | Before (main, wt0 0.1.15) | After (D13) | Reduction |
+| ---: | ---: | ---: | ---: |
+| 1 | 517 MiB | **15.7 MiB** | 97.0% |
+| 4 | 543 MiB | **38.6 MiB** | 92.9% |
+| 10 | 595 MiB | **84.9 MiB** | 85.7% |
+
+Marginal cost per additional worktree beyond the first is essentially
+unchanged (≈7.7 MiB, against the earlier 8.7 MiB — D13 does not touch that
+path at all, only the first worktree's). Every worktree in the run resolved
+`next 16.3.1` from `apps/web` and held the same 1,940 global-store links as
+the base; `git status --porcelain` was empty in each; the first worktree's
+`derived-from` marker read `checkout`, worktrees two through ten attached
+the sealed environment from the store exactly as before. `wt0 create`
+itself now costs 3.6 MiB (the linked-worktree registration and index, not a
+second copy of the 368 MiB tracked tree); `wt0 prepare --apply`'s first seal
+costs 12.4 MiB (cloning the base's `node_modules` plus Bun's frozen-lockfile
+reconcile) instead of a second full install.
+
+The same optimization measured on the npm/Next fixture from
+[`drift.md`](drift.md) (Scenario 2, `wt0 prepare --apply`'s first seal with
+no native store to fall back on): **391.6 MiB before, 8.9 MiB after**
+(97.7% reduction) — cloning the base's 12,820-entry `node_modules` and
+letting `npm install` reconcile on top of it, instead of a fresh install
+into an empty tree. `wt0 doctor` reports `dependency_ready: true` and
+`prepared_environment_attached: true` afterward, and `next` resolves from
+the attached environment.
+
+### Gap #7 — what a fresh worktree costs once its dependencies are usable (2026-09-02)
+
+Same instrument (dedicated APFS sparse images, exact `df` deltas), Bun
+1.3.14, wt0 at `main` after PR #51. Every run below happened on a busy
+laptop (load average above 100 from other sessions), so **storage numbers
+are exact and times are upper bounds**.
+
+**FLAM with Bun's isolated global store — the fair native baseline.** The
+M1 table above kept Bun's store on the laptop's main volume, so native
+`bun install` had to copy across volumes. Re-run with the store on the same
+volume as the worktrees:
+
+| Per additional usable worktree | Storage | Time |
+| --- | ---: | ---: |
+| Native `git worktree add` + `bun install`, store on the same volume | **+434 MiB** | 62–113 s |
+| wt0 create with seeded `node_modules` (12,669 links) + `prepare --apply` | **+9 MiB** | 6–12 s create + 17–21 s prepare |
+
+The 434 MiB is not `node_modules` — under the global store that is already
+cheap natively. It is FLAM's 368 MiB tracked checkout (226 MiB of it under
+`ops/brand/assets`) plus link metadata. That checkout is what wt0 shares.
+`apps/web` resolved `next 16.3.1` in every seeded worktree.
+
+**Seeding a hoisted `node_modules` from the base checkout** (the "origin as
+virtual store" question — no global store involved). Each worktree cloned
+the base's `node_modules` in one directory `clonefile`, then ran the
+package manager's ordinary install exactly as an agent would:
+
+| Layout | Native install per worktree | Seed clone | Raw install after seeding | Paths the install rewrote |
+| --- | ---: | ---: | ---: | ---: |
+| npm, Next app, 11,687 files | +389 MiB, 60–74 s | **+4–5 MiB** | **+0 MiB, 2–5 s** | 3 (its hidden lockfile and metadata) |
+| Bun hoisted (`linker = "hoisted"`), FLAM, 236,332 files, 10 workspace trees | +4,234 MiB, 616 s (cache across volumes; upper bound) | **+471 MiB** | +58 MiB, 8–42 s | 751 (the unseeded workspace `node_modules` and `.bin` shims) |
+
+Two readings. First, seeding works for any manager when the lockfile is
+byte-identical to the base's: npm's reconcile touched three paths and wrote
+nothing; Bun's recreated only what was not seeded. Second, the cost of a
+seeded — or attached, or natively installed — `node_modules` is set by its
+**file count, not its bytes**: APFS spends roughly 2 KB of metadata per
+cloned inode, so 236k files cost ~470 MiB per worktree no matter how the
+bytes are shared, while 11.7k files cost 5 MiB and a 12.7k-link global-store
+tree 9 MiB. Copy-on-write shares blocks, not inodes. That is why the ≤15–20
+MiB bar is met by link-tree layouts (Bun's global store, pnpm) and by small
+hoisted trees, and cannot be met by a 236k-file hoisted tree through any
+per-worktree materialization — the recommendation to enable the native
+virtual store stands on that number.
+
+**Create itself.** Profiling the same runs found `wt0 create` spending its
+time outside the clone: the baseline was cloned file by file (4.5 s where
+one directory `clonefile` takes 0.07 s), the fresh index carried no stat
+data so the verifying `git status` — and the agent's first — hashed all
+368 MiB (15 s), and every lease scan spawned `git rev-parse` per registered
+worktree. With all three removed (PR #51), create on FLAM with 19 worktrees
+registered measured **0.8–1.4 s** and the first `git status` inside the
+worktree 0.14 s. Directory `clonefile` of the 230k-file Builders Stack
+`node_modules` took 12 s on the loaded laptop; removing it took 65 s.
+
 Not yet measured here: builds, tests, and dev servers inside the
-worktrees (gate 2), Linux and Windows (gate 7). M3 (real-fleet reclaim,
+worktrees (gate 2). M3 (real-fleet reclaim,
 12.2 GiB) and the booted-stack round trip are recorded above; M4/M5 are
 covered by the concurrency suite and the Team session's round trip; M6
 waits on the adapter landing on FLAM `main`.
@@ -258,3 +364,107 @@ is recovered by identity through `wt0 prune`'s `orphaned_runtimes` and an
 `orphaned` event. It also surfaced and fixed a real bug: `ports::allocate`/
 `release` compared paths without canonicalizing, so a symlinked temp root
 (macOS's `/var` -> `/private/var`) silently leaked the port claim past gc.
+
+#### What most users pay today (2026-09-02)
+
+Every number above compares native Git against wt0. This addendum answers a
+narrower question: what does the setup **most repositories actually run** —
+`git worktree add` plus the package manager's own install, no store, no
+wt0 — cost per extra worktree, right now? Same instrument as the rest of
+this document (dedicated APFS sparse image, exact `df -k` deltas, times are
+upper bounds on a busy laptop), 3 worktrees per row unless noted. Fixture A
+is the Next app used throughout this repository's docs (`next@16.3.1`,
+`react@19.2.4`, `react-dom@19.2.4`, dev deps `typescript@5.9.3`,
+`@types/react@19.2.14`, `@types/node@24.10.1`, `eslint@9.39.1`,
+`tailwindcss@4.1.18`); Fixture B is FLAM itself (`bunfig.toml` switched to
+`linker = "hoisted"` for this test — FLAM's real config is
+`isolated`+`globalStore`, measured separately above). Every manager's
+cache/store was placed on the same volume as the worktrees
+(`npm_config_cache`, `BUN_INSTALL_CACHE_DIR`, `YARN_CACHE_FOLDER`).
+
+| Setup | Native `git worktree add` + install, per worktree | wt0 `create --require-cow` (seeded) + install, per worktree |
+| --- | ---: | ---: |
+| npm hoisted, Fixture A | 367.4 MiB, 9 s (1-run confirm; docs above: 388–389 MiB, 60–74 s cold cache) | +4–5 MiB seed, +0 MiB reconcile, 2–5 s (gap #7 above) |
+| Yarn classic 1.22.22, Fixture A | 404.7 MiB mean (404.7/409.4/409.4), 6.7 s mean | ≈0 MiB (noise: −21.4 to +4.7 MiB across 3 creates), 0 MiB / 0 s reconcile (`yarn install` reports "Already up-to-date"), ~3.3 s create |
+| Bun 1.3.14 hoisted (no store), Fixture A | 4.45 MiB mean (4.8/4.1/4.4), 2 s mean | 2.93 MiB seed + −0.2 MiB reconcile (noise) = 2.70 MiB mean, ~5 s |
+| Bun 1.3.14 hoisted (no store), Fixture B (FLAM, 236,332 files) | 452.1 MiB mean (469.3/467.3/420.0), 96.7 s mean (checkout 4–9 s + install 75–109 s) | 458.6 MiB seed + 1.65 MiB reconcile = 460.2 MiB, 148 s (1 run — the other 2 of 3 planned were skipped to stay inside the session's ~45-minute budget; a single run is consistent with the already-published 471 MiB seed figure above) |
+
+Two findings, neither anticipated going in:
+
+1. **On APFS, same-volume cache is what actually matters for Bun, not the
+   linker mode.** Bun's own install path clonefiles package files out of
+   its cache into `node_modules` — even in plain `hoisted` mode, with no
+   `globalStore` configured. With the cache on the same volume as the
+   worktree, that clonefile shares blocks with the cache the same way wt0
+   shares blocks with its baseline: Fixture A's *native* Bun-hoisted install
+   cost 4.45 MiB, not the ~388 MiB npm/Yarn pay for the identical dependency
+   tree. The 236,332-file FLAM number (452 MiB) is **not** a failure of this
+   mechanism — see finding 2. This is also the reason gap #7's Bun-hoisted
+   FLAM figure was only ever an upper bound: that run's cache sat on a
+   different volume, which forces Bun to fall back to a real byte copy
+   (+4,234 MiB, 616 s) instead of a clonefile. Most FLAM-like setups do keep
+   the cache on the same disk as the checkout (it's the default location),
+   so 452 MiB / 97 s, not 4,234 MiB / 616 s, is the honest "today" number for
+   this row.
+2. **wt0 gives no advantage over that same-volume-cache baseline for a
+   236,332-file hoisted tree — both hit the same ~2 KB/file metadata floor.**
+   Native Bun-hoisted (452 MiB) and wt0-seeded (460 MiB) land within noise of
+   each other, because both are paying per-*file* clonefile metadata for
+   236k files, and clonefile cannot share directory entries, only blocks.
+   Ten worktrees costs roughly 4.4 GiB either way. The fix is the same one
+   gap #7 already recommends and this document's finding 1 explains why it
+   works structurally: Bun's `isolated` linker with `globalStore = true`
+   replaces per-worktree clonefiled *files* with per-worktree *symlinks* to
+   one real copy — no per-file metadata floor, because nothing new is
+   cloned. That configuration (FLAM's actual `bunfig.toml`) measured 3 MiB
+   marginal above and independently in
+   [`dependency-link-trees.md`](../research/dependency-link-trees.md). One
+   config line closes a gap wt0's own storage sharing cannot.
+
+wt0 dogfooding receipts for this session:
+
+```
+$ ./target/release/wt0 create claude/readme-today \
+    --path /Users/shaisnir/Development/wt0-agent-readme \
+    --owner readme-agent --require-cow
+mode: cow-clone
+runtime: 01a06379-f4a2-7de0-a4df-73b70e09ac91
+/Users/shaisnir/Development/wt0-agent-readme
+```
+
+### Gate 7 — M1 on Linux (Btrfs) and Windows (ReFS), in CI
+
+The macOS/APFS numbers above were measured by hand, once, on an isolated
+volume. The Linux and Windows numbers are not: they come from
+`tests/measure_m1.sh`, run on every CI build as a step in the
+`reflink-linux` job (the loopback Btrfs volume that job already mounts) and
+the `windows` job (the diskpart-created ReFS volume that job already
+formats) in [`ci.yml`](../../.github/workflows/ci.yml). Each run builds a
+~100 MiB, 2,000-file fixture repo on the volume under test, creates 5
+worktrees with native `git worktree add` and 5 with `wt0 create
+--require-cow`, and reads physical usage from the filesystem itself — `df
+-k --output=used` on Linux, a PowerShell `Get-PSDrive` query on Windows
+(Git Bash's `df` was not trusted to see through the ReFS/diskpart mount
+correctly; see the comment on that step). The job fails outright if wt0's
+marginal storage per worktree exceeds 10% of native's on either filesystem.
+The resulting table is not pasted here — it is published fresh to
+`$GITHUB_STEP_SUMMARY` on every run, so it can't go stale; see the
+`reflink-linux` and `windows` jobs' summaries for the current numbers. The
+Linux step runs on every push and pull request; the ReFS step runs on
+pushes to `main` only, because of the finding below.
+
+First run (2026-09-02, run `33661351722`), recorded here as the receipt for
+the day the gate landed — the job summaries are the living numbers:
+
+| Filesystem | Native marginal per worktree | wt0 marginal | wt0 share | Mean create: native / wt0 |
+| --- | ---: | ---: | ---: | ---: |
+| Linux Btrfs (loopback) | 125.3 MiB | **1.9 MiB** | 1.5% | 0.28 s / 0.26 s |
+| Windows ReFS (diskpart) | 103.6 MiB | **9.8 MiB** | 9.5% | 0.89 s / **20.2 s** |
+
+Storage holds on both. Time does not on ReFS: `wt0 create` averaged 20 s
+for a 2,000-file tree — about 10 ms per file on the per-file block-clone
+path — against native Git's 0.9 s. That is a real Windows shortfall (a
+FLAM-sized 4,000-file checkout would take ~40 s), open as follow-up work;
+the macOS path clones the whole directory in one call and Linux reflinks
+run at 0.26 s here. M2 (time to a usable workspace) on these two
+filesystems is otherwise not yet measured.

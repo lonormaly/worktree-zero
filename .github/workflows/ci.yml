@@ -5,13 +5,18 @@ on:
     branches: [main]
   pull_request:
 
+# A new push to a PR supersedes the run in flight; main runs are never cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - name: Shellcheck integration and benchmark scripts
-        run: shellcheck tests/*.sh integrations/tilt/examples/*.sh
+        run: shellcheck tests/*.sh integrations/tilt/examples/*.sh npm/*.sh
       - name: Plugin manifest versions match the workspace version
         run: |
           version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -19,6 +24,22 @@ jobs:
           for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json; do
             jq -e --arg v "$version" '.version == $v' "$manifest" >/dev/null \
               || { echo "$manifest version does not match workspace $version"; exit 1; }
+          done
+      - name: npm package.json versions stay at the build-time placeholder
+        run: |
+          # npm/build.sh stamps the real version (matching the workspace
+          # version above) into every npm/*/package.json at build time, from
+          # the version it's invoked with -- these files must not carry a
+          # committed real version that could drift out of sync.
+          placeholder="0.0.0-dev"
+          jq -e --arg v "$placeholder" '.version == $v' npm/wt0/package.json >/dev/null \
+            || { echo "npm/wt0/package.json version is not the $placeholder placeholder"; exit 1; }
+          jq -e --arg v "$placeholder" \
+            '.optionalDependencies | to_entries | all(.value == $v)' npm/wt0/package.json >/dev/null \
+            || { echo "npm/wt0/package.json optionalDependencies are not all $placeholder"; exit 1; }
+          for manifest in npm/platforms/*/package.json; do
+            jq -e --arg v "$placeholder" '.version == $v' "$manifest" >/dev/null \
+              || { echo "$manifest version is not the $placeholder placeholder"; exit 1; }
           done
 
   msrv:
@@ -114,6 +135,8 @@ jobs:
         env:
           TMPDIR: /mnt/wt0-btrfs
         run: WT0_BIN="$PWD/target/debug/wt0" bash tests/prepared_node_integration.sh npm
+      - name: Measure M1 (marginal storage per worktree) on Btrfs
+        run: WT0="$PWD/target/debug/wt0" VOLUME=/mnt/wt0-btrfs N=5 bash tests/measure_m1.sh
 
   windows:
     runs-on: windows-latest
@@ -142,6 +165,20 @@ jobs:
           TMP: R:\tmp
           TEMP: R:\tmp
         run: cargo test --all
+      # Main only: wt0 create runs ~20 s per worktree on ReFS today (a
+      # per-file clone cost under investigation), so this 4-minute step
+      # would set every PR's critical path. Linux measures on every run.
+      - name: Measure M1 (marginal storage per worktree) on ReFS
+        if: github.event_name == 'push'
+        shell: bash
+        # Git Bash's `df` reaches the R: drive through an MSYS translation
+        # layer we have not verified reports physical, clone-aware used
+        # bytes for a diskpart-created ReFS volume, so WT0_M1_PS_DRIVE routes
+        # tests/measure_m1.sh to `Get-PSDrive R | select Used` instead, which
+        # asks Windows for the volume's real usage directly.
+        env:
+          WT0_M1_PS_DRIVE: R
+        run: WT0="$PWD/target/debug/wt0.exe" VOLUME=/r/tmp N=5 bash tests/measure_m1.sh
 
   stress:
     # N agents arriving at once is the product's core scenario: many
@@ -162,17 +199,13 @@ jobs:
           WT0_STRESS_AGENTS: "24"
         run: cargo test --test concurrency_stress -- --nocapture
 
+  # Native ARM64 runner: no cross-linker to apt-install (that step alone took
+  # 26 s on a good day and 577 s on a bad one — the whole run's critical path)
+  # and the tests actually execute on the architecture.
   linux-arm64:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
-      - name: Install Linux ARM64 linker
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Cross-build
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --locked --target aarch64-unknown-linux-gnu -p worktree-zero
+      - run: cargo test --all --locked

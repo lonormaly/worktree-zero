@@ -21,6 +21,46 @@ whole runtime can be reclaimed safely later — even after a crash.
 > experimental Windows releases (ReFS/Dev Drive block-clone CoW, plain NTFS
 > fallback). FLAM and Builders Stack are the first measured design partners.
 
+## What a worktree costs you today — measured
+
+Most teams create a worktree with `git worktree add` and run their package
+manager's install inside it — no shared store, no wt0. Nobody sees the
+running cost, because it is spread across dozens of checkouts nobody
+remembers to delete. Measured on an isolated APFS volume, physical
+free-space deltas only, 3 worktrees per row unless noted:
+
+| Setup | Per extra worktree, today | Per extra worktree, wt0 | Ten worktrees, today → wt0 |
+| --- | ---: | ---: | ---: |
+| npm hoisted (Next app) | 388 MiB, 60–74 s | 4–5 MiB, 2–5 s | 3.8 GiB → 429 MiB |
+| Yarn classic (Next app) | 405 MiB, 7 s | ≈0–5 MiB, 3–4 s | 4.0 GiB → ≈430 MiB |
+| Bun hoisted, no store, cache on the same volume (Next app) | 4.5 MiB, 2 s | 2.7 MiB, 5 s | 45 MiB → 29 MiB |
+| Bun hoisted, no store, cache on the same volume (FLAM, 236k files) | 452 MiB, 97 s | 460 MiB, 148 s — no reduction, see below | 4.4 GiB → 4.5 GiB |
+| Bun global store / pnpm (FLAM) | 434 MiB, 62–113 s | 9 MiB, ~30 s | 5.1 GiB → 595 MiB |
+| `git worktree add` alone (FLAM checkout) | 368 MiB, 8 s | 9 MiB, 1 s | 3.6 GiB → 449 MiB |
+
+wt0 shares the tracked checkout in every row — that is the constant win,
+and the last row is that win on its own. Where wt0 does *not* help is the
+fourth row: a 236k-file hoisted `node_modules` costs the same ~2 KB of
+filesystem metadata per file whether wt0 clones it or Bun's own cache does
+(Bun clones package files out of a same-volume cache itself, which is why
+its rows are already small). The fix there is Bun's `isolated` linker with
+`globalStore = true` — one `bunfig.toml` line, the fifth row — which turns
+236k files into 12k links. Fixtures, instrument, and every raw number:
+[flam-migration.md](docs/design-partners/flam-migration.md#what-most-users-pay-today-2026-09-02),
+[dependency-link-trees.md](docs/research/dependency-link-trees.md),
+[drift.md](docs/design-partners/drift.md).
+
+- Adding a package inside a worktree costs the package, not the tree — every
+  manager tested wrote 5–6 MiB for one added package, never the tree's full
+  size ([drift.md](docs/design-partners/drift.md)).
+- A seeded `.next/cache` survives an edit and rebuild 4× faster and 85%
+  smaller than a cold one — 622 ms/4.3 MiB versus 2.5 s/28.5 MiB
+  ([drift.md](docs/design-partners/drift.md)).
+- The first worktree of a base commit always pays a one-time baseline —
+  517 MiB, measured on FLAM with a warm store — before any later worktree of
+  that commit clones for single-digit MiB
+  ([flam-migration.md](docs/design-partners/flam-migration.md)).
+
 ## The problem
 
 Agent swarms multiply everything about a checkout except the history.
@@ -41,6 +81,13 @@ sides):
 Each additional native worktree cost about 383 MiB. Each additional Worktree
 Zero runtime cost about 10 MiB — a **97% reduction in marginal storage** —
 and the fourth worktree still passed the repository's real test suite.
+
+That first-worktree row (-2.0%, essentially parity with native) predates
+deriving the baseline and the first prepared environment from the base
+checkout instead of a second physical copy of it
+([`flam-migration.md`](docs/design-partners/flam-migration.md#after---d13---the-first-worktree-2026-09-02)):
+measured on FLAM, the first worktree of a base commit now costs 15.7 MiB
+against a native 509 MiB.
 
 Duplication is only the first failure. Parallel agents **collide**: every dev
 server wants port 3000, every Compose stack wants the project name, every
@@ -77,9 +124,11 @@ manager's store is still recommended — it is the smallest footprint, and it
 shares across repositories, which a per-repository seal cannot. A checked-in
 `.wt0-seed` additionally clones the base checkout's build caches
 (`.nx/cache`, `.next/cache`) — and its `node_modules`, when the lockfile is
-identical — into every new worktree, so the first build starts warm and a
-plain `npm install` finds nothing to do (measured: three paths touched,
-0 MiB written). `wt0 run` applies the same ownership rule to Cargo
+identical and no cheaper native store (pnpm, Bun's global store, Yarn's
+`nodeLinker: pnpm`) is already active for it — into every new worktree, so
+the first build starts warm and a plain `npm install` finds nothing to do
+(measured: three paths touched, 0 MiB written). `wt0 run` applies the same
+ownership rule to Cargo
 target directories, Nx workspace state, and Wrangler local persistence.
 
 ### 2. Identity: collision-free by construction
@@ -177,6 +226,7 @@ and portable skill are the same implementation:
 ```bash
 brew tap lonormaly/wt0
 brew install wt0                   # macOS and Linux, prebuilt + checksummed
+npm i -g worktree-zero             # installs the `wt0` command; or: npx worktree-zero doctor
 ```
 
 ### Install for an agent

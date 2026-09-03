@@ -2500,7 +2500,7 @@ pub(crate) const CLONED_FILE_METADATA_BYTES: u64 = 2048;
 /// with a byte-identical lockfile, `npm install` after seeding touched three
 /// paths and wrote nothing, and Bun recreated only what was not seeded. With
 /// a different lockfile the reconcile leaves a mix of the base's layout and
-/// the worktree's, so the lockfile is the proof. Four conditions, in order,
+/// the worktree's, so the lockfile is the proof. Five conditions, in order,
 /// each with its own receipt reason:
 ///
 /// 1. the seed is the root `node_modules` (a nested workspace tree is only
@@ -2508,8 +2508,15 @@ pub(crate) const CLONED_FILE_METADATA_BYTES: u64 = 2048;
 /// 2. the worktree carries the manager's lockfile and it is byte-identical
 ///    to the base's, so both resolve to the same tree;
 /// 3. for Bun, base and worktree ask for the same linker layout (a global
-///    store link tree and a hoisted tree are different shapes); and
-/// 4. no live process holds the base tree open, so it is not mid-install.
+///    store link tree and a hoisted tree are different shapes);
+/// 4. the base's manager has no active native link-tree store (pnpm always,
+///    Bun's global store, Yarn's `nodeLinker: pnpm`) — cloning a hardlink
+///    tree turns hardlinks into wt0 clones that pay the full ~2 KB/file
+///    metadata cost, and a native warm install measured cheaper than that
+///    clone (docs/research/dependency-link-trees.md: Bun's global store 3 MiB
+///    native vs. 9 MiB wt0-seeded, docs/design-partners/flam-migration.md gap
+///    #7); and
+/// 5. no live process holds the base tree open, so it is not mid-install.
 ///
 /// What this does not judge is size: the receipt reports the file count, and
 /// `wt0 doctor` states what that count costs per worktree.
@@ -2525,12 +2532,21 @@ fn node_modules_seed_refusal(base: &Path, target: &Path, relative: &Path) -> Opt
             DEPENDENCY_SEED_REFUSAL.to_owned()
         });
     }
-    let bun = crate::runtime::detect_javascript_package_managers(target).as_slice() == ["bun"];
-    if bun
+    let managers = crate::runtime::detect_javascript_package_managers(target);
+    let manager = match managers.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    };
+    if manager == Some("bun")
         && crate::runtime::bun_isolated_global_store(base)
             != crate::runtime::bun_isolated_global_store(target)
     {
         return Some("base and worktree must use the same Bun linker layout".to_owned());
+    }
+    if let Some(store) =
+        manager.and_then(|manager| crate::runtime::native_link_tree_store(base, manager))
+    {
+        return Some(format!("native store is cheaper: {store}"));
     }
     // An install in flight would be cloned half-written; a failed probe is
     // treated as "in use" rather than waved through.
@@ -2579,6 +2595,39 @@ fn lockfiles_match(base: &Path, target: &Path) -> bool {
             .collect::<Vec<u8>>()
     };
     text(worktree) == text(base)
+}
+
+/// Whether `base`'s `node_modules` is a sound starting point for `wt0
+/// prepare` to seal a brand-new environment key at `target`, instead of
+/// installing into empty air: the same trust conditions as
+/// `node_modules_seed_refusal`'s lockfile, manager, and (for Bun) linker
+/// checks, minus the ones that do not apply here — native-store managers
+/// (pnpm, Yarn's `pnpm` linker) never reach a sealed prepare in the first
+/// place, and a live install on the base is caught here the same way.
+pub(crate) fn base_node_modules_seed_for_prepare(
+    base: &Path,
+    target: &Path,
+    manager: &str,
+) -> bool {
+    if !base.join("node_modules").is_dir() {
+        return false;
+    }
+    if !lockfiles_match(base, target) {
+        return false;
+    }
+    if crate::runtime::detect_javascript_package_managers(target) != [manager] {
+        return false;
+    }
+    if manager == "bun"
+        && crate::runtime::bun_isolated_global_store(base)
+            != crate::runtime::bun_isolated_global_store(target)
+    {
+        return false;
+    }
+    matches!(
+        crate::process::live_open_path(&base.join("node_modules")),
+        Ok(None)
+    )
 }
 
 /// Clone each seed path from the base checkout into `target` with

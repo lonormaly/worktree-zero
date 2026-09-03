@@ -1,0 +1,36 @@
+{
+  "name": "worktree-zero",
+  "version": "0.0.0-dev",
+  "description": "Thin, copy-on-write worktrees for coding agents -- create, prepare, measure, and safely remove them from the command line.",
+  "bin": {
+    "wt0": "bin/wt0.js"
+  },
+  "files": [
+    "bin/wt0.js"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lonormaly/worktree-zero.git"
+  },
+  "homepage": "https://github.com/lonormaly/worktree-zero",
+  "bugs": "https://github.com/lonormaly/worktree-zero/issues",
+  "keywords": [
+    "git",
+    "worktree",
+    "agents",
+    "copy-on-write",
+    "cli"
+  ],
+  "optionalDependencies": {
+    "wt0-darwin-arm64": "0.0.0-dev",
+    "wt0-darwin-x64": "0.0.0-dev",
+    "wt0-linux-x64": "0.0.0-dev",
+    "wt0-linux-arm64": "0.0.0-dev",
+    "wt0-win32-x64": "0.0.0-dev",
+    "wt0-win32-arm64": "0.0.0-dev"
+  }
+}
