@@ -192,6 +192,153 @@ fn gc_retains_unmerged_branches_without_force() -> Result<()> {
 }
 
 #[test]
+fn delete_local_branch_keeps_an_unmerged_branch_and_names_the_current_checkout() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let current_branch = git_path_output(
+        &fixture.repo,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )?;
+
+    git(&fixture.repo, ["checkout", "-q", "-b", "agent/unmerged"])?;
+    fs::write(fixture.repo.join("agent.txt"), "result\n")?;
+    git(&fixture.repo, ["add", "agent.txt"])?;
+    git(&fixture.repo, ["commit", "-q", "-m", "agent result"])?;
+    git(&fixture.repo, ["checkout", "-q", &current_branch])?;
+
+    let error = delete_local_branch(&repo, "refs/heads/agent/unmerged", false, None)
+        .expect_err("a branch with a real commit of its own must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("is not merged into {current_branch}")),
+        "{message}"
+    );
+    assert!(message.contains("it is kept"), "{message}");
+    assert!(branch_exists(&repo, "agent/unmerged")?);
+    Ok(())
+}
+
+/// A worktree can be created from a base ahead of whatever the main checkout
+/// happens to be on — an agent's `--base` picks a newer commit while the
+/// main checkout sits on an older branch. Deleting that worktree's branch
+/// while it never grew a commit of its own would otherwise hit git's "not
+/// fully merged" refusal even though nothing is lost.
+#[test]
+fn delete_local_branch_deletes_a_branch_that_never_moved_past_its_base() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let current_branch = git_path_output(
+        &fixture.repo,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )?;
+
+    git(&fixture.repo, ["checkout", "-q", "-b", "ahead"])?;
+    fs::write(fixture.repo.join("ahead.txt"), "progress\n")?;
+    git(&fixture.repo, ["add", "ahead.txt"])?;
+    git(&fixture.repo, ["commit", "-q", "-m", "progress"])?;
+    let base = resolve_commit(&repo, "ahead")?;
+    git(&fixture.repo, ["branch", "agent/idle", &base])?;
+    git(&fixture.repo, ["checkout", "-q", &current_branch])?;
+
+    delete_local_branch(&repo, "refs/heads/agent/idle", false, Some(&base))?;
+    assert!(!branch_exists(&repo, "agent/idle")?);
+    Ok(())
+}
+
+/// Work that landed on the remote's default branch by another route (a
+/// squash-merge, a push from elsewhere) is safe to delete locally even
+/// before the main checkout's own branch catches up.
+#[test]
+fn delete_local_branch_deletes_a_branch_already_contained_by_origins_default() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let current_branch = git_path_output(
+        &fixture.repo,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )?;
+    let original = resolve_commit(&repo, "HEAD")?;
+
+    let bare = fixture.root.join("origin.git");
+    fs::create_dir_all(&bare)?;
+    git(&bare, ["init", "-q", "--bare"])?;
+    git(
+        &fixture.repo,
+        ["remote", "add", "origin", bare.to_str().unwrap()],
+    )?;
+    git(
+        &fixture.repo,
+        [
+            "push",
+            "-q",
+            "origin",
+            &format!("{current_branch}:{current_branch}"),
+        ],
+    )?;
+    git(
+        &fixture.repo,
+        [
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            &format!("refs/remotes/origin/{current_branch}"),
+        ],
+    )?;
+
+    git(&fixture.repo, ["checkout", "-q", "-b", "agent/shipped"])?;
+    fs::write(fixture.repo.join("shipped.txt"), "landed upstream\n")?;
+    git(&fixture.repo, ["add", "shipped.txt"])?;
+    git(&fixture.repo, ["commit", "-q", "-m", "shipped work"])?;
+    // Land it on origin's default branch through some other route, then
+    // refresh the local tracking ref — the main checkout itself never moves.
+    git(
+        &fixture.repo,
+        [
+            "push",
+            "-q",
+            "origin",
+            &format!("refs/heads/agent/shipped:refs/heads/{current_branch}"),
+        ],
+    )?;
+    git(&fixture.repo, ["fetch", "-q", "origin"])?;
+    git(&fixture.repo, ["checkout", "-q", &current_branch])?;
+    assert_eq!(resolve_commit(&repo, "HEAD")?, original);
+
+    delete_local_branch(&repo, "refs/heads/agent/shipped", false, Some(&original))?;
+    assert!(!branch_exists(&repo, "agent/shipped")?);
+    Ok(())
+}
+
+#[test]
+fn refine_remove_refusal_reframes_gits_dirty_worktree_message() {
+    let target = Path::new("/tmp/some/worktree");
+    let original = anyhow::anyhow!(
+        "git worktree remove failed (exit status: 128): fatal: '/tmp/some/worktree' contains \
+         modified or untracked files, use --force to delete it"
+    );
+    let refined = refine_remove_refusal(target, original);
+    let rendered = format!("{refined:?}");
+    assert!(
+        rendered.starts_with(
+            "refusing to remove /tmp/some/worktree: it has modified or untracked files — \
+             commit them, pass --commit to keep them on the branch, or --force to discard"
+        ),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Caused by"), "{rendered}");
+    assert!(
+        rendered.contains("contains modified or untracked files"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn refine_remove_refusal_leaves_unrelated_errors_alone() {
+    let target = Path::new("/tmp/some/worktree");
+    let original = anyhow::anyhow!("some other git failure");
+    let refined = refine_remove_refusal(target, original);
+    assert_eq!(refined.to_string(), "some other git failure");
+}
+
+#[test]
 fn gc_preserves_unowned_and_unknown_ignored_state() -> Result<()> {
     let fixture = Fixture::new()?;
     fs::write(

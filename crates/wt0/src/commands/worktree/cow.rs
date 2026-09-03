@@ -10,6 +10,42 @@ use uuid::Uuid;
 
 const BASELINE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// Which physical mechanism `clone_tree` used to move a directory's files:
+/// one atomic whole-directory clone, or the entry-by-entry fallback used
+/// when the filesystem has no whole-directory primitive (or it failed).
+/// The two cost very different amounts of filesystem metadata per file —
+/// measured on APFS at ≈400 B/file for a whole-directory `clonefile` versus
+/// ≈2 KB/file entry by entry (`docs/design-partners/flam-migration.md`,
+/// "Verification — hoisted node_modules per-worktree cost") — so a silent
+/// fallback from one to the other is exactly the kind of thing that made an
+/// earlier measurement land 5x higher than the settled number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloneKind {
+    /// One atomic whole-directory clone (APFS `clonefile`, Windows ReFS
+    /// block clone).
+    Directory,
+    /// Entry-by-entry fallback: one clone (or symlink recreation, or
+    /// directory creation) per tree entry.
+    PerFile,
+}
+
+impl CloneKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Directory => "directory",
+            Self::PerFile => "per-file",
+        }
+    }
+}
+
+/// `WT0_TRACE=1` prints which clone mechanism ran for every `clone_tree`
+/// call, to stderr — the fastest way to catch a silent fallback from the
+/// cheap whole-directory clone to the entry-by-entry path without
+/// instrumenting a benchmark script by hand.
+pub(crate) fn trace_enabled() -> bool {
+    std::env::var_os("WT0_TRACE").is_some_and(|value| value == "1")
+}
+
 /// Probe whether the filesystem holding both the state directory and the
 /// destination supports copy-on-write cloning: APFS `clonefile` on macOS,
 /// `FICLONE` reflink on Linux (Btrfs/XFS), and ReFS block cloning on Windows
@@ -143,12 +179,26 @@ fn preserve_modified_time(source: &Path, destination: &Path) -> Result<()> {
 /// recreated as symlinks. Equivalent to the former `cp -c -R source/. dest`
 /// without the platform-specific `cp` dependency. On APFS the whole tree is
 /// cloned in one `clonefile` call, which is tens of times faster than
-/// cloning file by file.
-pub(crate) fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
-    if clone_tree_atomically(source, destination)? {
-        return Ok(());
+/// cloning file by file — and, per the measurement in `CloneKind`'s doc
+/// comment, roughly 5x cheaper in filesystem metadata too. Returns which
+/// mechanism actually ran, so a caller building a receipt (or `WT0_TRACE`)
+/// can tell the two apart instead of assuming the cheap path was taken.
+pub(crate) fn clone_tree(source: &Path, destination: &Path) -> Result<CloneKind> {
+    let kind = if clone_tree_atomically(source, destination)? {
+        CloneKind::Directory
+    } else {
+        clone_tree_entries(source, destination)?;
+        CloneKind::PerFile
+    };
+    if trace_enabled() {
+        eprintln!(
+            "wt0 trace: clone {} -> {} ({})",
+            source.display(),
+            destination.display(),
+            kind.label()
+        );
     }
-    clone_tree_entries(source, destination)
+    Ok(kind)
 }
 
 /// APFS clones a directory hierarchy atomically, metadata included. The clone

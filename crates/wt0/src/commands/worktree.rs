@@ -314,6 +314,8 @@ fn add(args: WorktreeAdd, json: bool) -> Result<()> {
             "slug": branch_slug(&args.branch),
             "reused": created.reused,
             "seeded": created.seeded,
+            "dependencies": created.dependencies,
+            "clone": created.clone_kind.map(cow::CloneKind::label),
         }));
     } else {
         eprintln!("mode: {}", created.mode);
@@ -334,6 +336,16 @@ fn add(args: WorktreeAdd, json: bool) -> Result<()> {
         eprintln!("runtime: {}", created.lease.runtime_id);
         println!("{}", created.target.display());
     }
+    // A JavaScript manager was detected but the new worktree has no usable
+    // dependency tree yet — never blocks the create, just says what to do
+    // next. Printed on stderr regardless of --json so an agent piping stdout
+    // still sees it.
+    if created.dependencies == Some("not-prepared") {
+        eprintln!(
+            "next: run `wt0 prepare --apply` in {} (wt0 run does this automatically)",
+            created.target.display()
+        );
+    }
     Ok(())
 }
 
@@ -345,6 +357,12 @@ struct CreatedWorktree {
     lease: RuntimeLease,
     reused: bool,
     seeded: Vec<serde_json::Value>,
+    /// "prepared" | "native" | "not-prepared", or `None` when no JavaScript
+    /// package manager was detected. See `runtime::dependency_classification`.
+    dependencies: Option<&'static str>,
+    /// How the baseline's tracked files were cloned into this worktree:
+    /// `None` for overlay and plain-checkout modes, which do not clone.
+    clone_kind: Option<cow::CloneKind>,
 }
 
 fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
@@ -378,11 +396,19 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         .filter(|owner| !owner.is_empty());
     let mode = select_populate_mode(&repo, target_parent, args.require_cow)?;
 
-    match mode {
-        PopulateMode::CowClone => add_cow_worktree(&repo, &args.branch, &target, &base)?,
-        PopulateMode::Overlay => add_overlay_worktree(&repo, &args.branch, &target, &base)?,
-        PopulateMode::GitCheckout => add_git_worktree(&repo, &args.branch, &target, &base)?,
-    }
+    // `Some` only for `CowClone`: overlay and plain-checkout modes populate
+    // the worktree by other means and never call `cow::clone_tree`.
+    let clone_kind = match mode {
+        PopulateMode::CowClone => Some(add_cow_worktree(&repo, &args.branch, &target, &base)?),
+        PopulateMode::Overlay => {
+            add_overlay_worktree(&repo, &args.branch, &target, &base)?;
+            None
+        }
+        PopulateMode::GitCheckout => {
+            add_git_worktree(&repo, &args.branch, &target, &base)?;
+            None
+        }
+    };
 
     // Seed ignored trees from the base checkout before anything runs in the
     // worktree: the package manager and build tools then find a warm tree and
@@ -417,7 +443,8 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
             Err(error) => {
                 ports::release(&target);
                 let _ = force_teardown(&repo, &target);
-                let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
+                let _ =
+                    delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true, None);
                 return Err(error).context("record worktree ownership lease");
             }
         }
@@ -425,7 +452,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
     if args.ephemeral {
         if let Err(error) = mark_ephemeral(&target) {
             let _ = force_teardown(&repo, &target);
-            let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
+            let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true, None);
             return Err(error).context("mark worktree ephemeral");
         }
     }
@@ -437,7 +464,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         Ok(generated) => generated,
         Err(error) => {
             let _ = force_teardown(&repo, &target);
-            let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
+            let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true, None);
             return Err(error).context("prepare owned generated runtime");
         }
     };
@@ -461,10 +488,15 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         crate::hooks::run_hook(&target, crate::hooks::HookEvent::PostCreate, &hook_env)
     {
         let _ = force_teardown(&repo, &target);
-        let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
+        let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true, None);
         return Err(error).context("post-create hook failed; worktree rolled back");
     }
 
+    // Reuses the same classification `wt0 doctor` reports, computed after
+    // populate + seeding so a seeded or already-native tree is credited.
+    let dependencies = crate::runtime::dependency_classification(&target)
+        .ok()
+        .flatten();
     crate::events::record(
         &repo.common_git_dir,
         "created",
@@ -487,6 +519,8 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         lease,
         reused: false,
         seeded,
+        dependencies,
+        clone_kind,
     })
 }
 
@@ -558,6 +592,9 @@ fn reuse_existing_runtime(
             "runtime_id": lease.runtime_id,
         }),
     );
+    let dependencies = crate::runtime::dependency_classification(&existing)
+        .ok()
+        .flatten();
     // same_path proved `existing` and `target` name one location; report the
     // request's resolved spelling so a retried create's receipt is
     // byte-identical to the original on every platform.
@@ -581,6 +618,8 @@ fn reuse_existing_runtime(
         },
         reused: true,
         seeded: Vec::new(),
+        dependencies,
+        clone_kind: None,
     })
 }
 
@@ -887,7 +926,12 @@ impl Drop for StateLock {
     }
 }
 
-fn add_cow_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str) -> Result<()> {
+fn add_cow_worktree(
+    repo: &RepoContext,
+    branch: &str,
+    target: &Path,
+    base: &str,
+) -> Result<cow::CloneKind> {
     let clone_hint = target.parent().context("worktree path has no parent")?;
     let baseline = cow::ensure_baseline(repo, base, Some(clone_hint))?;
     let add_result = run_git_common(
@@ -906,25 +950,28 @@ fn add_cow_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str)
         return Err(error.context("create linked worktree"));
     }
 
-    let populate_result = (|| -> Result<()> {
+    let populate_result = (|| -> Result<cow::CloneKind> {
         if !adopt_baseline_index(repo, &baseline, target)? {
             run_git_at(target, ["read-tree", "HEAD"])
                 .context("initialize linked-worktree index")?;
         }
-        cow::clone_tree(&baseline, target).context("clone cached baseline")?;
+        let clone_kind = cow::clone_tree(&baseline, target).context("clone cached baseline")?;
         ensure_clean(target).context("verify cloned worktree")?;
         fs::write(
             source_migration_marker(target)?,
             format!("{base}\n{base}\n"),
         )
-        .context("record cloned source identity")
+        .context("record cloned source identity")?;
+        Ok(clone_kind)
     })();
 
-    if let Err(error) = populate_result {
-        rollback_created_worktree(repo, target, branch);
-        return Err(error);
+    match populate_result {
+        Ok(clone_kind) => Ok(clone_kind),
+        Err(error) => {
+            rollback_created_worktree(repo, target, branch);
+            Err(error)
+        }
     }
-    Ok(())
 }
 
 /// Start a cloned worktree from the baseline's stat-populated index instead
@@ -1059,7 +1106,7 @@ fn add_overlay_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &
         let _ = fs::remove_dir_all(target);
         let _ = fs::remove_dir_all(&overlay_dir);
         let _ = run_git_common(repo, [OsStr::new("worktree"), OsStr::new("prune")]);
-        let _ = delete_local_branch(repo, branch, true);
+        let _ = delete_local_branch(repo, branch, true, None);
         return Err(error);
     }
     Ok(())
@@ -1122,6 +1169,10 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     let overlay = overlay::state(&repo, &target);
 
     let removed_runtime_id = runtime_identity(&target).ok();
+    // Captured before the worktree (and its ownership marker) is gone: a
+    // later --delete-branch refusal needs the base commit to tell "no
+    // commits of its own" from a branch that genuinely diverged.
+    let branch_base = stored_lease(&target).ok().and_then(|lease| lease.base);
     let mut hook_env = vec![
         ("WT0_WORKTREE", target.display().to_string()),
         ("WT0_REPO_ROOT", repo.main_worktree.display().to_string()),
@@ -1172,7 +1223,8 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
             command.arg("--force");
         }
         command.arg(&target);
-        run_command(&mut command, "git worktree remove")?;
+        run_command(&mut command, "git worktree remove")
+            .map_err(|error| refine_remove_refusal(&target, error))?;
     }
 
     ports::release(&release_target);
@@ -1192,7 +1244,7 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     let mut branch_deleted = false;
     if args.delete_branch {
         let branch = branch.context("cannot delete branch for a detached worktree")?;
-        delete_local_branch(&repo, &branch, args.force)?;
+        delete_local_branch(&repo, &branch, args.force, branch_base.as_deref())?;
         branch_deleted = true;
     }
     if json {
@@ -1206,6 +1258,25 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         println!("{}", target.display());
     }
     Ok(())
+}
+
+/// Git's own "contains modified or untracked files" refusal names the
+/// worktree but not what to do about it. Reframe it as wt0's own refusal
+/// with the three ways out, keeping git's original text as the `caused by`
+/// cause rather than discarding it.
+fn refine_remove_refusal(target: &Path, error: anyhow::Error) -> anyhow::Error {
+    if error
+        .to_string()
+        .contains("contains modified or untracked files")
+    {
+        error.context(format!(
+            "refusing to remove {}: it has modified or untracked files — commit them, pass \
+             --commit to keep them on the branch, or --force to discard",
+            target.display()
+        ))
+    } else {
+        error
+    }
 }
 
 /// Resolve a user-supplied worktree reference — an explicit path, a branch
@@ -1690,7 +1761,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
                 );
                 if args.delete_branches {
                     if let Some(branch) = &entry.branch {
-                        if delete_local_branch(repo, branch, false).is_err() {
+                        if delete_local_branch(repo, branch, false, None).is_err() {
                             retained_branches.push(short.to_owned());
                         } else {
                             deleted_branches.push(short.to_owned());
@@ -1714,7 +1785,17 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
     })
 }
 
-fn delete_local_branch(repo: &RepoContext, branch_ref: &str, force: bool) -> Result<()> {
+/// `base` is the commit the removed worktree was created from (its lease's
+/// `base`, read before removal deleted the marker) — used only to recognize
+/// "this branch never moved past its base" when `-d` refuses. Callers that
+/// already pass `force: true` (rollback paths) never reach that logic, so
+/// they may pass `None`.
+fn delete_local_branch(
+    repo: &RepoContext,
+    branch_ref: &str,
+    force: bool,
+    base: Option<&str>,
+) -> Result<()> {
     let branch = branch_ref.strip_prefix("refs/heads/").unwrap_or(branch_ref);
     if branch == "main" || branch == "master" {
         bail!("refusing to delete primary branch '{branch}'");
@@ -1723,11 +1804,122 @@ fn delete_local_branch(repo: &RepoContext, branch_ref: &str, force: bool) -> Res
     // not checked out anywhere, so it needs the same serialization as the
     // registry mutations it races against.
     let _registry = StateLock::registry(&repo.common_git_dir);
+    if force {
+        return run_branch_delete(repo, branch, true);
+    }
+    match run_branch_delete(repo, branch, false) {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains("is not fully merged") => {
+            handle_unmerged_branch(repo, branch, base)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn run_branch_delete(repo: &RepoContext, branch: &str, force: bool) -> Result<()> {
     let mut command = Command::new("git");
     command
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))
         .args(["branch", if force { "-D" } else { "-d" }, branch]);
     run_command(&mut command, "delete worktree branch")
+}
+
+/// `git branch -d` refuses on "not fully merged" — Git's language for
+/// "not reachable from wherever HEAD is in the checkout you ran this from",
+/// which for an agent removing a worktree from elsewhere is rarely obvious.
+/// Reframe it against the main checkout's actual current branch. When
+/// nothing is actually lost — the branch never moved past its own base, or
+/// the remote's default branch already carries its commits — delete it
+/// instead of refusing.
+fn handle_unmerged_branch(repo: &RepoContext, branch: &str, base: Option<&str>) -> Result<()> {
+    let current = main_checkout_branch(repo);
+    let tip = branch_tip(repo, branch);
+    let origin_ref = origin_default_ref(repo);
+
+    let reason = if tip
+        .as_deref()
+        .zip(base)
+        .is_some_and(|(tip, base)| tip == base)
+    {
+        Some("it has no commits of its own".to_owned())
+    } else {
+        tip.as_deref()
+            .zip(origin_ref.as_deref())
+            .and_then(|(tip, origin_ref)| {
+                let contained =
+                    git_output_common(repo, ["merge-base", "--is-ancestor", tip, origin_ref])
+                        .ok()
+                        .is_some_and(|output| output.status.success());
+                contained.then(|| format!("{origin_ref} already contains it"))
+            })
+    };
+
+    if let Some(reason) = reason {
+        eprintln!("branch {branch} is not merged into {current}; {reason} — deleting it");
+        return run_branch_delete(repo, branch, true);
+    }
+
+    bail!(
+        "branch {branch} is not merged into {current}; it is kept — delete it with \
+         git branch -D if intended"
+    );
+}
+
+/// The branch currently checked out in the repository's main worktree — the
+/// branch git actually measured "not fully merged" against, whichever
+/// checkout the remove was invoked from.
+fn main_checkout_branch(repo: &RepoContext) -> String {
+    git_path_output(
+        &repo.main_worktree,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .ok()
+    .filter(|name| !name.is_empty())
+    .unwrap_or_else(|| "a detached HEAD".to_owned())
+}
+
+fn branch_tip(repo: &RepoContext, branch: &str) -> Option<String> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let output = git_output_common(repo, ["rev-parse", "--verify", "--quiet", &branch_ref]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|text| text.trim().to_owned())
+}
+
+/// The remote's default branch as a remote-tracking ref (`origin/main`), if
+/// discoverable without touching the network: the symref a clone (or
+/// `git remote set-head`) records at `refs/remotes/origin/HEAD`, falling
+/// back to whichever of `origin/main`/`origin/master` actually exists.
+fn origin_default_ref(repo: &RepoContext) -> Option<String> {
+    if let Ok(output) = git_output_common(
+        repo,
+        ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    ) {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                let short = text
+                    .trim()
+                    .strip_prefix("refs/remotes/")
+                    .unwrap_or(text.trim());
+                if !short.is_empty() {
+                    return Some(short.to_owned());
+                }
+            }
+        }
+    }
+    for candidate in ["origin/main", "origin/master"] {
+        let candidate_ref = format!("refs/remotes/{candidate}");
+        if git_output_common(repo, ["rev-parse", "--verify", "--quiet", &candidate_ref])
+            .ok()
+            .is_some_and(|output| output.status.success())
+        {
+            return Some(candidate.to_owned());
+        }
+    }
+    None
 }
 
 /// A linked worktree as reported by `git worktree list --porcelain`.
@@ -2487,10 +2679,27 @@ pub(crate) fn project_seed_policy(root: &Path) -> Result<Vec<PathBuf>> {
 const DEPENDENCY_SEED_REFUSAL: &str =
     "no lockfile proves the base tree matches; prepared environments (wt0 prepare) handle that";
 
-/// Filesystem metadata a cloned file costs on APFS, measured: 236,332 files
-/// cost 471 MiB per worktree, 11,687 cost 5 MiB. Copy-on-write shares blocks,
-/// not inodes, so this — not the bytes — is what a seeded tree costs.
-pub(crate) const CLONED_FILE_METADATA_BYTES: u64 = 2048;
+/// Filesystem metadata one file costs a *native* per-file install (no CoW):
+/// gap #7's original measurement, ≈2 KB/file on APFS. Calibrated against a
+/// script that cloned file by file rather than through wt0's own
+/// whole-directory `clonefile`, so it overstates wt0's own cost by roughly
+/// 5x — see `CLONED_FILE_METADATA_BYTES` and
+/// `docs/design-partners/flam-migration.md` ("Verification — hoisted
+/// node_modules per-worktree cost", 2026-09-03).
+pub(crate) const NATIVE_INSTALL_FILE_METADATA_BYTES: u64 = 2048;
+
+/// Filesystem metadata one file costs wt0's own clone (`cow::clone_tree`'s
+/// whole-directory `clonefile`/reflink/block-clone path): settled at
+/// ≈400 B/file on APFS across two independent measurements — a 2×2 seed/
+/// prepare matrix and a six-worktree interleaved re-run, both landing
+/// within 1% of each other (236,332 files → 89–91 MiB per worktree; see
+/// `docs/design-partners/flam-migration.md`, "Verification — hoisted
+/// node_modules per-worktree cost", 2026-09-03). Copy-on-write shares
+/// blocks, not inodes, so this — not the bytes — is what a cloned tree
+/// costs; a silent fallback to the entry-by-entry path instead costs
+/// `NATIVE_INSTALL_FILE_METADATA_BYTES` per file, roughly 5x more — see
+/// `cow::CloneKind`.
+pub(crate) const CLONED_FILE_METADATA_BYTES: u64 = 400;
 
 /// Why this `node_modules` seed is refused, or `None` when cloning it is
 /// sound: the package manager's ordinary install then reconciles a tree that
@@ -2651,13 +2860,18 @@ fn seed_from_base(repo: &RepoContext, target: &Path) -> Vec<serde_json::Value> {
     for relative in policy {
         let source = repo.top_level.join(&relative);
         let destination = target.join(&relative);
-        let receipt = |status: &str, reason: Option<String>, files: u64, bytes: u64| {
+        let receipt = |status: &str,
+                       reason: Option<String>,
+                       files: u64,
+                       bytes: u64,
+                       clone: Option<cow::CloneKind>| {
             json!({
                 "path": relative.to_string_lossy(),
                 "status": status,
                 "reason": reason,
                 "files": files,
                 "logical_bytes": bytes,
+                "clone": clone.map(cow::CloneKind::label),
             })
         };
         // A dependency tree is seeded only when it is provably cheap and sound
@@ -2667,12 +2881,12 @@ fn seed_from_base(repo: &RepoContext, target: &Path) -> Vec<serde_json::Value> {
             .any(|component| component.as_os_str() == "node_modules")
         {
             if let Some(reason) = node_modules_seed_refusal(&repo.top_level, target, &relative) {
-                receipts.push(receipt("refused", Some(reason), 0, 0));
+                receipts.push(receipt("refused", Some(reason), 0, 0, None));
                 continue;
             }
         }
         if !source.exists() {
-            receipts.push(receipt("absent", None, 0, 0));
+            receipts.push(receipt("absent", None, 0, 0, None));
             continue;
         }
         // The destination does not exist yet, so a `dir/` ignore pattern only
@@ -2698,28 +2912,38 @@ fn seed_from_base(repo: &RepoContext, target: &Path) -> Vec<serde_json::Value> {
                 ),
                 0,
                 0,
+                None,
             ));
             continue;
         }
         if destination.exists() {
-            receipts.push(receipt("skipped", Some("already present".to_owned()), 0, 0));
+            receipts.push(receipt(
+                "skipped",
+                Some("already present".to_owned()),
+                0,
+                0,
+                None,
+            ));
             continue;
         }
-        let cloned = (|| -> Result<()> {
+        // `None` for a lone file: `clone_file` is always one CoW clone, and
+        // the directory-vs-per-file distinction only applies to a tree.
+        let cloned = (|| -> Result<Option<cow::CloneKind>> {
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
             if source.is_dir() {
                 fs::create_dir(&destination)?;
-                cow::clone_tree(&source, &destination)
+                Ok(Some(cow::clone_tree(&source, &destination)?))
             } else {
-                cow::clone_file(&source, &destination)
+                cow::clone_file(&source, &destination)?;
+                Ok(None)
             }
         })();
         match cloned {
-            Ok(()) => {
+            Ok(clone_kind) => {
                 let (files, bytes) = tree_size(&destination);
-                receipts.push(receipt("seeded", None, files, bytes));
+                receipts.push(receipt("seeded", None, files, bytes, clone_kind));
             }
             Err(error) => {
                 let _ = if destination.is_dir() {
@@ -2727,7 +2951,7 @@ fn seed_from_base(repo: &RepoContext, target: &Path) -> Vec<serde_json::Value> {
                 } else {
                     fs::remove_file(&destination)
                 };
-                receipts.push(receipt("skipped", Some(format!("{error:#}")), 0, 0));
+                receipts.push(receipt("skipped", Some(format!("{error:#}")), 0, 0, None));
             }
         }
     }
@@ -3149,7 +3373,7 @@ fn ensure_clean(worktree: &Path) -> Result<()> {
 
 fn rollback_created_worktree(repo: &RepoContext, target: &Path, branch: &str) {
     let _ = remove_worktree_force(repo, target);
-    let _ = delete_local_branch(repo, branch, true);
+    let _ = delete_local_branch(repo, branch, true, None);
 }
 
 fn remove_worktree_force(repo: &RepoContext, target: &Path) -> Result<()> {

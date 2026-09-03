@@ -40,6 +40,14 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   ready" in `wt0 doctor` after an in-worktree install, and `wt0 prepare
   --apply` correctly refuses to re-seal over the resulting dirty diff but
   doesn't yet say why or how to fix it.
+- **README FAQ.** A new `## FAQ` section answers the questions an
+  independent reviewer hit first installing from npm and running wt0 on a
+  fresh Next app and a real Bun monorepo: the npm 404, where a worktree
+  lives, what it costs, why a native store still matters once wt0 shares
+  files, whether an agent's `npm install` breaks that sharing, whether
+  `gc`/`remove` can lose work, what slots/port windows/`WT0_SLUG` are, crash
+  recovery, Windows support, whether `doctor`'s "not ready" blocks
+  `create`, and what simgit is.
 
 ### Changed
 
@@ -121,6 +129,78 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   optimization (`cow.rs`'s `clone_tree_atomically`), which cuts the
   metadata cost per cloned file roughly 5x. The README's fourth row and
   caveat now state 89 MiB (marginal) / 179 MiB (first worktree) plainly.
+- **`wt0 create` says when dependencies are not shared yet.** Previously
+  `create` succeeded silently even with no usable `node_modules`, while
+  `doctor` was the only place that said so. Now, when a JavaScript manager
+  is detected and its dependency tree is not attached or native, `create`
+  prints ``next: run `wt0 prepare --apply` in <path> (wt0 run does this
+  automatically)`` to stderr — informational only, it never blocks the
+  create — and the `--json` receipt gains
+  `"dependencies": "prepared" | "native" | "not-prepared"`, the same
+  classification `doctor` computes (factored into one shared function so
+  the two can never disagree).
+- **`wt0 remove` reframes git's dirty-worktree refusal.** Instead of
+  surfacing git's raw `contains modified or untracked files, use --force to
+  delete it`, `wt0 remove` now leads with `refusing to remove <path>: it
+  has modified or untracked files — commit them, pass --commit to keep them
+  on the branch, or --force to discard`, with git's own text kept as the
+  `Caused by` cause.
+- **`wt0 remove --delete-branch` explains "not fully merged" against the
+  right branch, and skips the refusal when nothing is lost.** Git's message
+  names whichever branch happens to be checked out in the main checkout —
+  not necessarily one the removed worktree's agent ever saw. `wt0 remove`
+  now prints `branch <name> is not merged into <current branch of the main
+  checkout>; it is kept — delete it with git branch -D if intended`, and
+  deletes the branch instead of refusing when nothing is actually lost: its
+  tip never moved past its own base (`it has no commits of its own`), or
+  the remote's default branch already carries its commits (`origin/<default>
+  already contains it`).
+- **`wt0 prepare`'s human output calls the field what it is.** The
+  `stale dependency layout: N MiB` line is now `dependency tree to replace:
+  N MiB` (the JSON key `stale_logical_bytes` is unchanged); it also no
+  longer reports the size of the newly attached environment as "to
+  replace" when there was no prior `node_modules` — the first seal of an
+  empty tree now correctly shows 0.
+- **`wt0 doctor` stops recommending a seal it would never do, and explains a
+  budget-only "not ready."** The `` action: seal the worktree-local
+  post-install files with `wt0 prepare --apply` `` line no longer prints
+  when the dependency classification is already a native store (pnpm,
+  Yarn's pnpm linker or PnP, Bun's global store) — it previously appeared
+  alongside `dependencies: native store (...)`, which FLAM's own run
+  surfaced as a contradictory pair of lines. The verdict's shortfalls also
+  now include "generated state exceeds the default budget (...)" when that
+  is the only reason `ready` is `no`, instead of misreporting `holds`.
+- **`doctor`'s per-file metadata advice was calibrated against the wrong
+  clone.** `CLONED_FILE_METADATA_BYTES` (2 KB/file) was measured against a
+  file-by-file clone script, not wt0's own whole-directory `clonefile` —
+  independently re-verified this session at ≈400 B/file (two measurements
+  within 1% of each other; see
+  `docs/design-partners/flam-migration.md`, "Verification — hoisted
+  node_modules per-worktree cost"). It is now
+  `NATIVE_INSTALL_FILE_METADATA_BYTES = 2048` (context: what a plain
+  install costs) and `CLONED_FILE_METADATA_BYTES = 400` (what wt0's own
+  clone costs — the number the 20 MiB advice bar is about). `doctor`'s
+  `node_modules` advice now states both: "a native install pays about
+  X MiB ... (~2 KB/file measured), a wt0 seed or attach about Y MiB
+  (~400 B/file)".
+- **The clone path is no longer silent.** `cow::clone_tree` now returns
+  which mechanism it used — one atomic whole-directory clone, or the
+  entry-by-entry fallback — instead of discarding it: a silent fallback
+  from the cheap path to the expensive one is exactly what made an earlier
+  measurement land 5x higher than the settled number. `wt0 create`'s
+  receipt gains `"clone": "directory" | "per-file"` for the baseline clone
+  and for each `.wt0-seed` entry; `wt0 prepare`'s receipt gains the same
+  field for the attach/seal step. `WT0_TRACE=1` prints every clone's
+  mechanism to stderr as it happens.
+
+### Fixed
+
+- **`wt0 prepare`'s dependency-setup errors name the fix, not just the
+  symptom.** `node_modules is not ignored in <root>` now continues:
+  `add "node_modules/" to a committed .gitignore (an uncommitted
+  .gitignore does not reach a worktree)`. A missing lockfile now names all
+  four managers' lockfiles and says which one this manager needs committed,
+  instead of just `<manager> lockfile was not found`.
 
 ### Fixed
 

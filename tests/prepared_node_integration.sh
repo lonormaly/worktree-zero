@@ -140,6 +140,10 @@ if [[ "$manager" == npm ]]; then
   git -C "$base_repo" worktree add -qb frombase "$frombase"
   "$binary" prepare "$frombase" --apply --json > "$base_repo/frombase-receipt.json"
   grep -q "derived from the base checkout's node_modules" "$base_repo/frombase-receipt.json"
+  # The first seal of an empty tree has nothing to replace: node_modules did
+  # not exist in $frombase before this call, so stale_logical_bytes must stay
+  # 0 even though the attach above just filled node_modules in.
+  grep -q '"stale_logical_bytes": 0' "$base_repo/frombase-receipt.json"
   "$binary" doctor "$frombase" --json >/dev/null
   node -e "if (!require('$frombase/node_modules/is-even')(4)) process.exit(1)"
   git -C "$base_repo" worktree remove --force "$frombase"
