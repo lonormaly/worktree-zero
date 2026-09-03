@@ -89,7 +89,7 @@ pub(crate) fn allocate(worktree: &Path) -> Result<u64> {
         "ports.lock",
         Duration::from_secs(30),
         Duration::from_secs(60),
-    );
+    )?;
     let mut base = FIRST_BASE;
     while base < END_BASE {
         let claim = claim_path(&machine_dir, base);
