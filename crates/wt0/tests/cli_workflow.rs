@@ -1,7 +1,12 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
+// Only used by the crash-recovery helpers below, which are unix-only (they
+// shell out to `pgrep`/`kill -0`) — cfg-gated so a Windows-target build
+// doesn't see them as unused.
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 #[test]
 fn cli_reports_the_pinned_release_version() {
