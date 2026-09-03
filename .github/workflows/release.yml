@@ -121,27 +121,21 @@ jobs:
             --clobber
 
   # A release created with the workflow's own token does not fire the
-  # `release: published` event for other workflows (GitHub stops workflows
-  # from triggering each other), so npm publishing runs here, after every
-  # asset is attached, through the same Trusted Publishing (OIDC) path the
-  # standalone Publish npm workflow uses for re-dispatches.
+  # `release: published` event for other workflows, and npm's Trusted
+  # Publishing is bound to one workflow file per package (npm.yml). So the
+  # last step dispatches Publish npm — workflow_dispatch is the documented
+  # exception that GITHUB_TOKEN may trigger — instead of publishing here.
   npm:
     needs: [tag, build]
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: read
-      id-token: write
     steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ needs.tag.outputs.tag }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-      - name: npm with trusted-publishing support (11.5.1+)
-        run: npm install -g npm@latest && npm --version
-      - name: Publish worktree-zero and its platform packages
+      - name: Dispatch Publish npm for this release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ needs.tag.outputs.tag }}"
-          npm/publish.sh "${tag#v}"
+          gh workflow run npm.yml --repo "${{ github.repository }}" --ref main -f version="${tag#v}"
+          echo "dispatched Publish npm for ${tag#v}"
