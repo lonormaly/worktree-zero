@@ -36,6 +36,7 @@
 mod capabilities;
 mod commands;
 mod events;
+mod faq;
 mod hooks;
 mod init;
 mod mcp;
@@ -55,13 +56,15 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 /// subcommand is added, renamed, or moved between groups.
 const GROUPED_HELP: &str = "\
 Copy-on-write Git worktrees for agent fleets — a usable checkout in ~1 s and
-a few MiB, ports that never collide, cleanup that never loses work. Start
-with: wt0 doctor
+a few MiB, ports that never collide, cleanup that never loses work. Run
+`wt0` with no command for a plain-language report on this repository.
 
-Usage: wt0 [OPTIONS] <COMMAND>
+Usage: wt0 [OPTIONS] [COMMAND]
 
 Start here:
+  (none)  Same report as `doctor`, for the current directory
   doctor  Inspect dependency sharing and generated runtime storage
+  faq     Answer common questions about wt0 in plain language
   init    Propose or write the setup `doctor` recommends
   create  Create a thin linked checkout
   run     Create a thin runtime and run a command inside it
@@ -99,15 +102,17 @@ Options:
     version,
     about = "Copy-on-write Git worktrees for agent fleets — a usable checkout \
              in ~1 s and a few MiB, ports that never collide, cleanup that \
-             never loses work. Start with: wt0 doctor"
+             never loses work. Run `wt0` with no command for a report on \
+             this repository."
 )]
 struct Cli {
     /// Output machine-readable JSON.
     #[arg(long, global = true)]
     json: bool,
 
+    /// With no command, prints the same report as `wt0 doctor`.
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 // Ordered and grouped for `--help`'s custom `Cli::GROUPED_HELP` listing below
@@ -117,6 +122,8 @@ struct Cli {
 enum Commands {
     /// Inspect dependency sharing and generated runtime storage.
     Doctor(runtime::Doctor),
+    /// Answer common questions about wt0 in plain language.
+    Faq(faq::Faq),
     /// Propose or write the setup `doctor` recommends.
     Init(init::Init),
     /// Create a thin linked checkout.
@@ -156,38 +163,40 @@ fn main() -> Result<()> {
     let matches = Cli::command().override_help(GROUPED_HELP).get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     match cli.command {
-        Commands::Capabilities(args) => capabilities::run(args, cli.json),
-        Commands::Init(args) => init::run(args, cli.json),
-        Commands::Create(args) => {
+        None => runtime::doctor_or_intro(cli.json),
+        Some(Commands::Capabilities(args)) => capabilities::run(args, cli.json),
+        Some(Commands::Faq(args)) => faq::run(args, cli.json),
+        Some(Commands::Init(args)) => init::run(args, cli.json),
+        Some(Commands::Create(args)) => {
             commands::worktree::run(commands::worktree::Worktree::Add(args), cli.json)
         }
-        Commands::Run(args) => {
+        Some(Commands::Run(args)) => {
             commands::worktree::run(commands::worktree::Worktree::Run(args), cli.json)
         }
-        Commands::Remove(args) => {
+        Some(Commands::Remove(args)) => {
             commands::worktree::run(commands::worktree::Worktree::Remove(args), cli.json)
         }
-        Commands::List(args) => {
+        Some(Commands::List(args)) => {
             commands::worktree::run(commands::worktree::Worktree::List(args), cli.json)
         }
-        Commands::Gc(args) => {
+        Some(Commands::Gc(args)) => {
             commands::worktree::run(commands::worktree::Worktree::Gc(args), cli.json)
         }
-        Commands::Repair(args) => {
+        Some(Commands::Repair(args)) => {
             commands::worktree::run(commands::worktree::Worktree::Repair(args), cli.json)
         }
-        Commands::Heartbeat(args) => {
+        Some(Commands::Heartbeat(args)) => {
             commands::worktree::run(commands::worktree::Worktree::Heartbeat(args), cli.json)
         }
-        Commands::Prune(args) => {
+        Some(Commands::Prune(args)) => {
             commands::worktree::run(commands::worktree::Worktree::Prune(args), cli.json)
         }
-        Commands::Doctor(args) => runtime::doctor(args, cli.json),
-        Commands::Prepare(args) => runtime::prepare(args, cli.json),
-        Commands::Migrate(args) => runtime::migrate(args, cli.json),
-        Commands::Fleet(args) => commands::worktree::fleet(args.json || cli.json),
-        Commands::Events(args) => events::run(args, cli.json),
-        Commands::Mcp(args) => mcp::run(args),
-        Commands::Worktree(cmd) => commands::worktree::run(cmd, cli.json),
+        Some(Commands::Doctor(args)) => runtime::doctor(args, cli.json),
+        Some(Commands::Prepare(args)) => runtime::prepare(args, cli.json),
+        Some(Commands::Migrate(args)) => runtime::migrate(args, cli.json),
+        Some(Commands::Fleet(args)) => commands::worktree::fleet(args.json || cli.json),
+        Some(Commands::Events(args)) => events::run(args, cli.json),
+        Some(Commands::Mcp(args)) => mcp::run(args),
+        Some(Commands::Worktree(cmd)) => commands::worktree::run(cmd, cli.json),
     }
 }
