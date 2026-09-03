@@ -165,13 +165,12 @@ jobs:
           TMP: R:\tmp
           TEMP: R:\tmp
         run: cargo test --all
-      # Main only: wt0 create runs ~20 s per worktree on ReFS today (a
-      # per-file clone cost under investigation), so this 4-minute step
-      # would set every PR's critical path. Linux measures on every run.
+      # Main only: wt0 create runs ~5 s per worktree on ReFS today (parallel
+      # per-file clone; see "Gate 7" in flam-migration.md — down from ~20 s,
+      # still short of native's ~1 s), so this step still adds real time to
+      # every PR's critical path. Linux measures on every run.
       - name: Measure M1 (marginal storage per worktree) on ReFS
-        # TEMPORARY for claude/windows-create-speed: dropped the push-only
-        # gate and turned on WT0_TRACE so this PR's own runs get the phase
-        # split for the 20s ReFS create. Restored before merge.
+        if: github.event_name == 'push'
         shell: bash
         # Git Bash's `df` reaches the R: drive through an MSYS translation
         # layer we have not verified reports physical, clone-aware used
@@ -180,7 +179,6 @@ jobs:
         # asks Windows for the volume's real usage directly.
         env:
           WT0_M1_PS_DRIVE: R
-          WT0_TRACE: "1"
         run: WT0="$PWD/target/debug/wt0.exe" VOLUME=/r/tmp N=5 bash tests/measure_m1.sh
 
   stress:

@@ -202,6 +202,25 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   four managers' lockfiles and says which one this manager needs committed,
   instead of just `<manager> lockfile was not found`.
 
+- **`wt0 create --require-cow` is ~1.5x faster on Windows ReFS.** Gate 7's
+  CI measurement (`tests/measure_m1.sh`, run `33661351722`) found the
+  per-file clone path averaging 20.2s for a 2,000-file worktree against
+  native `git worktree add`'s 0.89s. `clone_tree_entries` now walks
+  directories single-threaded but clones files with a bounded pool of
+  worker threads pulling from a shared queue (any single failure still
+  fails the whole clone; no silent copy fallback) instead of one file at a
+  time. Measured on CI (windows job, run `33746674425`): the per-file
+  clone phase for the same fixture fell from 5.1-7.4s to 3.4-3.9s and mean
+  create time from 7.47s to 4.79s — about 1.5-1.6x, short of the 5x
+  target. Two follow-up rounds (raising the worker ceiling from 8 to 64
+  and dropping its core-count clamp; narrowing a Windows-only re-open to
+  the `FILE_WRITE_ATTRIBUTES` access it actually needs) produced no
+  further measurable gain, indicating the remaining cost is serialized
+  below the application — the OS/ReFS driver or Windows Defender's
+  per-file scan, not thread count. `WT0_TRACE=1` now prints phase timings
+  (`baseline`/`worktree-add`/`clone`/`status`) for the create path to
+  stderr; disabled by default, it costs one env check and no timers.
+
 ### Fixed
 
 - **A crashed or `rm -rf`'d worktree's port window is reliably released.**
