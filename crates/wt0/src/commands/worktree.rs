@@ -45,7 +45,9 @@ pub struct WorktreeAdd {
     /// Branch name to create (for example, feat/my-feature).
     pub branch: String,
 
-    /// Worktree path. Defaults to `.git/wt0/worktrees/<branch>`.
+    /// Worktree path. Defaults to a sibling `<repo-name>-worktrees/<branch>`
+    /// directory next to the repository (override with `WT0_WORKTREES_DIR`
+    /// or a `worktrees_dir` line in `.wt0/config`).
     #[arg(long)]
     pub path: Option<PathBuf>,
 
@@ -219,7 +221,9 @@ pub struct WorktreeRun {
     /// Branch to create for the command.
     pub branch: String,
 
-    /// Worktree path. Defaults to `.git/wt0/worktrees/<branch>`.
+    /// Worktree path. Defaults to a sibling `<repo-name>-worktrees/<branch>`
+    /// directory next to the repository (override with `WT0_WORKTREES_DIR`
+    /// or a `worktrees_dir` line in `.wt0/config`).
     #[arg(long)]
     pub path: Option<PathBuf>,
 
@@ -478,8 +482,11 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
     let target = absolute_path(
         args.path
             .clone()
-            .unwrap_or_else(|| default_worktree_path(&repo.common_git_dir, &args.branch)),
+            .unwrap_or_else(|| default_worktree_path(&repo, &args.branch)),
     )?;
+    if is_inside_git_dir(&target, &repo.common_git_dir) {
+        eprintln!("wt0: {}", git_nested_notice(&target));
+    }
 
     if branch_exists(&repo, &args.branch)? {
         return reuse_existing_runtime(&repo, args, &base, &target);
@@ -1301,10 +1308,12 @@ fn add_overlay_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &
 /// `git worktree remove --force` for plain worktrees.
 fn force_teardown(repo: &RepoContext, target: &Path) -> Result<()> {
     let generated = generated_runtime(repo, target)?;
-    // Resolved before removal: a port claim is stored under `allocate`'s
-    // canonical form, and `target` no longer exists to canonicalize once
-    // it is gone.
+    // Resolved before removal, alongside the container below: a port claim
+    // is stored under `allocate`'s canonical form, and `target` no longer
+    // exists to canonicalize (or to reread a `.wt0/config` override from)
+    // once it is gone.
     let release_target = dunce::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    let container = worktrees_container(repo);
     let result = if let Some(state) = overlay::state(repo, target) {
         overlay::unmount(target);
         let _ = fs::remove_dir_all(target);
@@ -1318,6 +1327,7 @@ fn force_teardown(repo: &RepoContext, target: &Path) -> Result<()> {
     if let Some(generated) = generated {
         retire_generated_runtime(&generated)?;
     }
+    cleanup_worktrees_container(&container, target);
     Ok(())
 }
 
@@ -1350,11 +1360,13 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         .unwrap_or(cwd);
     let repo = discover_repo(&repo_hint)?;
     let target = resolve_worktree_target(&repo, args.target.as_deref())?;
-    // Resolved before removal: a port claim is stored under `allocate`'s
-    // canonical form, and `target` no longer exists to canonicalize once
-    // it is gone. `target` itself stays literal — receipts and hooks below
-    // still echo back exactly what the caller passed.
+    // Resolved before removal, alongside the container below: a port claim
+    // is stored under `allocate`'s canonical form, and `target` no longer
+    // exists to canonicalize (or to reread a `.wt0/config` override from)
+    // once it is gone. `target` itself stays literal — receipts and hooks
+    // below still echo back exactly what the caller passed.
     let release_target = dunce::canonicalize(&target).unwrap_or_else(|_| target.clone());
+    let container = worktrees_container(&repo);
     let generated = generated_runtime(&repo, &target)?;
     let branch = list_worktrees(&repo)?
         .into_iter()
@@ -1427,6 +1439,7 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     if let Some(generated) = generated {
         retire_generated_runtime(&generated)?;
     }
+    cleanup_worktrees_container(&container, &target);
     crate::events::record(
         &repo.common_git_dir,
         "removed",
@@ -1796,6 +1809,14 @@ pub fn fleet(args: WorktreeFleet, global_json: bool) -> Result<()> {
     } else {
         render_fleet_table(&rows, compute_size);
     }
+    // Printed on stderr regardless of --json, like the seed hint in `add`, so
+    // an agent piping stdout still sees it.
+    print_git_nested_notice(
+        rows.iter()
+            .filter(|row| row.managed)
+            .map(|row| row.path.as_path()),
+        &repo.common_git_dir,
+    );
     Ok(())
 }
 
@@ -3965,11 +3986,153 @@ fn replace_with_clone(source: &Path, destination: &Path) -> Result<()> {
     result
 }
 
-fn default_worktree_path(common_git_dir: &Path, branch: &str) -> PathBuf {
-    common_git_dir
-        .join("wt0")
-        .join("worktrees")
-        .join(safe_path_component(branch))
+fn default_worktree_path(repo: &RepoContext, branch: &str) -> PathBuf {
+    worktrees_container(repo).join(safe_path_component(branch))
+}
+
+/// Env var overriding the worktrees container (see [`worktrees_container`]).
+/// Absolute, or relative to the repository's parent directory. Beaten only
+/// by an explicit `--path`.
+const WORKTREES_DIR_ENV: &str = "WT0_WORKTREES_DIR";
+
+/// The checked-in project config naming this repository's worktrees
+/// container — a single `worktrees_dir = "…"` line, hand-parsed like
+/// `bunfig.toml` above rather than pulling in a TOML crate for one key.
+const WORKTREES_DIR_CONFIG_FILE: &str = ".wt0/config";
+
+/// Where a worktree lands when `create`/`run` get no `--path`: a per-repository
+/// sibling container next to the checkout, not inside it and not inside
+/// `.git` — see [`default_worktrees_container`] for why. Precedence:
+/// [`WORKTREES_DIR_ENV`], then a `worktrees_dir` line in the checked-in
+/// [`WORKTREES_DIR_CONFIG_FILE`], then the default. Either override may be a
+/// relative path, resolved against the repository's parent directory (not
+/// the current directory) so it means the same thing from any worktree.
+fn worktrees_container(repo: &RepoContext) -> PathBuf {
+    let repo_root = &repo.main_worktree;
+    let anchor = || repo_root.parent().unwrap_or(repo_root.as_path());
+    if let Some(dir) = std::env::var(WORKTREES_DIR_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        let dir = PathBuf::from(dir);
+        return if dir.is_absolute() {
+            dir
+        } else {
+            anchor().join(dir)
+        };
+    }
+    if let Some(dir) = configured_worktrees_dir(&repo.top_level) {
+        return if dir.is_absolute() {
+            dir
+        } else {
+            anchor().join(dir)
+        };
+    }
+    default_worktrees_container(repo_root)
+}
+
+/// The new default worktrees container: `<parent>/<repo-name>-worktrees/`,
+/// next to (not inside) the checkout. Same volume as the checkout, so
+/// copy-on-write still holds, but outside the repository's own tree — unlike
+/// the old `.git/wt0/worktrees` default, no bundler's or watcher's stock
+/// "ignore .git" rule hides it (Vite's `server.fs.deny` 403ed every module
+/// under `.git`, breaking Storybook previews inside a wt0 worktree on FLAM —
+/// see docs/design-partners/flam-migration.md), and it never shows up inside
+/// the checkout's own `git status` or gets swept by its `tsconfig`/Nx/Jest
+/// globs. `.git/wt0` remains wt0's own state (baselines, environments,
+/// registry) regardless of where checkouts land.
+fn default_worktrees_container(repo_root: &Path) -> PathBuf {
+    let mut name = repo_root
+        .file_name()
+        .map(OsStr::to_os_string)
+        .unwrap_or_else(|| OsString::from("repo"));
+    name.push("-worktrees");
+    repo_root.parent().unwrap_or(repo_root).join(name)
+}
+
+/// Parse `worktrees_dir = "…"` from the checked-in `.wt0/config`, ignoring
+/// blank lines and `#` comments. Read from the current checkout (`top_level`)
+/// so a tracked config takes effect from any worktree of the repository, not
+/// only the main one.
+fn configured_worktrees_dir(checkout: &Path) -> Option<PathBuf> {
+    let text = fs::read_to_string(checkout.join(WORKTREES_DIR_CONFIG_FILE)).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "worktrees_dir" {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if !value.is_empty() {
+            return Some(PathBuf::from(value));
+        }
+    }
+    None
+}
+
+/// Whether `path` is nested inside `common_git_dir` — the old default
+/// location (`.git/wt0/worktrees/<slug>`), or anywhere else an explicit
+/// `--path`, `WT0_WORKTREES_DIR`, or `.wt0/config` might still place one.
+/// Best-effort: both sides are already-absolute, unresolved paths, not
+/// canonicalized (the target may not exist yet), so an unusual symlink
+/// layout could evade this — the cost of a false negative here is a missed
+/// warning, not a safety issue.
+pub(crate) fn is_inside_git_dir(path: &Path, common_git_dir: &Path) -> bool {
+    path.starts_with(common_git_dir)
+}
+
+/// The shared one-line notice for a worktree nested inside `.git`: any tool
+/// with a stock "ignore .git" rule (Vite's `server.fs.deny`, Storybook, most
+/// file watchers) silently hides everything under it. Printed by `create
+/// --path` (a warning, not a refusal) and by `fleet`/`doctor` for an
+/// existing managed worktree left over at the old default.
+fn git_nested_notice(path: &Path) -> String {
+    format!(
+        "{} inside .git — tools that ignore .git (Vite, Storybook, watchers) will not see it; \
+         recreate it, or pass --path outside .git",
+        path.display()
+    )
+}
+
+/// Prints [`git_nested_notice`] for `fleet`/`doctor`: one line naming the
+/// path when exactly one of `paths` is nested inside `common_git_dir`, else
+/// one line with the count; nothing when none are.
+pub(crate) fn print_git_nested_notice<'a>(
+    paths: impl Iterator<Item = &'a Path>,
+    common_git_dir: &Path,
+) {
+    let nested: Vec<&Path> = paths
+        .filter(|path| is_inside_git_dir(path, common_git_dir))
+        .collect();
+    match nested.as_slice() {
+        [] => {}
+        [path] => eprintln!("wt0: {}", git_nested_notice(path)),
+        many => eprintln!(
+            "wt0: {} worktrees are inside .git — tools that ignore .git (Vite, Storybook, \
+             watchers) will not see them; recreate them, or pass --path outside .git",
+            many.len()
+        ),
+    }
+}
+
+/// Removes `container` if the just-removed worktree lived directly inside it
+/// and it is now empty — undoing the on-demand `create_dir_all` from
+/// `create_worktree`. Never touches a container holding anything else, and
+/// does nothing when it was never the parent (a custom `--path` elsewhere,
+/// or the legacy `.git/wt0/worktrees` location). `container` must be
+/// resolved with [`worktrees_container`] before `removed` is deleted:
+/// removing a worktree can delete the very checked-in `.wt0/config` that
+/// call would otherwise need to reread (self-removal, no `--path` hint).
+fn cleanup_worktrees_container(container: &Path, removed: &Path) {
+    if removed.parent() == Some(container) {
+        let _ = fs::remove_dir(container);
+    }
 }
 
 fn safe_path_component(branch: &str) -> String {

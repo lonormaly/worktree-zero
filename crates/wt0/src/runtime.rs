@@ -379,8 +379,10 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
 
     // The one-screen verdict: does wt0's promise hold on this machine for
     // this repository? Three lines, one per promise, then a word.
-    let cow_available = worktree::discover_repo(&root)
-        .and_then(|repo| worktree::cow::clone_supported(&repo.common_git_dir, &root))
+    let repo_context = worktree::discover_repo(&root).ok();
+    let cow_available = repo_context
+        .as_ref()
+        .and_then(|repo| worktree::cow::clone_supported(&repo.common_git_dir, &root).ok())
         .unwrap_or(false);
     let dependency_sharing = match &store {
         None => "none-detected".to_owned(),
@@ -564,6 +566,11 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
                     .to_owned()
             }),
         });
+    }
+    // Printed on stderr regardless of --json, like the "not ready" line
+    // below, so an agent piping stdout still sees it.
+    if let Some(repo) = &repo_context {
+        worktree::print_git_nested_notice(std::iter::once(root.as_path()), &repo.common_git_dir);
     }
     if ready {
         Ok(())

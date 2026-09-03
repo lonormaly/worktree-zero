@@ -172,7 +172,7 @@ fn tools() -> Vec<Tool> {
             properties: json!({
                 "repo": repo,
                 "branch": { "type": "string", "description": "New branch name, e.g. agent/fix-checkout." },
-                "path": { "type": "string", "description": "Worktree path. Defaults to .git/wt0/worktrees/<branch>." },
+                "path": { "type": "string", "description": "Worktree path. Defaults to a sibling <repo-name>-worktrees/<branch> directory next to the repository." },
                 "base": { "type": "string", "description": "Commit-ish to start from. Defaults to HEAD." },
                 "require_cow": { "type": "boolean", "description": "Fail instead of falling back to a plain checkout when copy-on-write is unavailable." },
                 "ephemeral": { "type": "boolean", "description": "Mark the worktree for automatic gc selection." },
