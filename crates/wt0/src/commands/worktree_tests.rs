@@ -191,6 +191,109 @@ fn gc_retains_unmerged_branches_without_force() -> Result<()> {
     Ok(())
 }
 
+/// `--merged` narrows candidates to worktrees whose branch is fully
+/// contained in the default branch. An unmerged one is preserved and
+/// reported under the `"unmerged"` reason rather than silently dropped, so
+/// a dry run still accounts for every worktree it considered.
+#[test]
+fn gc_merged_selector_reaps_only_merged_branches() -> Result<()> {
+    let fixture = Fixture::new()?;
+    // `default_branch_ref`'s local fallback only recognizes `main`/`master`
+    // (there's no `origin` in this fixture); pin the name so the test
+    // doesn't depend on the environment's `init.defaultBranch`.
+    git(&fixture.repo, ["branch", "-m", "main"])?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+
+    let merged = fixture.root.join("merged");
+    add_git_worktree(&repo, "agent/merged", &merged, &base)?;
+    mark_test_managed(&merged, "agent/merged", false)?;
+    fs::write(merged.join("feature.txt"), "work\n")?;
+    run_git_at(&merged, ["add", "feature.txt"])?;
+    run_git_at(&merged, ["commit", "-q", "-m", "feature work"])?;
+    git(&fixture.repo, ["merge", "--ff-only", "-q", "agent/merged"])?;
+
+    let unmerged = fixture.root.join("unmerged");
+    add_git_worktree(&repo, "agent/unmerged", &unmerged, &base)?;
+    mark_test_managed(&unmerged, "agent/unmerged", false)?;
+    fs::write(unmerged.join("wip.txt"), "wip\n")?;
+    run_git_at(&unmerged, ["add", "wip.txt"])?;
+    run_git_at(&unmerged, ["commit", "-q", "-m", "unmerged work"])?;
+
+    let outcome = run_gc(
+        &repo,
+        &WorktreeGc {
+            older_than: "0s".to_owned(),
+            merged: true,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(outcome.reaped, vec![merged]);
+    assert!(outcome
+        .skipped
+        .contains(&(unmerged.clone(), "unmerged".to_owned())));
+    assert!(unmerged.exists());
+    Ok(())
+}
+
+/// `--include-unmanaged` extends both selection and every safety check to
+/// worktrees wt0 doesn't own. Skipped as `"unowned"` by default; considered
+/// (and still checked — a dirty one is preserved exactly like a managed
+/// one) with the flag; a reap of one is reported in
+/// `adopted_for_removal` so it's never silent.
+#[test]
+fn gc_include_unmanaged_considers_but_still_checks_a_plain_worktree() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+
+    let plain = fixture.root.join("plain");
+    add_git_worktree(&repo, "plain/unmanaged", &plain, &base)?;
+    // Deliberately not `mark_test_managed`: a plain `git worktree add`
+    // checkout, made outside wt0.
+
+    let default_outcome = run_gc(
+        &repo,
+        &WorktreeGc {
+            older_than: "0s".to_owned(),
+            ..Default::default()
+        },
+    )?;
+    assert!(default_outcome.reaped.is_empty());
+    assert!(default_outcome
+        .skipped
+        .contains(&(plain.clone(), "unowned".to_owned())));
+
+    fs::write(plain.join("scratch.txt"), "uncommitted\n")?;
+    let dirty_included = run_gc(
+        &repo,
+        &WorktreeGc {
+            older_than: "0s".to_owned(),
+            include_unmanaged: true,
+            ..Default::default()
+        },
+    )?;
+    assert!(dirty_included.reaped.is_empty());
+    assert!(dirty_included
+        .skipped
+        .contains(&(plain.clone(), "dirty".to_owned())));
+    assert!(plain.exists());
+
+    fs::remove_file(plain.join("scratch.txt"))?;
+    let cleaned_outcome = run_gc(
+        &repo,
+        &WorktreeGc {
+            older_than: "0s".to_owned(),
+            include_unmanaged: true,
+            apply: true,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(cleaned_outcome.reaped, vec![plain.clone()]);
+    assert_eq!(cleaned_outcome.adopted_for_removal, vec![plain]);
+    Ok(())
+}
+
 #[test]
 fn delete_local_branch_keeps_an_unmerged_branch_and_names_the_current_checkout() -> Result<()> {
     let fixture = Fixture::new()?;

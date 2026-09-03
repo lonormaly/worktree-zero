@@ -89,7 +89,7 @@ pub struct WorktreeAdd {
 #[derive(Args)]
 pub struct WorktreeRemove {
     /// Worktree path or branch name. Defaults to the worktree containing the
-    /// current directory.
+    /// current directory. Omit when using a bulk selector below.
     pub target: Option<String>,
 
     /// Commit all changes before removing the worktree.
@@ -107,6 +107,23 @@ pub struct WorktreeRemove {
     /// Delete the worktree branch too. Refuses unmerged branches unless --force.
     #[arg(long)]
     pub delete_branch: bool,
+
+    /// Bulk selector: remove every worktree whose branch is fully merged
+    /// into the default branch — the same selection and checks as
+    /// `wt0 gc --merged`. Combine with `--idle`/`--owner` to narrow it, and
+    /// print a receipt per worktree removed.
+    #[arg(long)]
+    pub merged: bool,
+
+    /// Bulk selector: only remove worktrees idle at least this long (e.g.
+    /// 90s, 30m, 24h, 7d). Defaults to `gc`'s own default (24h) when a bulk
+    /// selector is used without this flag.
+    #[arg(long, value_name = "DURATION")]
+    pub idle: Option<String>,
+
+    /// Bulk selector: only remove worktrees owned by this agent or session.
+    #[arg(long)]
+    pub owner: Option<String>,
 
     /// JSON output.
     #[arg(long)]
@@ -142,14 +159,43 @@ pub struct WorktreeGc {
     pub prefix: Option<String>,
 
     /// Reap worktrees idle at least this long (e.g. 90s, 30m, 24h, 7d).
-    #[arg(long, default_value = "24h")]
+    /// `--older-than` is kept as an alias.
+    #[arg(
+        long = "idle",
+        alias = "older-than",
+        value_name = "DURATION",
+        default_value = "24h"
+    )]
     pub older_than: String,
+
+    /// Only reap worktrees whose branch is fully merged into the default
+    /// branch (`origin/HEAD`'s target, falling back to `main`/`master`) —
+    /// the "merged and forgotten" case. Combine with `--idle 0s` to reap
+    /// every merged, clean, non-live worktree regardless of age.
+    #[arg(long)]
+    pub merged: bool,
+
+    /// Only reap worktrees owned by this agent or session.
+    #[arg(long)]
+    pub owner: Option<String>,
+
+    /// Only reap this exact branch.
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// Consider worktrees Worktree Zero does not own (plain `git worktree
+    /// add` checkouts) — they still must pass every safety check below.
+    /// Reaping one is reported as `adopted-for-removal`. Unmanaged
+    /// worktrees are skipped by default.
+    #[arg(long)]
+    pub include_unmanaged: bool,
 
     /// Legacy compatibility flag. Always refused; GC never discards dirty work.
     #[arg(long, hide = true)]
     pub force: bool,
 
     /// Delete each reaped worktree's branch. Unmerged branches are retained.
+    /// With `--merged`, only merged branches are deleted.
     #[arg(long)]
     pub delete_branches: bool,
 
@@ -215,9 +261,69 @@ pub struct WorktreeRun {
 
 #[derive(Args, Default)]
 pub struct WorktreeFleet {
+    /// Only show worktrees idle at least this long (e.g. 90s, 30m, 24h, 7d).
+    /// For a managed worktree, idle is time since its last heartbeat; for
+    /// an unmanaged one (no wt0 lease), it's the checkout's git index mtime
+    /// — cheaper than walking every tracked file for its newest mtime, and
+    /// close enough to flag a genuinely stale checkout.
+    #[arg(long, value_name = "DURATION")]
+    pub idle: Option<String>,
+
+    /// Only show worktrees whose branch is fully merged into the default
+    /// branch (`origin/HEAD`'s target, falling back to `main`/`master`).
+    #[arg(long)]
+    pub merged: bool,
+
+    /// Only show worktrees not provably merged into the default branch.
+    #[arg(long, conflicts_with = "merged")]
+    pub unmerged: bool,
+
+    /// Only show worktrees with modified or untracked files.
+    #[arg(long)]
+    pub dirty: bool,
+
+    /// Only show worktrees with no modified or untracked files.
+    #[arg(long, conflicts_with = "dirty")]
+    pub clean: bool,
+
+    /// Only show worktrees owned by this agent or session.
+    #[arg(long)]
+    pub owner: Option<String>,
+
+    /// Only show worktrees whose branch starts with this prefix.
+    #[arg(long)]
+    pub prefix: Option<String>,
+
+    /// Only show worktrees Worktree Zero does not own.
+    #[arg(long, conflicts_with = "managed")]
+    pub unmanaged: bool,
+
+    /// Only show worktrees Worktree Zero owns.
+    #[arg(long)]
+    pub managed: bool,
+
+    /// Compute each worktree's generated-state and `node_modules` size
+    /// (walks the tree; not free, so opt in).
+    #[arg(long)]
+    pub size: bool,
+
+    /// Sort the table.
+    #[arg(long, value_enum)]
+    pub sort: Option<FleetSort>,
+
     /// JSON output.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FleetSort {
+    /// Most idle first.
+    Idle,
+    /// Alphabetical by branch.
+    Branch,
+    /// Largest first. Implies `--size`.
+    Size,
 }
 
 #[derive(Args, Default)]
@@ -1216,6 +1322,18 @@ fn force_teardown(repo: &RepoContext, target: &Path) -> Result<()> {
 }
 
 fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
+    if args.merged {
+        if args.target.is_some() {
+            bail!("give a worktree target OR --merged (bulk removal), not both");
+        }
+        return remove_bulk(&args, json);
+    }
+    if args.idle.is_some() || args.owner.is_some() {
+        bail!(
+            "--idle and --owner select worktrees to remove only together with --merged; \
+             pass --merged too, or drop them and give a target"
+        );
+    }
     let cwd = std::env::current_dir()?;
     let repo_hint = args
         .target
@@ -1338,6 +1456,68 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `wt0 remove --merged [--idle <duration>] [--owner <id>]`: the exact same
+/// selection and safety checks as `wt0 gc --merged --apply` — merged
+/// branches only, every dirty/live/unknown-state guard still enforced — but
+/// applied immediately and reported as one receipt per worktree removed
+/// rather than a batch dry-run summary.
+fn remove_bulk(args: &WorktreeRemove, json: bool) -> Result<()> {
+    let repo = discover_repo(&std::env::current_dir()?)?;
+    let gc_args = WorktreeGc {
+        merged: true,
+        owner: args.owner.clone(),
+        older_than: args.idle.clone().unwrap_or_else(|| "24h".to_owned()),
+        delete_branches: args.delete_branch,
+        apply: true,
+        ..Default::default()
+    };
+    let outcome = run_gc(&repo, &gc_args)?;
+
+    if json {
+        let removed: Vec<_> = outcome
+            .reaped
+            .iter()
+            .map(|path| {
+                json!({
+                    "removed": path.display().to_string(),
+                    "adopted_for_removal": outcome.adopted_for_removal.contains(path),
+                })
+            })
+            .collect();
+        emit(&json!({
+            "schema_version": 1,
+            "removed": removed,
+            "skipped": outcome.skipped
+                .iter()
+                .map(|(p, why)| json!({ "worktree": p.display().to_string(), "reason": why }))
+                .collect::<Vec<_>>(),
+            "deleted_branches": outcome.deleted_branches,
+            "retained_branches": outcome.retained_branches,
+        }));
+    } else {
+        for path in &outcome.reaped {
+            let adopted = outcome.adopted_for_removal.contains(path);
+            println!(
+                "{}{}",
+                path.display(),
+                if adopted {
+                    " (adopted-for-removal)"
+                } else {
+                    ""
+                }
+            );
+        }
+        for branch in &outcome.deleted_branches {
+            println!("deleted branch: {branch}");
+        }
+        for (path, why) in &outcome.skipped {
+            eprintln!("skipped ({why}): {}", path.display());
+        }
+        println!("removed {} worktree(s)", outcome.reaped.len());
+    }
+    Ok(())
+}
+
 /// Git's own "contains modified or untracked files" refusal names the
 /// worktree but not what to do about it. Reframe it as wt0's own refusal
 /// with the three ways out, keeping git's original text as the `caused by`
@@ -1437,12 +1617,50 @@ fn list(json_output: bool) -> Result<()> {
     Ok(())
 }
 
-/// The swarm control view: every worktree with its lease, slot, heartbeat
-/// age, and owned generated storage — the data orchestrators render.
-pub fn fleet(json_output: bool) -> Result<()> {
+/// One worktree's fleet-view facts, computed once and shared by the human
+/// table, the JSON receipt, and every `--filter`/`--sort` decision — so a
+/// filter and the value it is compared against can never drift apart.
+struct FleetRow {
+    path: PathBuf,
+    is_main: bool,
+    managed: bool,
+    branch: Option<String>,
+    runtime_id: Option<String>,
+    slot: Option<u64>,
+    port_base: Option<u64>,
+    owner: Option<String>,
+    mode: Option<String>,
+    ephemeral: Option<bool>,
+    created_at_unix: Option<u64>,
+    heartbeat_at_unix: Option<u64>,
+    /// Managed: time since the last heartbeat. Unmanaged: the checkout's
+    /// git index mtime (documented on `--idle` since it's cheaper than
+    /// walking every tracked file for its newest mtime).
+    idle: Duration,
+    /// `None` when merge status can't be proven either way (no branch, or
+    /// no discoverable default branch) — distinct from a proven "no".
+    merged: Option<bool>,
+    /// `None` when `git status` itself failed.
+    dirty: Option<bool>,
+    live: bool,
+    owned_generated_bytes: Option<u64>,
+    /// Generated state + logical `node_modules`; only computed with
+    /// `--size` (or `--sort size`), since it walks the tree.
+    size_bytes: Option<u64>,
+}
+
+/// The swarm control view: every worktree with its lease, slot, idle time,
+/// merge/dirty/live status, and owned generated storage — the data an
+/// orchestrator or a human uses to decide what to clean up next.
+pub fn fleet(args: WorktreeFleet, global_json: bool) -> Result<()> {
+    let json_output = args.json || global_json;
     let repo = discover_repo(&std::env::current_dir()?)?;
     let now = now_unix_seconds()?;
-    let mut runtimes = Vec::new();
+    let idle_floor = args.idle.as_deref().map(parse_duration).transpose()?;
+    let compute_size = args.size || args.sort == Some(FleetSort::Size);
+    let live_cwds = crate::process::live_working_directories()?;
+
+    let mut rows = Vec::new();
     for entry in list_worktrees(&repo)? {
         let branch = entry.branch.as_deref().map(|branch| {
             branch
@@ -1450,70 +1668,265 @@ pub fn fleet(json_output: bool) -> Result<()> {
                 .unwrap_or(branch)
                 .to_owned()
         });
-        if !is_managed(&entry.path) {
-            runtimes.push(json!({
-                "worktree": entry.path,
-                "is_main": entry.is_main,
-                "managed": false,
-                "branch": branch,
-            }));
-            continue;
-        }
-        let lease = stored_lease(&entry.path)?;
-        let generated = generated_runtime(&repo, &entry.path)
+        let managed = is_managed(&entry.path);
+        let lease = if managed {
+            stored_lease(&entry.path).ok()
+        } else {
+            None
+        };
+        let idle = worktree_idle(&entry.path);
+        let merged = branch
+            .as_deref()
+            .and_then(|branch| is_branch_merged(&repo, branch));
+        let dirty = worktree_dirty(&entry.path).ok();
+        let live = live_cwds.iter().any(|cwd| cwd.starts_with(&entry.path))
+            || crate::process::live_open_path(&entry.path)?.is_some();
+        let owned_generated_bytes = generated_runtime(&repo, &entry.path)
             .ok()
             .flatten()
             .map(|runtime| generated_logical_bytes(&runtime.root))
-            .transpose()?
-            .unwrap_or(0);
-        runtimes.push(json!({
-            "worktree": entry.path,
-            "is_main": entry.is_main,
-            "managed": true,
-            "branch": branch,
-            "runtime_id": lease.runtime_id,
-            "slot": lease.slot,
-            "port_base": lease.port_base.or(lease.slot.map(port_base)),
-            "owner": lease.owner,
-            "slug": branch.as_deref().map(branch_slug),
-            "mode": lease.mode,
-            "ephemeral": lease.ephemeral,
-            "created_at_unix": lease.created_at_unix,
-            "heartbeat_at_unix": lease.heartbeat_at_unix,
-            "lease_age_seconds": now.saturating_sub(lease.heartbeat_at_unix),
-            "owned_generated_bytes": generated,
-        }));
+            .transpose()?;
+        let size_bytes = compute_size.then(|| {
+            let node_modules = tree_size(&entry.path.join("node_modules")).1;
+            owned_generated_bytes.unwrap_or(0) + node_modules
+        });
+        rows.push(FleetRow {
+            path: entry.path,
+            is_main: entry.is_main,
+            managed,
+            runtime_id: lease.as_ref().map(|lease| lease.runtime_id.clone()),
+            slot: lease.as_ref().and_then(|lease| lease.slot),
+            port_base: lease
+                .as_ref()
+                .and_then(|lease| lease.port_base.or(lease.slot.map(port_base))),
+            owner: lease.as_ref().and_then(|lease| lease.owner.clone()),
+            mode: lease.as_ref().and_then(|lease| lease.mode.clone()),
+            ephemeral: lease.as_ref().map(|lease| lease.ephemeral),
+            created_at_unix: lease.as_ref().map(|lease| lease.created_at_unix),
+            heartbeat_at_unix: lease.as_ref().map(|lease| lease.heartbeat_at_unix),
+            branch,
+            idle,
+            merged,
+            dirty,
+            live,
+            owned_generated_bytes,
+            size_bytes,
+        });
     }
-    if json_output {
-        emit(&json!({ "schema_version": 1, "runtimes": runtimes }));
-    } else {
-        println!("Worktree Zero fleet: {} worktree(s)", runtimes.len());
-        for runtime in &runtimes {
-            if runtime["managed"] == true {
-                println!(
-                    "  {}  slot {}  ports {}+  lease {}s  {}  {}",
-                    runtime["branch"].as_str().unwrap_or("detached"),
-                    runtime["slot"],
-                    runtime["port_base"],
-                    runtime["lease_age_seconds"],
-                    runtime["mode"].as_str().unwrap_or("unknown"),
-                    runtime["worktree"].as_str().unwrap_or("")
-                );
-            } else {
-                println!(
-                    "  {}  unmanaged{}  {}",
-                    runtime["branch"].as_str().unwrap_or("detached"),
-                    if runtime["is_main"] == true {
-                        " (main)"
-                    } else {
-                        ""
-                    },
-                    runtime["worktree"].as_str().unwrap_or("")
-                );
+
+    rows.retain(|row| {
+        if let Some(floor) = idle_floor {
+            if row.idle < floor {
+                return false;
             }
         }
+        if args.merged && !row.merged.unwrap_or(false) {
+            return false;
+        }
+        if args.unmerged && row.merged.unwrap_or(false) {
+            return false;
+        }
+        if args.dirty && !row.dirty.unwrap_or(false) {
+            return false;
+        }
+        if args.clean && row.dirty.unwrap_or(false) {
+            return false;
+        }
+        if let Some(owner) = &args.owner {
+            if row.owner.as_deref() != Some(owner.as_str()) {
+                return false;
+            }
+        }
+        if let Some(prefix) = &args.prefix {
+            if !row
+                .branch
+                .as_deref()
+                .is_some_and(|branch| branch.starts_with(prefix.as_str()))
+            {
+                return false;
+            }
+        }
+        if args.unmanaged && row.managed {
+            return false;
+        }
+        if args.managed && !row.managed {
+            return false;
+        }
+        true
+    });
+
+    match args.sort {
+        Some(FleetSort::Idle) => rows.sort_by(|a, b| b.idle.cmp(&a.idle)),
+        Some(FleetSort::Branch) => rows.sort_by(|a, b| a.branch.cmp(&b.branch)),
+        Some(FleetSort::Size) => {
+            rows.sort_by(|a, b| b.size_bytes.unwrap_or(0).cmp(&a.size_bytes.unwrap_or(0)))
+        }
+        None => {}
+    }
+
+    if json_output {
+        let runtimes: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "worktree": row.path,
+                    "is_main": row.is_main,
+                    "managed": row.managed,
+                    "branch": row.branch,
+                    "runtime_id": row.runtime_id,
+                    "slot": row.slot,
+                    "port_base": row.port_base,
+                    "owner": row.owner,
+                    "slug": row.branch.as_deref().map(branch_slug),
+                    "mode": row.mode,
+                    "ephemeral": row.ephemeral,
+                    "created_at_unix": row.created_at_unix,
+                    "heartbeat_at_unix": row.heartbeat_at_unix,
+                    "lease_age_seconds": row.heartbeat_at_unix.map(|heartbeat| now.saturating_sub(heartbeat)),
+                    "idle_seconds": row.idle.as_secs(),
+                    "merged": row.merged,
+                    "dirty": row.dirty,
+                    "live": row.live,
+                    "owned_generated_bytes": row.owned_generated_bytes,
+                    "size_bytes": row.size_bytes,
+                })
+            })
+            .collect();
+        emit(&json!({ "schema_version": 1, "runtimes": runtimes }));
+    } else {
+        render_fleet_table(&rows, compute_size);
     }
     Ok(())
+}
+
+fn tri_state(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "?",
+    }
+}
+
+/// A short humanized duration for the fleet table's IDLE column and dry-run
+/// hints: `45s`, `12m`, `3h`, `9d` — the coarsest unit that still reads as
+/// one meaningful number, the way an operator would say it out loud.
+fn humanize_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86400 {
+        format!("{}h", seconds / 3600)
+    } else {
+        format!("{}d", seconds / 86400)
+    }
+}
+
+/// Truncate `text` to at most `max` characters, dropping from the left and
+/// marking the cut with a leading `…` — a path's most identifying part is
+/// its tail, so that's what a narrow PATH column keeps.
+fn truncate_path_left(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max || max == 0 {
+        return text.to_owned();
+    }
+    let keep = max.saturating_sub(1);
+    let start = chars.len() - keep;
+    format!("…{}", chars[start..].iter().collect::<String>())
+}
+
+/// Render the fleet as a table aligned to at most 120 columns, truncating
+/// only the trailing PATH column (from the left) when the fixed columns
+/// alone don't leave it room.
+fn render_fleet_table(rows: &[FleetRow], show_size: bool) {
+    println!("Worktree Zero fleet: {} worktree(s)", rows.len());
+    if rows.is_empty() {
+        return;
+    }
+    const MAX_LINE_WIDTH: usize = 120;
+    const INDENT: usize = 2;
+    const GAP: usize = 2;
+    const MIN_PATH_WIDTH: usize = 8;
+
+    let mut headers = vec![
+        "BRANCH", "OWNER", "SLOT", "PORTS", "IDLE", "MERGED", "DIRTY", "LIVE", "MODE",
+    ];
+    if show_size {
+        headers.push("SIZE");
+    }
+    headers.push("PATH");
+    let path_index = headers.len() - 1;
+
+    let table_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            let branch = match (row.branch.as_deref(), row.is_main) {
+                (Some(branch), true) => format!("{branch} (main)"),
+                (Some(branch), false) => branch.to_owned(),
+                (None, true) => "detached (main)".to_owned(),
+                (None, false) => "detached".to_owned(),
+            };
+            let mut cells = vec![
+                branch,
+                row.owner.clone().unwrap_or_else(|| "-".to_owned()),
+                row.slot
+                    .map(|slot| slot.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                row.port_base
+                    .map(|port_base| format!("{port_base}+"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                humanize_duration(row.idle),
+                tri_state(row.merged).to_owned(),
+                tri_state(row.dirty).to_owned(),
+                (if row.live { "yes" } else { "no" }).to_owned(),
+                row.mode.clone().unwrap_or_else(|| "unmanaged".to_owned()),
+            ];
+            if show_size {
+                cells.push(
+                    row.size_bytes
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "-".to_owned()),
+                );
+            }
+            cells.push(row.path.display().to_string());
+            cells
+        })
+        .collect();
+
+    let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
+    for cells in &table_rows {
+        for (index, cell) in cells.iter().enumerate() {
+            widths[index] = widths[index].max(cell.chars().count());
+        }
+    }
+    let overhead = INDENT + widths[..path_index].iter().sum::<usize>() + GAP * (headers.len() - 1);
+    let path_budget = MAX_LINE_WIDTH.saturating_sub(overhead).max(MIN_PATH_WIDTH);
+    if widths[path_index] > path_budget {
+        widths[path_index] = path_budget;
+    }
+
+    let render_row = |cells: &[String]| -> String {
+        let line: Vec<String> = cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                let value = if index == path_index {
+                    truncate_path_left(cell, widths[index])
+                } else {
+                    cell.clone()
+                };
+                format!("{value:width$}", width = widths[index])
+            })
+            .collect();
+        line.join("  ").trim_end().to_owned()
+    };
+
+    let header_cells: Vec<String> = headers.iter().map(|header| header.to_string()).collect();
+    println!("  {}", render_row(&header_cells));
+    for cells in &table_rows {
+        println!("  {}", render_row(cells));
+    }
 }
 
 fn prune(args: WorktreePrune, json: bool) -> Result<()> {
@@ -1662,6 +2075,10 @@ fn gc(args: WorktreeGc, json: bool) -> Result<()> {
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>(),
+            "adopted_for_removal": outcome.adopted_for_removal
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
             "skipped": outcome.skipped
                 .iter()
                 .map(|(p, why)| json!({ "worktree": p.display().to_string(), "reason": why }))
@@ -1669,10 +2086,18 @@ fn gc(args: WorktreeGc, json: bool) -> Result<()> {
             "retained_branches": outcome.retained_branches,
             "deleted_branches": outcome.deleted_branches,
         }));
-    } else {
-        let verb = if args.apply { "reaped" } else { "would reap" };
+    } else if args.apply {
         for path in &outcome.reaped {
-            println!("{verb}: {}", path.display());
+            let adopted = outcome.adopted_for_removal.contains(path);
+            println!(
+                "reaped: {}{}",
+                path.display(),
+                if adopted {
+                    " (adopted-for-removal)"
+                } else {
+                    ""
+                }
+            );
         }
         for (path, why) in &outcome.skipped {
             eprintln!("skipped ({why}): {}", path.display());
@@ -1683,9 +2108,67 @@ fn gc(args: WorktreeGc, json: bool) -> Result<()> {
         for branch in &outcome.deleted_branches {
             println!("deleted branch: {branch}");
         }
-        println!("{verb} {} worktree(s)", outcome.reaped.len());
+        println!("reaped {} worktree(s)", outcome.reaped.len());
+    } else {
+        print_gc_dry_run(&outcome);
     }
     Ok(())
+}
+
+/// The dry-run report: worktrees grouped by outcome, each with its paths,
+/// so an operator can see at a glance not just what would be reaped but why
+/// everything else wasn't — dirty, unmerged, live, in an unrecognized
+/// ignored state, or simply not owned by wt0 yet.
+fn print_gc_dry_run(outcome: &GcOutcome) {
+    println!("would reap ({})", outcome.reaped.len());
+    for path in &outcome.reaped {
+        let adopted = outcome.adopted_for_removal.contains(path);
+        println!(
+            "  {}{}",
+            path.display(),
+            if adopted {
+                " (adopted-for-removal)"
+            } else {
+                ""
+            }
+        );
+    }
+
+    // Fixed order for the headings the ask calls out by name; anything else
+    // (an unrecognized check, a hook or removal failure) still gets a group
+    // rather than being dropped, appended in first-seen order.
+    let fixed_order = [
+        "kept: dirty",
+        "kept: unmerged",
+        "kept: live",
+        "kept: unknown ignored state",
+    ];
+    let mut groups: Vec<(String, Vec<&Path>)> = Vec::new();
+    for (path, reason) in &outcome.skipped {
+        let heading = skip_group_heading(reason);
+        if let Some(group) = groups.iter_mut().find(|(existing, _)| existing == &heading) {
+            group.1.push(path);
+        } else {
+            groups.push((heading, vec![path]));
+        }
+    }
+    groups.sort_by_key(|(heading, _)| {
+        fixed_order
+            .iter()
+            .position(|candidate| candidate == heading)
+            .unwrap_or(fixed_order.len())
+    });
+    // The unmanaged-skip heading always trails the kept: groups.
+    let unmanaged_heading = "skipped: unmanaged (pass --include-unmanaged to consider)";
+    groups.sort_by_key(|(heading, _)| (heading == unmanaged_heading) as u8);
+
+    for (heading, paths) in &groups {
+        println!("{heading} ({})", paths.len());
+        for path in paths {
+            println!("  {}", path.display());
+        }
+    }
+    println!("run again with --apply to remove; wt0 fleet --idle 7d to see the rest");
 }
 
 fn repair(json_output: bool) -> Result<()> {
@@ -1730,6 +2213,10 @@ fn repair(json_output: bool) -> Result<()> {
 
 struct GcOutcome {
     reaped: Vec<PathBuf>,
+    /// Subset of `reaped` that wt0 did not own before this run — only
+    /// non-empty with `--include-unmanaged`. Reported separately so `reaped`
+    /// itself stays a plain path list.
+    adopted_for_removal: Vec<PathBuf>,
     skipped: Vec<(PathBuf, String)>,
     retained_branches: Vec<String>,
     deleted_branches: Vec<String>,
@@ -1737,6 +2224,13 @@ struct GcOutcome {
 
 /// Core reaping logic, separated from output for testability. Returns the
 /// worktrees reaped (or that would be, under `--dry-run`) and those skipped.
+///
+/// Selectors (`--ephemeral`, `--prefix`, `--branch`, `--owner`, `--idle`)
+/// narrow which worktrees are *considered* at all — a non-match is simply
+/// not a candidate, and is never reported. Every candidate then goes
+/// through every safety check below regardless of which selectors were
+/// passed; a failed check is always reported in `skipped` so a dry run
+/// shows exactly why a worktree wasn't reaped.
 fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
     if args.force {
         bail!("--force is disabled: Worktree Zero never discards dirty work during garbage collection");
@@ -1745,6 +2239,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
     let older_than = parse_duration(&args.older_than)?;
     let live_cwds = crate::process::live_working_directories()?;
     let mut reaped: Vec<PathBuf> = Vec::new();
+    let mut adopted_for_removal: Vec<PathBuf> = Vec::new();
     let mut skipped: Vec<(PathBuf, String)> = Vec::new();
     let mut retained_branches = Vec::new();
     let mut deleted_branches = Vec::new();
@@ -1753,7 +2248,8 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
         if entry.is_main {
             continue;
         }
-        if !is_managed(&entry.path) {
+        let unmanaged = !is_managed(&entry.path);
+        if unmanaged && !args.include_unmanaged {
             skipped.push((entry.path, "unowned".to_owned()));
             continue;
         }
@@ -1765,6 +2261,17 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
         let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
         if let Some(prefix) = &args.prefix {
             if !short.starts_with(prefix) {
+                continue;
+            }
+        }
+        if let Some(wanted_branch) = &args.branch {
+            if short != wanted_branch {
+                continue;
+            }
+        }
+        if let Some(wanted_owner) = &args.owner {
+            let actual_owner = stored_lease(&entry.path).ok().and_then(|lease| lease.owner);
+            if actual_owner.as_deref() != Some(wanted_owner.as_str()) {
                 continue;
             }
         }
@@ -1808,7 +2315,18 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
             skipped.push((entry.path, "active-open-path".to_owned()));
             continue;
         }
+        // Checked last: every hard safety veto above (dirty, live, unknown
+        // ignored state) takes priority in the dry-run report over "not
+        // merged yet" — a worktree that's already preserved for being dirty
+        // is reported as dirty, not doubly as unmerged.
+        if args.merged && !is_branch_merged(repo, short).unwrap_or(false) {
+            skipped.push((entry.path, "unmerged".to_owned()));
+            continue;
+        }
         if !args.apply {
+            if unmanaged {
+                adopted_for_removal.push(entry.path.clone());
+            }
             reaped.push(entry.path);
             continue;
         }
@@ -1835,6 +2353,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
                         "worktree": entry.path,
                         "branch": short,
                         "runtime_id": reaped_runtime_id,
+                        "adopted_for_removal": unmanaged,
                     }),
                 );
                 if args.delete_branches {
@@ -1845,6 +2364,9 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
                             deleted_branches.push(short.to_owned());
                         }
                     }
+                }
+                if unmanaged {
+                    adopted_for_removal.push(entry.path.clone());
                 }
                 reaped.push(entry.path)
             }
@@ -1857,10 +2379,27 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
     }
     Ok(GcOutcome {
         reaped,
+        adopted_for_removal,
         skipped,
         retained_branches,
         deleted_branches,
     })
+}
+
+/// The dry-run heading a skip reason is grouped under. Known reasons map to
+/// the fixed headings an operator scans for first; anything else still gets
+/// a readable `kept: <reason>` heading rather than being silently absorbed,
+/// so a new check added later is never invisible in the dry-run summary.
+fn skip_group_heading(reason: &str) -> String {
+    let kind = reason.split(':').next().unwrap_or(reason).trim();
+    match kind {
+        "dirty" => "kept: dirty".to_owned(),
+        "unmerged" => "kept: unmerged".to_owned(),
+        "active-cwd" | "active-open-path" => "kept: live".to_owned(),
+        "unowned-local-state" => "kept: unknown ignored state".to_owned(),
+        "unowned" => "skipped: unmanaged (pass --include-unmanaged to consider)".to_owned(),
+        other => format!("kept: {}", other.replace('-', " ")),
+    }
 }
 
 /// `base` is the commit the removed worktree was created from (its lease's
@@ -1998,6 +2537,42 @@ fn origin_default_ref(repo: &RepoContext) -> Option<String> {
         }
     }
     None
+}
+
+/// The project's default branch — what "merged" is judged against for
+/// `wt0 fleet`, `wt0 gc --merged`, and `wt0 remove --merged`: the remote's
+/// recorded default (`origin/HEAD`'s target, or `origin/main`/`origin/master`
+/// if the symref was never set), falling back to a local `main` or `master`
+/// branch when there is no `origin` at all. Returns a ref usable with
+/// `git merge-base --is-ancestor` — `refs/remotes/<remote>/<branch>` for the
+/// remote form, `refs/heads/<branch>` for the local fallback.
+fn default_branch_ref(repo: &RepoContext) -> Option<String> {
+    if let Some(remote) = origin_default_ref(repo) {
+        return Some(format!("refs/remotes/{remote}"));
+    }
+    for candidate in ["main", "master"] {
+        let candidate_ref = format!("refs/heads/{candidate}");
+        if git_output_common(repo, ["rev-parse", "--verify", "--quiet", &candidate_ref])
+            .ok()
+            .is_some_and(|output| output.status.success())
+        {
+            return Some(candidate_ref);
+        }
+    }
+    None
+}
+
+/// Whether `branch`'s tip is fully contained in the project's default
+/// branch ([`default_branch_ref`]) — "merged and forgotten". `None` when
+/// merge status can't be proven either way (no such branch, or no
+/// discoverable default branch), which callers should treat as "not merged"
+/// for any removal decision: an indeterminate branch is never assumed safe.
+fn is_branch_merged(repo: &RepoContext, branch: &str) -> Option<bool> {
+    let tip = branch_tip(repo, branch)?;
+    let default_ref = default_branch_ref(repo)?;
+    let output =
+        git_output_common(repo, ["merge-base", "--is-ancestor", &tip, &default_ref]).ok()?;
+    Some(output.status.success())
 }
 
 /// A linked worktree as reported by `git worktree list --porcelain`.

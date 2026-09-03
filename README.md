@@ -221,8 +221,10 @@ and portable skill are the same implementation:
   or double-creating. A different key is refused, never handed someone
   else's runtime.
 - **The fleet map**: `wt0 fleet --json` returns every runtime with branch,
-  worktree, slot, port window, lease age, mode, and owned storage — the one
-  call an orchestrator needs to reason about the swarm. `wt0 events
+  owner, slot, port window, idle time, merged/dirty/live status, mode, and
+  owned storage — the one call an orchestrator needs to reason about the
+  swarm, filterable (`--idle`, `--merged`, `--owner`, `--prefix`,
+  `--unmanaged`, …) and sortable (`--sort idle|branch|size`). `wt0 events
   --follow` streams the append-only lifecycle log (created, reused, removed,
   reaped, adopted).
 - **Concurrency is tested, not assumed**: CI drives 24 simultaneous
@@ -306,6 +308,8 @@ wt0 init generated --apply  # writes .wt0-generated from this repo's own ignored
 wt0 init seed --apply       # writes .wt0-seed from detected caches (Nx, Turbo, Next, node_modules)
 wt0 init tilt --apply       # writes tilt_up.sh / tilt_down.sh, lifecycle hooks, and a Tiltfile snippet
 wt0 create agent/first-task # now create the first thin runtime
+wt0 fleet --idle 7d         # what's been sitting idle a week or more
+wt0 gc --merged --idle 7d   # reap what's idle that long AND already merged (dry run first)
 ```
 
 ### Tilt, Portless and ports
@@ -461,10 +465,21 @@ Worktree Zero is not stable until a new agent integration can:
   derive their Tilt port and hostnames from them; see the
   [Tilt integration](integrations/tilt/README.md)).
 - **What happens when an agent crashes?** The lease stops refreshing;
-  `wt0 gc --older-than` reaps the worktree, frees its slot and ports, and
-  retires its generated state; an `rm -rf` is recovered by `wt0 prune` as an
-  orphan with its runtime id
+  `wt0 gc --idle` reaps the worktree, frees its slot and ports, and retires
+  its generated state; an `rm -rf` is recovered by `wt0 prune` as an orphan
+  with its runtime id
   ([orphans](docs/lifecycle.md#orphans-a-checkout-that-vanished-outside-wt0)).
+- **How do I clean up old worktrees?** `wt0 fleet --idle 7d` shows what's
+  been sitting idle at least that long, with its merged/dirty/live status so
+  you can tell what's actually safe to drop. `wt0 gc --idle 7d` reaps
+  worktrees idle that long (dry run by default; `--apply` to remove). Add
+  `--merged` for "merged and forgotten": `wt0 gc --merged --idle 0s` reaps
+  every merged, clean, non-live worktree regardless of age, and
+  `wt0 gc --merged --idle 7d` combines both — merged *and* idle a week.
+  `wt0 remove --merged [--idle <duration>] [--owner <id>]` does the same
+  removal immediately, printing one receipt per worktree. `--owner <id>`
+  narrows any of these to one agent's runtimes. See
+  [Garbage collection](docs/lifecycle.md#garbage-collection).
 - **Windows?** ReFS/Dev Drive gives copy-on-write, and the storage numbers
   hold (9.8 MiB per worktree in CI). `wt0 create` is slower there today
   (per-file cloning; the CI receipt shows the current number). NTFS falls

@@ -185,7 +185,7 @@ fn main() -> Result<()> {
         Commands::Doctor(args) => runtime::doctor(args, cli.json),
         Commands::Prepare(args) => runtime::prepare(args, cli.json),
         Commands::Migrate(args) => runtime::migrate(args, cli.json),
-        Commands::Fleet(args) => commands::worktree::fleet(args.json || cli.json),
+        Commands::Fleet(args) => commands::worktree::fleet(args, cli.json),
         Commands::Events(args) => events::run(args, cli.json),
         Commands::Mcp(args) => mcp::run(args),
         Commands::Worktree(cmd) => commands::worktree::run(cmd, cli.json),

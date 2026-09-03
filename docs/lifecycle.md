@@ -35,14 +35,39 @@ lines from a real run, right after `wt0 create agent/add-tests` and
 /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-fix-checkout-9b8dc285  87194d1 [agent/fix-checkout]
 ```
 
-`wt0 fleet` is the control view: every Worktree Zero runtime with its slot,
-port window, lease age, mode, and path — the one call an orchestrator needs
-(`wt0 fleet --json` for the machine-readable form). Same two runtimes:
+`wt0 fleet` is the control view: every Worktree Zero runtime — and every
+worktree it doesn't own — with owner, slot, port window, idle time, whether
+its branch is merged into the default branch, whether it's dirty, whether a
+process is live in it, mode, and path (`wt0 fleet --json` for the
+machine-readable form, with the same facts additively). Same two runtimes,
+after `add-tests`' branch was merged and `fix-checkout`'s work is still in
+progress:
 
 ```text
-  agent/add-tests  slot 4  ports 22500+  lease 0s  cow-clone  /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-add-tests-99c97ab6
-  agent/fix-checkout  slot 1  ports 22300+  lease 1s  cow-clone  /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-fix-checkout-9b8dc285
+Worktree Zero fleet: 3 worktree(s)
+  BRANCH              OWNER  SLOT  PORTS   IDLE  MERGED  DIRTY  LIVE  MODE       PATH
+  master (main)       -      -     -       0s    yes     no     yes   unmanaged  /Users/shaisnir/Development/worktree-zero
+  agent/add-tests     -      0     22800+  2s    yes     no     no    cow-clone  /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-add-tests-99c97ab6
+  agent/fix-checkout  -      1     22900+  2s    no      no     no    cow-clone  /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-fix-checkout-9b8dc285
 ```
+
+The table stays aligned and at most 120 columns; a long PATH is truncated
+from the left (`…worktrees/agent-add-tests-99c97ab6`) so its most
+identifying part — the slug — stays visible. Every unmanaged worktree (a
+plain `git worktree add` checkout, including the main worktree itself) gets
+the same MERGED/DIRTY/IDLE facts as a managed one; its IDLE is the
+checkout's git index mtime rather than a heartbeat, since walking every
+tracked file for its newest mtime isn't worth the cost.
+
+Filter with `--idle <duration>` (idle at least this long), `--merged` /
+`--unmerged`, `--dirty` / `--clean`, `--owner <id>`, `--prefix <branch
+prefix>`, `--unmanaged` / `--managed` — combinable, all AND'd together.
+`wt0 fleet --idle 7d` finds worktrees nobody has touched in a week;
+`wt0 fleet --merged --dirty` finds merged branches someone left dirty work
+in (so `gc --merged` alone won't touch them). `--sort idle|branch|size`
+orders the table; `size` (and `--sort size`) additionally computes each
+worktree's generated-state plus logical `node_modules` size, which is not
+free — it walks the tree — so it's opt-in.
 
 Both worktrees above were created without `--path`: by default a worktree
 lives under `<repo>/.git/wt0/worktrees/<slug>/`, inside the repository's own
@@ -187,6 +212,72 @@ of these are true:
 An ignored `.env.local`, an unknown tool directory, a dirty file, a running
 agent, an unowned checkout, or a detached commit is preserved and reported.
 `wt0 gc --force` is disabled.
+
+### Fleet management: selecting which worktrees to consider
+
+The checks above never change. What can change is *which worktrees are
+candidates for them* — `--ephemeral`, `--prefix`, `--branch`, `--owner`, and
+`--idle` (an alias for the older `--older-than`, default `24h`) narrow the
+set; a worktree that doesn't match one is simply not a candidate and never
+appears in the report. `--merged` is the one selector that *is* reported: it
+only considers worktrees whose branch is fully merged into the default
+branch (`origin/HEAD`'s target, falling back to `main`/`master`), and a
+worktree excluded by it shows up under `kept: unmerged` so a dry run still
+accounts for everything it looked at. The three cases the selectors are
+for:
+
+```bash
+# Idle longer than X, regardless of merge status
+wt0 gc --idle 7d
+
+# Merged and forgotten, regardless of age
+wt0 gc --merged --idle 0s
+
+# Both: merged, AND idle at least a week
+wt0 gc --merged --idle 7d
+```
+
+`--owner <id>` narrows to one agent's or session's runtimes; `--branch
+<name>` to exactly one. `--delete-branches` combined with `--merged` deletes
+only the branches this run reaped (all of which are merged by construction);
+an unmerged branch is retained exactly as it is without `--merged`.
+
+By default GC only ever considers worktrees Worktree Zero owns — a plain
+`git worktree add` checkout is always skipped, reported as
+`skipped: unmanaged`. `--include-unmanaged` extends every selector and every
+check to those worktrees too — nothing about the safety checks loosens, a
+dirty or live unmanaged checkout is preserved exactly like a managed one —
+and a reaped one is reported as `adopted-for-removal` so that's never
+silent.
+
+A dry run (the default) groups its report by outcome instead of one flat
+list, each group with its paths, only shown when non-empty:
+
+```text
+would reap (1)
+  /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-add-tests-99c97ab6
+kept: unmerged (1)
+  /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-fix-checkout-9b8dc285
+run again with --apply to remove; wt0 fleet --idle 7d to see the rest
+```
+
+The possible headings: `would reap`, `kept: dirty`, `kept: unmerged`,
+`kept: live` (a process holds the worktree's cwd or a path inside it),
+`kept: unknown ignored state` (an ignored path GC doesn't recognize as
+generated, and no policy allows it), and `skipped: unmanaged` when
+`--include-unmanaged` wasn't passed.
+
+### Bulk removal: `wt0 remove --merged`
+
+`wt0 remove --merged [--idle <duration>] [--owner <id>]` applies exactly the
+selection `wt0 gc --merged` would report — same checks, same defaults — but
+immediately, with a receipt printed per worktree removed instead of a
+dry-run summary. It's the same command whether cleaning up one merged branch
+or a whole fleet's worth: `wt0 remove --merged` alone reaps everything
+merged and idle 24h+ (gc's own default), `--idle 0s` drops the age floor
+entirely, and `--owner <id>` scopes it to one agent. `--idle`/`--owner`
+without `--merged`, or a target combined with `--merged`, are both refused —
+each names a different, non-overlapping way to say what to remove.
 
 ### Reviewing additional generated paths
 
