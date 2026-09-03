@@ -1937,10 +1937,18 @@ fn crashed_agent_runtime_is_reaped_and_its_resources_released() {
         &worktree2,
     );
     assert_eq!(slot2, slot, "the reaped slot must be reused");
-    assert_eq!(
-        port_base2, port_base,
-        "the released port window must be reused"
-    );
+    // The property is release, not reuse: the reaped window's claim is gone.
+    // Whether the next runtime lands on the same window depends on a bind
+    // probe, and on a busy CI host another process can hold that port for a
+    // moment — so accept the same window, or a different one with the old
+    // claim file absent.
+    let old_claim = machine.join("ports").join(format!("{port_base}.json"));
+    if port_base2 != port_base {
+        assert!(
+            !old_claim.exists(),
+            "the released port window {port_base} still has a claim file"
+        );
+    }
 
     if mode2 == "overlay" {
         // On a filesystem without reflinks (plain ext4 — most Linux CI
