@@ -1,13 +1,16 @@
 //! Live-process inspection guarding destructive operations.
 //!
 //! On Unix, `lsof` enumerates working directories and open paths, and its
-//! absence is a hard error — cleanup must not proceed blind. On Windows there
-//! is no portable enumeration, but the filesystem itself is the guard: a
-//! directory that is any process's working directory, or that a process holds
-//! a handle inside, cannot be renamed, and files opened without
-//! `FILE_SHARE_DELETE` cannot be replaced or deleted. The Windows
-//! implementation therefore probes with a rename round-trip and relies on
-//! mandatory locking to refuse the rest at act time.
+//! absence is a hard error — cleanup must not proceed blind. A full-system
+//! sweep can run for minutes on a loaded machine, so every `lsof` call is
+//! bounded by `WT0_LSOF_TIMEOUT` (default 20 s, see `imp::run_lsof`); a
+//! timeout is reported as a distinct error and treated as "unknown, refuse",
+//! never as "no process found". On Windows there is no portable enumeration,
+//! but the filesystem itself is the guard: a directory that is any process's
+//! working directory, or that a process holds a handle inside, cannot be
+//! renamed, and files opened without `FILE_SHARE_DELETE` cannot be replaced
+//! or deleted. The Windows implementation therefore probes with a rename
+//! round-trip and relies on mandatory locking to refuse the rest at act time.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -58,7 +61,98 @@ pub(crate) fn is_alive_hint(pid: u32) -> Option<bool> {
 mod imp {
     use anyhow::{bail, Context, Result};
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Bound on how long a single `lsof` sweep may run before wt0 gives up
+    /// and refuses rather than blocking indefinitely — on a loaded laptop a
+    /// full-system `lsof` can take minutes, which would otherwise leave
+    /// every liveness check (and everything that depends on one: `remove`,
+    /// `gc`, `migrate`) looking hung. Override with `WT0_LSOF_TIMEOUT`
+    /// (seconds).
+    const DEFAULT_LSOF_TIMEOUT_SECS: u64 = 20;
+
+    fn lsof_timeout() -> Duration {
+        std::env::var("WT0_LSOF_TIMEOUT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(DEFAULT_LSOF_TIMEOUT_SECS))
+    }
+
+    /// Run `lsof` with `args` (and, if given, a trailing path argument),
+    /// bounded by [`lsof_timeout`]. `-w` suppresses permission warnings on
+    /// stderr and `-S 2` caps how long lsof itself will wait on a single
+    /// slow kernel query, both supported by the lsof builds wt0 targets
+    /// (macOS's built-in lsof and the Linux `lsof` package).
+    fn run_lsof(args: &[&str], path_arg: Option<&Path>) -> Result<std::process::Output> {
+        let mut command = Command::new("lsof");
+        command.args(["-w", "-S", "2"]).args(args);
+        if let Some(path) = path_arg {
+            command.arg(path);
+        }
+        output_with_timeout(command, lsof_timeout())
+    }
+
+    /// Run `command` to completion, killing it and returning a distinct
+    /// timeout error rather than blocking forever if it hasn't exited by
+    /// `timeout`. Callers must treat a timeout as "unknown" and refuse,
+    /// never as "no process found".
+    ///
+    /// stdout/stderr are drained on background threads while the main
+    /// thread polls `try_wait` — `Command::output()` can't be used here
+    /// since it blocks until exit with no way to bound the wait, and
+    /// reading the pipes only after that wait (instead of concurrently)
+    /// would deadlock if lsof's sweep fills the pipe buffer before exiting.
+    fn output_with_timeout(
+        mut command: Command,
+        timeout: Duration,
+    ) -> Result<std::process::Output> {
+        use std::io::Read;
+
+        let mut child: Child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("lsof is required for safe cleanup and migration")?;
+        let mut stdout_pipe = child.stdout.take().expect("stdout piped");
+        let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+        let stdout_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout_pipe.read_to_end(&mut buf);
+            buf
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut buf);
+            buf
+        });
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait().context("waiting for lsof")? {
+                let stdout = stdout_reader.join().unwrap_or_default();
+                let stderr = stderr_reader.join().unwrap_or_default();
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                bail!(
+                    "could not prove no live process within {} s (lsof); retry, raise \
+                     WT0_LSOF_TIMEOUT, or pass --force",
+                    timeout.as_secs()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
 
     pub(super) fn live_working_directories() -> Result<Vec<PathBuf>> {
         Ok(live_working_directories_by_pid()?
@@ -69,10 +163,7 @@ mod imp {
 
     /// Every live process's working directory, with its pid.
     pub(super) fn live_working_directories_by_pid() -> Result<Vec<(u32, PathBuf)>> {
-        let output = Command::new("lsof")
-            .args(["-a", "-d", "cwd", "-Fpn"])
-            .output()
-            .context("lsof is required for safe cleanup and migration")?;
+        let output = run_lsof(&["-a", "-d", "cwd", "-Fpn"], None)?;
         if !output.status.success() && output.status.code() != Some(1) {
             bail!("lsof failed while checking active processes");
         }
@@ -142,11 +233,7 @@ mod imp {
     ];
 
     pub(super) fn live_open_path(root: &Path) -> Result<Option<String>> {
-        let output = Command::new("lsof")
-            .args(["-Fcn", "+D"])
-            .arg(root)
-            .output()
-            .context("lsof is required for safe cleanup and migration")?;
+        let output = run_lsof(&["-Fcn", "+D"], Some(root))?;
         if !output.status.success() && output.status.code() != Some(1) {
             bail!("lsof failed while checking open worktree paths");
         }
@@ -163,6 +250,36 @@ mod imp {
             }
         }
         Ok(None)
+    }
+
+    /// A fake `lsof` that outlives the bound must be killed and reported as
+    /// the distinct timeout error — never awaited, and never mistaken for
+    /// "no process found". Drives `output_with_timeout` directly (rather
+    /// than through a real `lsof` lookup on `PATH`) so the test never
+    /// mutates the process-wide `PATH`, which would race every other test
+    /// in this binary that shells out to the real `lsof` concurrently.
+    #[test]
+    fn output_with_timeout_kills_and_reports_a_hung_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("wt0-fake-lsof-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let script = dir.join("lsof");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").expect("write fake lsof");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake lsof");
+
+        let error = output_with_timeout(Command::new(&script), Duration::from_millis(200))
+            .expect_err("a command that outlives the timeout must be refused, not awaited");
+        let message = error.to_string();
+        assert!(
+            message.contains("could not prove no live process within"),
+            "{message}"
+        );
+        assert!(message.contains("WT0_LSOF_TIMEOUT"), "{message}");
+        assert!(message.contains("--force"), "{message}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

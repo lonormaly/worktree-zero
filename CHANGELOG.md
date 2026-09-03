@@ -39,6 +39,41 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   fix}`); the existing `tilt` field is unchanged. See `docs/faq.md`, "I
   don't use Tilt — does wt0 still help?" and `docs/lifecycle.md`, "Not
   everyone uses Tilt".
+- **macOS release binaries are signed with a Developer ID and notarized.**
+  A freshly downloaded (or freshly copied) ad-hoc-signed `wt0` binary was
+  measured hanging at `_dyld_start` for minutes on first launch under
+  Gatekeeper — an already-launched copy of the exact same bytes ran
+  instantly. `.github/workflows/release.yml`'s two `*-apple-darwin` build
+  jobs now codesign with a Developer ID certificate (`--timestamp --options
+  runtime`) and notarize with `xcrun notarytool submit --wait`
+  (`scripts/sign-and-notarize-macos.sh`) before packaging, so the
+  `.tar.gz.sha256` covers the signed bytes; verification uses `codesign
+  --verify --deep --strict` and `spctl -a -t exec`, since `xcrun stapler`
+  doesn't apply to a bare binary. The step is a no-op — release still
+  ships, with a clear job-summary notice — when the six `APPLE_*` secrets
+  aren't set, so a fork (or this repository before they're added) keeps
+  releasing. See `docs/release.md` for the required secrets and the
+  release pipeline end to end.
+- **`lsof` sweeps are bounded, not indefinite.** wt0's own liveness checks
+  (`process.rs`: `live_open_path`, `foreign_working_directory`,
+  `live_working_directories_by_pid`) can call a full-system `lsof`, which
+  was measured taking minutes on a loaded machine and made `wt0 remove`/
+  `gc`/`migrate` look hung. Every `lsof` call is now killed and refused
+  after `WT0_LSOF_TIMEOUT` seconds (default 20, `-w -S 2` set on the call
+  itself) with a distinct error — "could not prove no live process within
+  Ns (lsof); retry, raise WT0_LSOF_TIMEOUT, or pass --force" — that every
+  caller already propagates as a refusal, never as "no process found".
+- **`wt0 doctor` flags Next.js + Turbopack on Bun's global store.** Building
+  with Turbopack (the `next build` default since Next 15) can fail against
+  Bun's global virtual store — "Symlink … points out of the filesystem
+  root" (vercel/next.js#94432), reproduced on this project's own CI — and
+  Bun's global store is the only shared-store shape wt0 ever recommends
+  for Bun. `doctor` now surfaces a `known_issues` entry (JSON, additive)
+  and a one-line note in the plain report whenever a repository uses both,
+  naming both workarounds: `next build --webpack` (verified) or
+  `turbopack.root` pointed at a directory containing the store (did not
+  fix it in testing). See `docs/faq.md`, "What does \"shared package
+  store\" mean…".
 
 ### Changed
 
@@ -87,6 +122,39 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   another wt0 is mid-operation — retry`) instead of racing the mutation
   the lock exists to serialize; the registry lock's wait rose from 30s to
   60s to match.
+- **`wt0 fleet` is cheap by default.** 0.1.18's `fleet` computed `dirty`
+  (`git status`), `merged` (`git merge-base`), `live` (`lsof`), and
+  generated-state/`node_modules` size for every registered worktree
+  regardless of filters — on Builders Stack (10 registered worktrees,
+  ~1,100 processes, several agents running) `wt0 fleet --json` took
+  54–58s, with or without `--owner`/`--managed`, repeatable; Builders
+  Stack's `pre-remove` hook calls `fleet --json` to verify ownership, so a
+  one-minute fleet stalled every removal. `fleet` without filters or flags
+  now reads only the ownership marker and lease (owner, runtime id, slot,
+  port window, idle from the heartbeat, mode, path, branch) — no `git`, no
+  `lsof`, no tree walk (before/after timing on Builders Stack: TODO, pending
+  the fleet-wide build queue clearing). `--merged`/`--unmerged` compute
+  `merged`; `--dirty`/`--clean` compute `dirty`; `--live` (new flag, also
+  filters to live worktrees) computes `live`; `--size`/`--sort size`
+  compute `size`; `--facts` computes all four regardless of filters — each
+  only for the worktrees that survive the cheap filters (`--idle`,
+  `--owner`, `--prefix`, `--managed`/`--unmanaged`) first, so `fleet
+  --merged` scales with the candidate count, not the fleet (timing: TODO).
+  The
+  human table shows `?` and JSON reports `null` for any fact not computed;
+  JSON additionally reports which facts were computed as a top-level
+  `facts` list. `gc` keeps its full checks (dirty/merged/live are still
+  computed for every managed candidate that survives the cheap selectors —
+  GC needs a definitive answer, not "unknown"), but confirmed unmanaged
+  worktrees are still excluded before any expensive check runs. The `git
+  status`/`git merge-base` calls behind `fleet`'s `dirty`/`merged` facts are
+  now killed and reported `null` (with a `warnings` entry in JSON) if they
+  don't finish within 10 seconds, so a repository locked by a concurrently
+  running agent can't stall a `fleet` pass. `wt0 list --json` gains
+  `runtime_id`, `owner`, and `managed` per worktree (same cheap marker
+  read) — the recommended fast ownership check for a `pre-remove` hook
+  instead of shelling out to `fleet`. See `docs/lifecycle.md`, "Inspecting
+  the fleet".
 
 ## 0.1.18 — 2026-09-03
 

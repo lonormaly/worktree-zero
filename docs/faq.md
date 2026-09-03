@@ -23,6 +23,21 @@ The npm package is `worktree-zero` — the registry refuses the bare name
 `wt0` as too similar to existing short packages — but the installed command
 is still `wt0`. Use `npx worktree-zero …` or `npm i -g worktree-zero`.
 
+## `wt0` (or any freshly built/downloaded binary) hangs the first time it runs on macOS.
+
+That's Gatekeeper, not wt0: macOS's `syspolicyd` evaluates a binary the
+first time it launches, and if `syspolicyd` is itself busy — a loaded Mac
+running many builds at once can pin it near 100% CPU for a long time —
+every first launch queues behind it, whether it's ad-hoc signed or not.
+Reproduced with a program that does nothing but print a string: a fresh
+`rustc`-compiled binary hung for 30+ minutes on first run while
+`syspolicyd` was saturated, at 0% CPU the whole time. An already-launched
+copy of the exact same bytes runs instantly afterward. Release binaries of
+`wt0` itself are signed with a Developer ID and notarized (see
+`docs/release.md`) precisely so they skip this first-launch check —
+notarizing doesn't un-stick a saturated `syspolicyd` for everything else on
+your machine, but it does mean `wt0` isn't one of the things waiting on it.
+
 ## Where does a worktree live?
 
 Under `<parent>/<repo-name>-worktrees/<name>/` by default — a sibling
@@ -62,6 +77,16 @@ each package once on your machine and gives every worktree a set of links
 into it — usually a fraction of a plain install's size, and it's what makes
 `wt0 doctor`'s "with wt0" column so small. wt0 detects which mode your
 project is in and prints the one config line that turns a store on.
+
+**Known issue:** Next.js building with Turbopack (the `next build` default
+since Next 15) can fail against Bun's global virtual store — "Symlink …
+points out of the filesystem root"
+([vercel/next.js#94432](https://github.com/vercel/next.js/issues/94432)),
+reproduced on this project's own CI. `wt0 doctor` flags this whenever a
+repository uses Next.js and Bun together. Two workarounds: run
+`next build --webpack` (verified fix), or set `turbopack.root` to a
+directory that contains the store — in testing that did not fix it, so
+prefer `--webpack` until the upstream issue is resolved.
 
 ## What is a build cache, and what does `wt0 init seed` do?
 
@@ -172,10 +197,12 @@ of.
 
 ## How do I clean up old worktrees?
 
-`wt0 fleet --idle 7d` lists every worktree idle at least that long, with
-whether its branch is merged, whether it's dirty, and whether a process is
-still live in it — so you can see what's actually safe to drop before you
-remove anything. `wt0 gc --idle 7d` (or any duration; `--older-than` still
+`wt0 fleet --idle 7d --facts` lists every worktree idle at least that long,
+with whether its branch is merged, whether it's dirty, and whether a
+process is still live in it — so you can see what's actually safe to drop
+before you remove anything (`--facts` opts into those; a plain `wt0 fleet`
+skips them since each spawns `git` or `lsof`). `wt0 gc --idle 7d` (or any
+duration; `--older-than` still
 works as the older name) is a dry run that shows what it would remove; add
 `--apply` to actually remove it — it already refuses anything dirty,
 unmerged, live, or in an unrecognized ignored state, so there's no way to

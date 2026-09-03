@@ -194,6 +194,35 @@ fn native_store_recommendation(root: &Path, store: &NativeStore) -> Option<Strin
     }
 }
 
+/// Upstream incompatibilities `wt0 doctor` warns about because they involve
+/// a configuration it already recommends or has already put in place —
+/// distinct from `recommendations`/`steps`, which are about wt0's own
+/// promise; these are additive, informational, and never move `ready`.
+///
+/// Next.js building with Turbopack (the `next build` default since Next 15)
+/// fails against Bun's global virtual store with "Symlink … points out of
+/// the filesystem root" (vercel/next.js#94432, reproduced on this project's
+/// own CI) — and Bun's global store is the only shared-store shape wt0 ever
+/// recommends for Bun, so any repository where Bun is the manager either
+/// already has the store on or is about to be told to turn it on.
+fn known_issues(next_detected: bool, javascript_manager: Option<&str>) -> Vec<Value> {
+    let mut issues = Vec::new();
+    if next_detected && javascript_manager == Some("bun") {
+        issues.push(json!({
+            "id": "next-turbopack-bun-global-store",
+            "summary": "Next.js building with Turbopack can fail against Bun's global virtual \
+                store: \"Symlink … points out of the filesystem root\" (vercel/next.js#94432).",
+            "workarounds": [
+                "run `next build --webpack` (verified fix)",
+                "set `turbopack.root` to a directory that contains the store — did not fix it \
+                 in testing, so prefer --webpack",
+            ],
+            "upstream": "https://github.com/vercel/next.js/issues/94432",
+        }));
+    }
+    issues
+}
+
 /// The dependency facts `wt0 doctor` and `wt0 create` both need: which
 /// JavaScript package manager (if any) governs this tree, what native
 /// link-tree store it resolves to, and whether its dependencies are already
@@ -457,6 +486,7 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     );
     let steps = doctor_steps(&root)?;
     let tooling_names = tooling_report.names();
+    let known_issues = known_issues(tooling_report.next, javascript_manager.as_deref());
 
     let report = json!({
         "schema_version": 1,
@@ -539,6 +569,7 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
             "fix": tool.fix.join(" "),
         })).collect::<Vec<_>>(),
         "steps": steps,
+        "known_issues": known_issues,
     });
 
     if json_output {
@@ -565,6 +596,7 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
                     .unwrap_or("package-manager")
                     .to_owned()
             }),
+            known_issues: &known_issues,
         });
     }
     // Printed on stderr regardless of --json, like the "not ready" line
@@ -604,6 +636,7 @@ struct DoctorPrintArgs<'a> {
     steps: &'a [Value],
     stale: u64,
     not_shipped: Option<String>,
+    known_issues: &'a [Value],
 }
 
 /// wt0's own title line, shared by the doctor report and the short message
@@ -637,6 +670,7 @@ fn print_doctor_report(args: DoctorPrintArgs) {
         steps,
         stale,
         not_shipped,
+        known_issues,
     } = args;
 
     println!("{WT0_TITLE}\n");
@@ -762,6 +796,23 @@ fn print_doctor_report(args: DoctorPrintArgs) {
         println!(
             "⚠️  This repository uses {manager}, which wt0 doesn't share dependencies for yet — the numbers above don't apply until wt0 adds support."
         );
+    }
+    for issue in known_issues {
+        let (Some(summary), Some(workarounds), Some(upstream)) = (
+            issue.get("summary").and_then(Value::as_str),
+            issue.get("workarounds").and_then(Value::as_array),
+            issue.get("upstream").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let workarounds = workarounds
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" · ");
+        println!();
+        println!("⚠️  Known issue: {summary}");
+        println!("   Workarounds: {workarounds}   ·   {upstream}");
     }
 }
 
@@ -3614,6 +3665,32 @@ fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn known_issues_flags_next_on_bun_whether_the_store_is_on_or_about_to_be_recommended() {
+        // Bun as the manager resolves to exactly two states — the global
+        // store already on, or not yet (about to be recommended) — and both
+        // carry the same Turbopack incompatibility, so checking the manager
+        // alone covers it.
+        let issues = known_issues(true, Some("bun"));
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0]["id"], "next-turbopack-bun-global-store");
+        assert!(issues[0]["summary"]
+            .as_str()
+            .expect("summary is a string")
+            .contains("Turbopack"));
+        assert_eq!(
+            issues[0]["upstream"],
+            "https://github.com/vercel/next.js/issues/94432"
+        );
+    }
+
+    #[test]
+    fn known_issues_is_empty_without_both_next_and_bun() {
+        assert!(known_issues(false, Some("bun")).is_empty());
+        assert!(known_issues(true, Some("pnpm")).is_empty());
+        assert!(known_issues(true, None).is_empty());
+    }
 
     #[test]
     fn is_native_store_covers_every_link_tree_store() {

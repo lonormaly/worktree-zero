@@ -94,6 +94,19 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} -p worktree-zero
+      - name: Sign and notarize (macOS)
+        # A no-op (with a clear job-summary notice) when the Apple secrets
+        # below aren't set, so a fork -- or this repository before they're
+        # added -- still releases. See docs/release.md.
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: scripts/sign-and-notarize-macos.sh "target/${{ matrix.target }}/release/wt0" "${{ matrix.target }}"
       - name: Package
         shell: bash
         run: |
