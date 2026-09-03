@@ -775,15 +775,6 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?}");
 }
 
-/// `git worktree list --porcelain` (what `wt0 gc`/`fleet`/`list` read their
-/// paths from) always reports forward-slash paths, even on Windows, while
-/// `Path::display()` on Windows renders the native backslash form — so a
-/// path from `git`-sourced CLI text output must be compared in this form,
-/// not `PathBuf::display()`'s.
-fn forward_slashes(path: &Path) -> String {
-    path.display().to_string().replace('\\', "/")
-}
-
 #[cfg(unix)]
 #[test]
 fn create_runs_the_post_create_hook_and_rolls_back_when_it_fails() {
@@ -1259,28 +1250,47 @@ fn fleet_and_gc_select_by_merged_idle_and_include_unmanaged() {
     // reports for a branch that never diverged. `dirty` and `unmerged` both
     // got a real commit of their own above specifically so this assertion
     // exercises the actual merge-base check, not that trivial case.)
-    let fleet_merged = Command::new(wt0)
+    //
+    // The unfiltered call also gives every worktree's path exactly as `gc`
+    // and `fleet` themselves report it (sourced from `git worktree list
+    // --porcelain`, always forward-slash even on Windows) — comparing gc's
+    // later text output against THIS instead of a locally built `PathBuf`
+    // sidesteps any Windows short-name/separator mismatch between the two.
+    let fleet_all = Command::new(wt0)
         .current_dir(&repo)
-        .args(["--json", "fleet", "--merged", "--managed"])
+        .args(["--json", "fleet"])
         .output()
-        .expect("run fleet --merged --managed");
+        .expect("run fleet");
     assert!(
-        fleet_merged.status.success(),
+        fleet_all.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&fleet_merged.stderr)
+        String::from_utf8_lossy(&fleet_all.stderr)
     );
-    let fleet_merged: serde_json::Value =
-        serde_json::from_slice(&fleet_merged.stdout).expect("fleet --merged JSON");
-    let branches: Vec<&str> = fleet_merged["runtimes"]
-        .as_array()
-        .expect("runtimes")
+    let fleet_all: serde_json::Value =
+        serde_json::from_slice(&fleet_all.stdout).expect("fleet JSON");
+    let runtimes = fleet_all["runtimes"].as_array().expect("runtimes");
+    let path_for = |branch: &str| -> String {
+        runtimes
+            .iter()
+            .find(|runtime| runtime["branch"] == branch)
+            .and_then(|runtime| runtime["worktree"].as_str())
+            .unwrap_or_else(|| panic!("no fleet entry for branch {branch}: {runtimes:?}"))
+            .to_owned()
+    };
+    let merged_path = path_for("agent/merged");
+    let unmerged_path = path_for("agent/unmerged");
+    let dirty_path = path_for("agent/dirty");
+    let unmanaged_path = path_for("plain/unmanaged");
+
+    let merged_branches: Vec<&str> = runtimes
         .iter()
+        .filter(|runtime| runtime["managed"] == true && runtime["merged"] == true)
         .filter_map(|runtime| runtime["branch"].as_str())
         .collect();
     assert_eq!(
-        branches,
+        merged_branches,
         vec!["agent/merged"],
-        "fleet --merged --managed: {branches:?}"
+        "managed+merged branches: {merged_branches:?}"
     );
 
     // `gc --merged --idle 0s` reaps exactly the merged worktree and groups
@@ -1297,20 +1307,19 @@ fn fleet_and_gc_select_by_merged_idle_and_include_unmanaged() {
     );
     let gc_dry_run = String::from_utf8_lossy(&gc_dry_run.stdout);
     assert!(
-        gc_dry_run.contains("would reap (1)") && gc_dry_run.contains(&forward_slashes(&merged)),
+        gc_dry_run.contains("would reap (1)") && gc_dry_run.contains(&merged_path),
         "{gc_dry_run}"
     );
     assert!(
-        gc_dry_run.contains("kept: dirty") && gc_dry_run.contains(&forward_slashes(&dirty)),
+        gc_dry_run.contains("kept: dirty") && gc_dry_run.contains(&dirty_path),
         "{gc_dry_run}"
     );
     assert!(
-        gc_dry_run.contains("kept: unmerged") && gc_dry_run.contains(&forward_slashes(&unmerged)),
+        gc_dry_run.contains("kept: unmerged") && gc_dry_run.contains(&unmerged_path),
         "{gc_dry_run}"
     );
     assert!(
-        gc_dry_run.contains("skipped: unmanaged")
-            && gc_dry_run.contains(&forward_slashes(&unmanaged)),
+        gc_dry_run.contains("skipped: unmanaged") && gc_dry_run.contains(&unmanaged_path),
         "{gc_dry_run}"
     );
 
@@ -1329,8 +1338,7 @@ fn fleet_and_gc_select_by_merged_idle_and_include_unmanaged() {
     );
     let include_unmanaged = String::from_utf8_lossy(&include_unmanaged.stdout);
     assert!(
-        include_unmanaged.contains("kept: dirty")
-            && include_unmanaged.contains(&forward_slashes(&unmanaged)),
+        include_unmanaged.contains("kept: dirty") && include_unmanaged.contains(&unmanaged_path),
         "{include_unmanaged}"
     );
     assert!(
