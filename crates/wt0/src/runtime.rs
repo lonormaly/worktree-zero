@@ -533,9 +533,13 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     }
     if ready {
         Ok(())
-    } else {
-        eprintln!("wt0: not ready — {} steps above", steps.len());
+    } else if json_output {
         bail!("repository is not ready for a thin agent runtime")
+    } else {
+        // The steps above are the message; a second "Error:" line under
+        // them only repeats it. Exit code stays non-zero for scripts.
+        eprintln!("wt0: not ready — {} steps above", steps.len());
+        std::process::exit(1)
     }
 }
 
