@@ -1267,3 +1267,290 @@ fn a_corrupt_parent_baseline_falls_back_to_a_full_materialization() -> Result<()
     );
     Ok(())
 }
+
+#[test]
+fn needed_facts_default_is_cheap_only() {
+    let needed = NeededFacts::for_args(&WorktreeFleet::default());
+    assert_eq!(needed, NeededFacts::default());
+    assert!(!needed.any());
+    assert!(needed.names().is_empty());
+}
+
+#[test]
+fn needed_facts_track_individual_filters_and_the_facts_flag() {
+    let merged = NeededFacts::for_args(&WorktreeFleet {
+        merged: true,
+        ..Default::default()
+    });
+    assert_eq!(merged, NeededFacts { merged: true, ..Default::default() });
+    assert_eq!(merged.names(), vec!["merged"]);
+
+    let unmerged = NeededFacts::for_args(&WorktreeFleet {
+        unmerged: true,
+        ..Default::default()
+    });
+    assert_eq!(unmerged, NeededFacts { merged: true, ..Default::default() });
+
+    let dirty = NeededFacts::for_args(&WorktreeFleet {
+        dirty: true,
+        ..Default::default()
+    });
+    assert_eq!(dirty, NeededFacts { dirty: true, ..Default::default() });
+
+    let clean = NeededFacts::for_args(&WorktreeFleet {
+        clean: true,
+        ..Default::default()
+    });
+    assert_eq!(clean, NeededFacts { dirty: true, ..Default::default() });
+
+    let live = NeededFacts::for_args(&WorktreeFleet {
+        live: true,
+        ..Default::default()
+    });
+    assert_eq!(live, NeededFacts { live: true, ..Default::default() });
+
+    let size = NeededFacts::for_args(&WorktreeFleet {
+        size: true,
+        ..Default::default()
+    });
+    assert_eq!(size, NeededFacts { size: true, ..Default::default() });
+
+    let sort_size = NeededFacts::for_args(&WorktreeFleet {
+        sort: Some(FleetSort::Size),
+        ..Default::default()
+    });
+    assert_eq!(sort_size, NeededFacts { size: true, ..Default::default() });
+
+    // Cheap filters (`--idle`, `--owner`, `--prefix`, `--managed`,
+    // `--unmanaged`) narrow the candidate set but never trigger a fact.
+    let cheap_only = NeededFacts::for_args(&WorktreeFleet {
+        idle: Some("1h".to_owned()),
+        owner: Some("agent".to_owned()),
+        prefix: Some("agent/".to_owned()),
+        managed: true,
+        ..Default::default()
+    });
+    assert_eq!(cheap_only, NeededFacts::default());
+
+    let all = NeededFacts::for_args(&WorktreeFleet {
+        facts: true,
+        ..Default::default()
+    });
+    assert_eq!(
+        all,
+        NeededFacts {
+            merged: true,
+            dirty: true,
+            live: true,
+            size: true,
+        }
+    );
+    assert_eq!(all.names(), vec!["merged", "dirty", "live", "size"]);
+}
+
+/// The core perf fix: a plain `wt0 fleet` — what Builders Stack's
+/// `pre-remove` hook runs before every removal — reads only the ownership
+/// marker and lease. No fact is computed, so a locked repository or a slow
+/// `lsof` can't stall it.
+#[test]
+fn fleet_default_computes_no_expensive_facts() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+
+    let target = fixture.root.join("agent-work");
+    add_git_worktree(&repo, "agent/work", &target, &base)?;
+    mark_test_managed(&target, "agent/work", false)?;
+
+    let outcome = compute_fleet_rows(&repo, &WorktreeFleet::default())?;
+    assert!(outcome.needed.names().is_empty());
+    assert!(outcome.warnings.is_empty());
+    assert_eq!(outcome.rows.len(), 2, "main worktree plus agent/work");
+    for row in &outcome.rows {
+        assert_eq!(row.merged, None);
+        assert_eq!(row.dirty, None);
+        assert_eq!(row.live, None);
+        assert_eq!(row.owned_generated_bytes, None);
+        assert_eq!(row.size_bytes, None);
+    }
+    Ok(())
+}
+
+/// `--merged` computes the `merged` fact only, and only for worktrees that
+/// already survived the cheap filters — an unmanaged worktree here is
+/// excluded by the cheap `--managed` filter before `merged` is ever
+/// computed for it.
+#[test]
+fn fleet_merged_filter_computes_only_the_merged_fact_for_survivors() -> Result<()> {
+    let fixture = Fixture::new()?;
+    git(&fixture.repo, ["branch", "-m", "main"])?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+
+    let merged = fixture.root.join("merged");
+    add_git_worktree(&repo, "agent/merged", &merged, &base)?;
+    mark_test_managed(&merged, "agent/merged", false)?;
+    fs::write(merged.join("feature.txt"), "work\n")?;
+    run_git_at(&merged, ["add", "feature.txt"])?;
+    run_git_at(&merged, ["commit", "-q", "-m", "feature work"])?;
+    git(&fixture.repo, ["merge", "--ff-only", "-q", "agent/merged"])?;
+
+    let unmerged = fixture.root.join("unmerged");
+    add_git_worktree(&repo, "agent/unmerged", &unmerged, &base)?;
+    mark_test_managed(&unmerged, "agent/unmerged", false)?;
+    fs::write(unmerged.join("wip.txt"), "wip\n")?;
+    run_git_at(&unmerged, ["add", "wip.txt"])?;
+    run_git_at(&unmerged, ["commit", "-q", "-m", "unmerged work"])?;
+
+    let outcome = compute_fleet_rows(
+        &repo,
+        &WorktreeFleet {
+            merged: true,
+            managed: true,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(outcome.needed.names(), vec!["merged"]);
+    assert_eq!(
+        outcome.rows.iter().map(|row| row.path.clone()).collect::<Vec<_>>(),
+        vec![merged]
+    );
+    let row = &outcome.rows[0];
+    assert_eq!(row.merged, Some(true));
+    assert_eq!(row.dirty, None);
+    assert_eq!(row.live, None);
+    assert_eq!(row.size_bytes, None);
+    Ok(())
+}
+
+/// `--facts` computes every expensive fact for every surviving worktree,
+/// regardless of which filters/sort were passed.
+#[test]
+fn fleet_facts_flag_computes_every_fact() -> Result<()> {
+    let fixture = Fixture::new()?;
+    git(&fixture.repo, ["branch", "-m", "main"])?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+
+    let target = fixture.root.join("agent-work");
+    add_git_worktree(&repo, "agent/work", &target, &base)?;
+    mark_test_managed(&target, "agent/work", false)?;
+
+    let outcome = compute_fleet_rows(
+        &repo,
+        &WorktreeFleet {
+            facts: true,
+            prefix: Some("agent/".to_owned()),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(outcome.needed.names(), vec!["merged", "dirty", "live", "size"]);
+    assert_eq!(outcome.rows.len(), 1);
+    let row = &outcome.rows[0];
+    assert!(row.merged.is_some());
+    assert!(row.dirty.is_some());
+    assert!(row.live.is_some());
+    assert!(row.size_bytes.is_some());
+    Ok(())
+}
+
+/// The specific case the fleet-perf fix calls out: `gc --merged` (without
+/// `--include-unmanaged`) must skip an unmanaged worktree via the cheap
+/// "unowned" check before any expensive check — `dirty`, `unmerged` — ever
+/// runs against it.
+#[test]
+fn gc_merged_selector_skips_unmanaged_before_computing_dirty() -> Result<()> {
+    let fixture = Fixture::new()?;
+    git(&fixture.repo, ["branch", "-m", "main"])?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+
+    let plain = fixture.root.join("plain");
+    add_git_worktree(&repo, "plain/unmanaged", &plain, &base)?;
+    // Dirty, so if the "unowned" cheap skip didn't run first, this would be
+    // reported "dirty" (or "unmerged") instead.
+    fs::write(plain.join("scratch.txt"), "uncommitted\n")?;
+
+    let outcome = run_gc(
+        &repo,
+        &WorktreeGc {
+            older_than: "0s".to_owned(),
+            merged: true,
+            ..Default::default()
+        },
+    )?;
+    assert!(outcome.reaped.is_empty());
+    assert_eq!(
+        outcome.skipped,
+        vec![(plain, "unowned".to_owned())]
+    );
+    Ok(())
+}
+
+/// `wt0 list --json` carries `runtime_id`/`owner`/`managed` per worktree —
+/// cheap fields read from the ownership marker, the fast ownership check a
+/// `pre-remove` hook should use instead of shelling out to `fleet`.
+#[test]
+fn list_json_entries_report_ownership_fields() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+
+    let managed = fixture.root.join("managed");
+    add_git_worktree(&repo, "agent/managed", &managed, &base)?;
+    let lease = mark_test_managed(&managed, "agent/managed", false)?;
+
+    let plain = fixture.root.join("plain");
+    add_git_worktree(&repo, "plain/unmanaged", &plain, &base)?;
+
+    let entries = list_json_entries(&repo)?;
+    let find = |path: &Path| -> serde_json::Value {
+        entries
+            .iter()
+            .find(|entry| entry["worktree"].as_str() == Some(path.to_string_lossy().as_ref()))
+            .unwrap_or_else(|| panic!("no entry for {}", path.display()))
+            .clone()
+    };
+
+    let managed_entry = find(&managed);
+    assert_eq!(managed_entry["managed"], json!(true));
+    assert_eq!(managed_entry["runtime_id"], json!(lease.runtime_id));
+    assert_eq!(managed_entry["owner"], serde_json::Value::Null);
+
+    let plain_entry = find(&plain);
+    assert_eq!(plain_entry["managed"], json!(false));
+    assert_eq!(plain_entry["runtime_id"], serde_json::Value::Null);
+    assert_eq!(plain_entry["owner"], serde_json::Value::Null);
+    Ok(())
+}
+
+/// The mechanism behind `fleet`'s bounded fact checks: a process that
+/// outlives `timeout` is killed, not merely abandoned, and the call
+/// reports an error rather than hanging.
+#[cfg(unix)]
+#[test]
+fn run_git_bounded_kills_a_process_that_outlives_its_timeout() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "sleep 5"]);
+    let start = Instant::now();
+    let error = run_git_bounded(&mut command, Duration::from_millis(200))
+        .expect_err("a 5s sleep must not finish inside a 200ms bound");
+    let elapsed = start.elapsed();
+    assert!(error.to_string().contains("timed out"), "{error}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "run_git_bounded should return promptly after killing the process, took {elapsed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_git_bounded_returns_normal_output_when_within_timeout() -> Result<()> {
+    let mut command = Command::new("sh");
+    command.args(["-c", "printf out; printf err 1>&2; exit 0"]);
+    let output = run_git_bounded(&mut command, Duration::from_secs(10))?;
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"out");
+    assert_eq!(output.stderr, b"err");
+    Ok(())
+}

@@ -40,6 +40,42 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   don't use Tilt — does wt0 still help?" and `docs/lifecycle.md`, "Not
   everyone uses Tilt".
 
+### Fixed
+
+- **`wt0 fleet` is cheap by default.** 0.1.18's `fleet` computed `dirty`
+  (`git status`), `merged` (`git merge-base`), `live` (`lsof`), and
+  generated-state/`node_modules` size for every registered worktree
+  regardless of filters — on Builders Stack (10 registered worktrees,
+  ~1,100 processes, several agents running) `wt0 fleet --json` took
+  54–58s, with or without `--owner`/`--managed`, repeatable; Builders
+  Stack's `pre-remove` hook calls `fleet --json` to verify ownership, so a
+  one-minute fleet stalled every removal. `fleet` without filters or flags
+  now reads only the ownership marker and lease (owner, runtime id, slot,
+  port window, idle from the heartbeat, mode, path, branch) — no `git`, no
+  `lsof`, no tree walk (before/after timing on Builders Stack: TODO, pending
+  the fleet-wide build queue clearing). `--merged`/`--unmerged` compute
+  `merged`; `--dirty`/`--clean` compute `dirty`; `--live` (new flag, also
+  filters to live worktrees) computes `live`; `--size`/`--sort size`
+  compute `size`; `--facts` computes all four regardless of filters — each
+  only for the worktrees that survive the cheap filters (`--idle`,
+  `--owner`, `--prefix`, `--managed`/`--unmanaged`) first, so `fleet
+  --merged` scales with the candidate count, not the fleet (timing: TODO).
+  The
+  human table shows `?` and JSON reports `null` for any fact not computed;
+  JSON additionally reports which facts were computed as a top-level
+  `facts` list. `gc` keeps its full checks (dirty/merged/live are still
+  computed for every managed candidate that survives the cheap selectors —
+  GC needs a definitive answer, not "unknown"), but confirmed unmanaged
+  worktrees are still excluded before any expensive check runs. The `git
+  status`/`git merge-base` calls behind `fleet`'s `dirty`/`merged` facts are
+  now killed and reported `null` (with a `warnings` entry in JSON) if they
+  don't finish within 10 seconds, so a repository locked by a concurrently
+  running agent can't stall a `fleet` pass. `wt0 list --json` gains
+  `runtime_id`, `owner`, and `managed` per worktree (same cheap marker
+  read) — the recommended fast ownership check for a `pre-remove` hook
+  instead of shelling out to `fleet`. See `docs/lifecycle.md`, "Inspecting
+  the fleet".
+
 ## 0.1.18 — 2026-09-03
 
 ### Added

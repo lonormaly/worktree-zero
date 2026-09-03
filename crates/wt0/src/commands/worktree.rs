@@ -12,7 +12,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -265,12 +265,17 @@ pub struct WorktreeFleet {
     /// For a managed worktree, idle is time since its last heartbeat; for
     /// an unmanaged one (no wt0 lease), it's the checkout's git index mtime
     /// — cheaper than walking every tracked file for its newest mtime, and
-    /// close enough to flag a genuinely stale checkout.
+    /// close enough to flag a genuinely stale checkout. Cheap: read from the
+    /// filesystem, no subprocess.
     #[arg(long, value_name = "DURATION")]
     pub idle: Option<String>,
 
     /// Only show worktrees whose branch is fully merged into the default
     /// branch (`origin/HEAD`'s target, falling back to `main`/`master`).
+    /// Computing "merged" spawns `git`, so it and every other expensive
+    /// fact below is skipped by default — this flag opts it in, for the
+    /// worktrees that survive the cheap filters (`--idle`, `--owner`,
+    /// `--prefix`, `--managed`/`--unmanaged`).
     #[arg(long)]
     pub merged: bool,
 
@@ -278,7 +283,8 @@ pub struct WorktreeFleet {
     #[arg(long, conflicts_with = "merged")]
     pub unmerged: bool,
 
-    /// Only show worktrees with modified or untracked files.
+    /// Only show worktrees with modified or untracked files. Computing
+    /// "dirty" spawns `git status`.
     #[arg(long)]
     pub dirty: bool,
 
@@ -286,26 +292,40 @@ pub struct WorktreeFleet {
     #[arg(long, conflicts_with = "dirty")]
     pub clean: bool,
 
-    /// Only show worktrees owned by this agent or session.
+    /// Only show worktrees owned by this agent or session. Cheap: read from
+    /// the ownership marker, no subprocess.
     #[arg(long)]
     pub owner: Option<String>,
 
-    /// Only show worktrees whose branch starts with this prefix.
+    /// Only show worktrees whose branch starts with this prefix. Cheap.
     #[arg(long)]
     pub prefix: Option<String>,
 
-    /// Only show worktrees Worktree Zero does not own.
+    /// Only show worktrees Worktree Zero does not own. Cheap.
     #[arg(long, conflicts_with = "managed")]
     pub unmanaged: bool,
 
-    /// Only show worktrees Worktree Zero owns.
+    /// Only show worktrees Worktree Zero owns. Cheap.
     #[arg(long)]
     pub managed: bool,
+
+    /// Only show worktrees with a process currently live in them. Computing
+    /// "live" runs `lsof` against every surviving worktree.
+    #[arg(long)]
+    pub live: bool,
 
     /// Compute each worktree's generated-state and `node_modules` size
     /// (walks the tree; not free, so opt in).
     #[arg(long)]
     pub size: bool,
+
+    /// Compute every expensive fact (`merged`, `dirty`, `live`, `size`) for
+    /// every worktree that survives the cheap filters, regardless of which
+    /// filters or sort were passed. The human table's MERGED/DIRTY/LIVE
+    /// columns otherwise show `?` — and JSON reports `null` — for any fact
+    /// nothing asked for.
+    #[arg(long)]
+    pub facts: bool,
 
     /// Sort the table.
     #[arg(long, value_enum)]
@@ -1402,7 +1422,7 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     }
 
     if let Some(state) = overlay {
-        if !args.force && !committed && worktree_dirty(&target)? {
+        if !args.force && !committed && worktree_dirty(&target, None)? {
             bail!("worktree has uncommitted changes; pass --commit or --force");
         }
         overlay::unmount(&target);
@@ -1580,19 +1600,54 @@ fn list(json_output: bool) -> Result<()> {
         return Ok(());
     }
 
+    let entries = list_json_entries(&repo)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "worktrees": entries,
+        }))?
+    );
+    Ok(())
+}
+
+/// `git worktree list --porcelain`, parsed into one JSON object per
+/// worktree and enriched with `runtime_id`/`owner`/`managed` from the
+/// ownership marker — a stat and, when managed, one small file read, no
+/// subprocess — so a hook like Builders Stack's `pre-remove` can verify
+/// ownership from `wt0 list --json` alone instead of shelling out to
+/// `fleet`. Split out from [`list`] so the enrichment is testable without
+/// capturing stdout.
+fn list_json_entries(repo: &RepoContext) -> Result<Vec<serde_json::Value>> {
     let output = {
         let _registry = StateLock::registry(&repo.common_git_dir);
-        git_output_common(&repo, ["worktree", "list", "--porcelain"])?
+        git_output_common(repo, ["worktree", "list", "--porcelain"])?
     };
     if !output.status.success() {
         return Err(git_failure("git worktree list --porcelain", &output));
     }
     let mut entries = Vec::new();
     let mut current = serde_json::Map::new();
+    let mut push_entry = |mut record: serde_json::Map<String, serde_json::Value>| {
+        if let Some(path) = record.get("worktree").and_then(|v| v.as_str()).map(PathBuf::from) {
+            let managed = is_managed(&path);
+            let lease = managed.then(|| stored_lease(&path).ok()).flatten();
+            record.insert("managed".to_owned(), json!(managed));
+            record.insert(
+                "runtime_id".to_owned(),
+                json!(lease.as_ref().map(|lease| lease.runtime_id.clone())),
+            );
+            record.insert(
+                "owner".to_owned(),
+                json!(lease.as_ref().and_then(|lease| lease.owner.clone())),
+            );
+        }
+        entries.push(serde_json::Value::Object(record));
+    };
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         if line.is_empty() {
             if !current.is_empty() {
-                entries.push(serde_json::Value::Object(std::mem::take(&mut current)));
+                push_entry(std::mem::take(&mut current));
             }
             continue;
         }
@@ -1605,21 +1660,19 @@ fn list(json_output: bool) -> Result<()> {
         current.insert(key.to_owned(), value);
     }
     if !current.is_empty() {
-        entries.push(serde_json::Value::Object(current));
+        push_entry(current);
     }
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "schema_version": 1,
-            "worktrees": entries,
-        }))?
-    );
-    Ok(())
+    Ok(entries)
 }
 
 /// One worktree's fleet-view facts, computed once and shared by the human
 /// table, the JSON receipt, and every `--filter`/`--sort` decision — so a
 /// filter and the value it is compared against can never drift apart.
+/// `merged`/`dirty`/`live`/`size_bytes`/`owned_generated_bytes` start `None`
+/// and are only filled in for the facts [`NeededFacts`] says this
+/// invocation actually needs, and only for rows that survive the cheap
+/// filters — a plain `wt0 fleet` spawns no `git`, runs no `lsof`, and walks
+/// no tree.
 struct FleetRow {
     path: PathBuf,
     is_main: bool,
@@ -1637,123 +1690,89 @@ struct FleetRow {
     /// git index mtime (documented on `--idle` since it's cheaper than
     /// walking every tracked file for its newest mtime).
     idle: Duration,
-    /// `None` when merge status can't be proven either way (no branch, or
-    /// no discoverable default branch) — distinct from a proven "no".
+    /// `None` when not computed ([`NeededFacts::merged`] was false for this
+    /// call), or when computed but merge status can't be proven either way
+    /// (no branch, or no discoverable default branch) — distinct from a
+    /// proven "no". Whether it was attempted at all is in the JSON output's
+    /// top-level `facts` list.
     merged: Option<bool>,
-    /// `None` when `git status` itself failed.
+    /// `None` when not computed, or when `git status` itself failed (or
+    /// timed out — see the `warnings` list in JSON output).
     dirty: Option<bool>,
-    live: bool,
+    /// `None` when not computed ([`NeededFacts::live`] was false).
+    live: Option<bool>,
     owned_generated_bytes: Option<u64>,
-    /// Generated state + logical `node_modules`; only computed with
-    /// `--size` (or `--sort size`), since it walks the tree.
+    /// Generated state + logical `node_modules`; only computed when
+    /// [`NeededFacts::size`] is true, since it walks the tree.
     size_bytes: Option<u64>,
+}
+
+/// Which of `fleet`'s expensive per-worktree facts an invocation actually
+/// needs — decided once from `--facts` and the filters/sort that depend on
+/// each fact, so a plain `wt0 fleet` (the check Builders Stack's
+/// `pre-remove` hook runs before every removal) never spawns `git` or
+/// `lsof`, or walks a tree, for a fact nothing asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct NeededFacts {
+    merged: bool,
+    dirty: bool,
+    live: bool,
+    size: bool,
+}
+
+impl NeededFacts {
+    fn for_args(args: &WorktreeFleet) -> Self {
+        Self {
+            merged: args.facts || args.merged || args.unmerged,
+            dirty: args.facts || args.dirty || args.clean,
+            live: args.facts || args.live,
+            size: args.facts || args.size || args.sort == Some(FleetSort::Size),
+        }
+    }
+
+    fn any(self) -> bool {
+        self.merged || self.dirty || self.live || self.size
+    }
+
+    /// Names of the facts this invocation computed, in a fixed order —
+    /// reported as JSON's top-level `facts` list so a `null` fact value can
+    /// be read as "not computed" (absent here) vs. "computed but
+    /// indeterminate" (present here, still `null` on the row).
+    fn names(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.merged {
+            names.push("merged");
+        }
+        if self.dirty {
+            names.push("dirty");
+        }
+        if self.live {
+            names.push("live");
+        }
+        if self.size {
+            names.push("size");
+        }
+        names
+    }
 }
 
 /// The swarm control view: every worktree with its lease, slot, idle time,
 /// merge/dirty/live status, and owned generated storage — the data an
-/// orchestrator or a human uses to decide what to clean up next.
+/// orchestrator or a human uses to decide what to clean up next. Cheap by
+/// default: only the ownership marker and lease are read. `--merged`,
+/// `--unmerged`, `--dirty`, `--clean`, `--live`, `--size`/`--sort size`, or
+/// `--facts` opt into the fact(s) they need, computed only for worktrees
+/// that already survived the cheap filters (`--idle`, `--owner`,
+/// `--prefix`, `--managed`/`--unmanaged`).
 pub fn fleet(args: WorktreeFleet, global_json: bool) -> Result<()> {
     let json_output = args.json || global_json;
     let repo = discover_repo(&std::env::current_dir()?)?;
     let now = now_unix_seconds()?;
-    let idle_floor = args.idle.as_deref().map(parse_duration).transpose()?;
-    let compute_size = args.size || args.sort == Some(FleetSort::Size);
-    let live_cwds = crate::process::live_working_directories()?;
-
-    let mut rows = Vec::new();
-    for entry in list_worktrees(&repo)? {
-        let branch = entry.branch.as_deref().map(|branch| {
-            branch
-                .strip_prefix("refs/heads/")
-                .unwrap_or(branch)
-                .to_owned()
-        });
-        let managed = is_managed(&entry.path);
-        let lease = if managed {
-            stored_lease(&entry.path).ok()
-        } else {
-            None
-        };
-        let idle = worktree_idle(&entry.path);
-        let merged = branch
-            .as_deref()
-            .and_then(|branch| is_branch_merged(&repo, branch));
-        let dirty = worktree_dirty(&entry.path).ok();
-        let live = live_cwds.iter().any(|cwd| cwd.starts_with(&entry.path))
-            || crate::process::live_open_path(&entry.path)?.is_some();
-        let owned_generated_bytes = generated_runtime(&repo, &entry.path)
-            .ok()
-            .flatten()
-            .map(|runtime| generated_logical_bytes(&runtime.root))
-            .transpose()?;
-        let size_bytes = compute_size.then(|| {
-            let node_modules = tree_size(&entry.path.join("node_modules")).1;
-            owned_generated_bytes.unwrap_or(0) + node_modules
-        });
-        rows.push(FleetRow {
-            path: entry.path,
-            is_main: entry.is_main,
-            managed,
-            runtime_id: lease.as_ref().map(|lease| lease.runtime_id.clone()),
-            slot: lease.as_ref().and_then(|lease| lease.slot),
-            port_base: lease
-                .as_ref()
-                .and_then(|lease| lease.port_base.or(lease.slot.map(port_base))),
-            owner: lease.as_ref().and_then(|lease| lease.owner.clone()),
-            mode: lease.as_ref().and_then(|lease| lease.mode.clone()),
-            ephemeral: lease.as_ref().map(|lease| lease.ephemeral),
-            created_at_unix: lease.as_ref().map(|lease| lease.created_at_unix),
-            heartbeat_at_unix: lease.as_ref().map(|lease| lease.heartbeat_at_unix),
-            branch,
-            idle,
-            merged,
-            dirty,
-            live,
-            owned_generated_bytes,
-            size_bytes,
-        });
-    }
-
-    rows.retain(|row| {
-        if let Some(floor) = idle_floor {
-            if row.idle < floor {
-                return false;
-            }
-        }
-        if args.merged && !row.merged.unwrap_or(false) {
-            return false;
-        }
-        if args.unmerged && row.merged.unwrap_or(false) {
-            return false;
-        }
-        if args.dirty && !row.dirty.unwrap_or(false) {
-            return false;
-        }
-        if args.clean && row.dirty.unwrap_or(false) {
-            return false;
-        }
-        if let Some(owner) = &args.owner {
-            if row.owner.as_deref() != Some(owner.as_str()) {
-                return false;
-            }
-        }
-        if let Some(prefix) = &args.prefix {
-            if !row
-                .branch
-                .as_deref()
-                .is_some_and(|branch| branch.starts_with(prefix.as_str()))
-            {
-                return false;
-            }
-        }
-        if args.unmanaged && row.managed {
-            return false;
-        }
-        if args.managed && !row.managed {
-            return false;
-        }
-        true
-    });
+    let FleetOutcome {
+        mut rows,
+        needed,
+        warnings,
+    } = compute_fleet_rows(&repo, &args)?;
 
     match args.sort {
         Some(FleetSort::Idle) => rows.sort_by_key(|row| std::cmp::Reverse(row.idle)),
@@ -1792,11 +1811,173 @@ pub fn fleet(args: WorktreeFleet, global_json: bool) -> Result<()> {
                 })
             })
             .collect();
-        emit(&json!({ "schema_version": 1, "runtimes": runtimes }));
+        emit(&json!({
+            "schema_version": 1,
+            "facts": needed.names(),
+            "warnings": warnings,
+            "runtimes": runtimes,
+        }));
     } else {
-        render_fleet_table(&rows, compute_size);
+        for warning in &warnings {
+            eprintln!("warning: {warning}");
+        }
+        render_fleet_table(&rows, needed.size);
     }
     Ok(())
+}
+
+/// [`fleet`]'s unsorted, unrendered result — the candidate rows (after both
+/// filter passes), which facts were actually computed, and any warning from
+/// a fact that failed or timed out. Split out from `fleet` so the
+/// cheap-by-default and needed-facts-only behavior is testable without
+/// capturing stdout.
+struct FleetOutcome {
+    rows: Vec<FleetRow>,
+    needed: NeededFacts,
+    warnings: Vec<String>,
+}
+
+fn compute_fleet_rows(repo: &RepoContext, args: &WorktreeFleet) -> Result<FleetOutcome> {
+    let idle_floor = args.idle.as_deref().map(parse_duration).transpose()?;
+    let needed = NeededFacts::for_args(args);
+    let mut warnings: Vec<String> = Vec::new();
+
+    let mut rows = Vec::new();
+    for entry in list_worktrees(repo)? {
+        let branch = entry.branch.as_deref().map(|branch| {
+            branch
+                .strip_prefix("refs/heads/")
+                .unwrap_or(branch)
+                .to_owned()
+        });
+        let managed = is_managed(&entry.path);
+        let lease = if managed {
+            stored_lease(&entry.path).ok()
+        } else {
+            None
+        };
+        let idle = worktree_idle(&entry.path);
+        rows.push(FleetRow {
+            path: entry.path,
+            is_main: entry.is_main,
+            managed,
+            runtime_id: lease.as_ref().map(|lease| lease.runtime_id.clone()),
+            slot: lease.as_ref().and_then(|lease| lease.slot),
+            port_base: lease
+                .as_ref()
+                .and_then(|lease| lease.port_base.or(lease.slot.map(port_base))),
+            owner: lease.as_ref().and_then(|lease| lease.owner.clone()),
+            mode: lease.as_ref().and_then(|lease| lease.mode.clone()),
+            ephemeral: lease.as_ref().map(|lease| lease.ephemeral),
+            created_at_unix: lease.as_ref().map(|lease| lease.created_at_unix),
+            heartbeat_at_unix: lease.as_ref().map(|lease| lease.heartbeat_at_unix),
+            branch,
+            idle,
+            merged: None,
+            dirty: None,
+            live: None,
+            owned_generated_bytes: None,
+            size_bytes: None,
+        });
+    }
+
+    // Cheap filters — ownership marker and lease fields only — narrow the
+    // candidate set before anything that spawns a process or walks a tree
+    // runs at all.
+    rows.retain(|row| {
+        if let Some(floor) = idle_floor {
+            if row.idle < floor {
+                return false;
+            }
+        }
+        if let Some(owner) = &args.owner {
+            if row.owner.as_deref() != Some(owner.as_str()) {
+                return false;
+            }
+        }
+        if let Some(prefix) = &args.prefix {
+            if !row
+                .branch
+                .as_deref()
+                .is_some_and(|branch| branch.starts_with(prefix.as_str()))
+            {
+                return false;
+            }
+        }
+        if args.unmanaged && row.managed {
+            return false;
+        }
+        if args.managed && !row.managed {
+            return false;
+        }
+        true
+    });
+
+    if needed.any() {
+        let live_cwds = if needed.live {
+            crate::process::live_working_directories()?
+        } else {
+            Vec::new()
+        };
+        for row in &mut rows {
+            if needed.dirty {
+                match worktree_dirty(&row.path, Some(FACT_GIT_TIMEOUT)) {
+                    Ok(value) => row.dirty = Some(value),
+                    Err(error) => warnings.push(format!(
+                        "dirty: {} — {error:#}",
+                        row.path.display()
+                    )),
+                }
+            }
+            if needed.merged {
+                row.merged = row
+                    .branch
+                    .as_deref()
+                    .and_then(|branch| is_branch_merged(repo, branch, Some(FACT_GIT_TIMEOUT)));
+            }
+            if needed.live {
+                let live = live_cwds.iter().any(|cwd| cwd.starts_with(&row.path))
+                    || crate::process::live_open_path(&row.path)?.is_some();
+                row.live = Some(live);
+            }
+            if needed.size {
+                let owned_generated_bytes = generated_runtime(repo, &row.path)
+                    .ok()
+                    .flatten()
+                    .map(|runtime| generated_logical_bytes(&runtime.root))
+                    .transpose()?;
+                let node_modules = tree_size(&row.path.join("node_modules")).1;
+                row.owned_generated_bytes = owned_generated_bytes;
+                row.size_bytes = Some(owned_generated_bytes.unwrap_or(0) + node_modules);
+            }
+        }
+    }
+
+    // Filters over computed facts run only after those facts exist.
+    rows.retain(|row| {
+        if args.merged && !row.merged.unwrap_or(false) {
+            return false;
+        }
+        if args.unmerged && row.merged.unwrap_or(false) {
+            return false;
+        }
+        if args.dirty && !row.dirty.unwrap_or(false) {
+            return false;
+        }
+        if args.clean && row.dirty.unwrap_or(false) {
+            return false;
+        }
+        if args.live && !row.live.unwrap_or(false) {
+            return false;
+        }
+        true
+    });
+
+    Ok(FleetOutcome {
+        rows,
+        needed,
+        warnings,
+    })
 }
 
 fn tri_state(value: Option<bool>) -> &'static str {
@@ -1879,7 +2060,7 @@ fn render_fleet_table(rows: &[FleetRow], show_size: bool) {
                 humanize_duration(row.idle),
                 tri_state(row.merged).to_owned(),
                 tri_state(row.dirty).to_owned(),
-                (if row.live { "yes" } else { "no" }).to_owned(),
+                tri_state(row.live).to_owned(),
                 row.mode.clone().unwrap_or_else(|| "unmanaged".to_owned()),
             ];
             if show_size {
@@ -2285,7 +2466,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
             skipped.push((entry.path, "active-cwd".to_owned()));
             continue;
         }
-        match worktree_dirty(&entry.path) {
+        match worktree_dirty(&entry.path, None) {
             Ok(true) => {
                 skipped.push((entry.path.clone(), "dirty".to_owned()));
                 continue;
@@ -2319,7 +2500,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
         // ignored state) takes priority in the dry-run report over "not
         // merged yet" — a worktree that's already preserved for being dirty
         // is reported as dirty, not doubly as unmerged.
-        if args.merged && !is_branch_merged(repo, short).unwrap_or(false) {
+        if args.merged && !is_branch_merged(repo, short, None).unwrap_or(false) {
             skipped.push((entry.path, "unmerged".to_owned()));
             continue;
         }
@@ -2450,8 +2631,8 @@ fn run_branch_delete(repo: &RepoContext, branch: &str, force: bool) -> Result<()
 /// instead of refusing.
 fn handle_unmerged_branch(repo: &RepoContext, branch: &str, base: Option<&str>) -> Result<()> {
     let current = main_checkout_branch(repo);
-    let tip = branch_tip(repo, branch);
-    let origin_ref = origin_default_ref(repo);
+    let tip = branch_tip(repo, branch, None);
+    let origin_ref = origin_default_ref(repo, None);
 
     let reason = if tip
         .as_deref()
@@ -2495,9 +2676,21 @@ fn main_checkout_branch(repo: &RepoContext) -> String {
     .unwrap_or_else(|| "a detached HEAD".to_owned())
 }
 
-fn branch_tip(repo: &RepoContext, branch: &str) -> Option<String> {
+/// `timeout`, when `Some`, bounds every git call this function (and the
+/// chain it's part of) makes — see [`FACT_GIT_TIMEOUT`]. Existing callers
+/// that need a definitive answer (`gc`, `remove`'s unmerged-branch message)
+/// pass `None`, unchanged from before the timeout existed; only `fleet`'s
+/// optional `merged` fact passes a bound, since it must never let a
+/// repository locked by a concurrently running agent stall a `fleet`
+/// pass.
+fn branch_tip(repo: &RepoContext, branch: &str, timeout: Option<Duration>) -> Option<String> {
     let branch_ref = format!("refs/heads/{branch}");
-    let output = git_output_common(repo, ["rev-parse", "--verify", "--quiet", &branch_ref]).ok()?;
+    let output = git_output_common_timed(
+        repo,
+        ["rev-parse", "--verify", "--quiet", &branch_ref],
+        timeout,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -2510,10 +2703,11 @@ fn branch_tip(repo: &RepoContext, branch: &str) -> Option<String> {
 /// discoverable without touching the network: the symref a clone (or
 /// `git remote set-head`) records at `refs/remotes/origin/HEAD`, falling
 /// back to whichever of `origin/main`/`origin/master` actually exists.
-fn origin_default_ref(repo: &RepoContext) -> Option<String> {
-    if let Ok(output) = git_output_common(
+fn origin_default_ref(repo: &RepoContext, timeout: Option<Duration>) -> Option<String> {
+    if let Ok(output) = git_output_common_timed(
         repo,
         ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+        timeout,
     ) {
         if output.status.success() {
             if let Ok(text) = String::from_utf8(output.stdout) {
@@ -2529,7 +2723,7 @@ fn origin_default_ref(repo: &RepoContext) -> Option<String> {
     }
     for candidate in ["origin/main", "origin/master"] {
         let candidate_ref = format!("refs/remotes/{candidate}");
-        if git_output_common(repo, ["rev-parse", "--verify", "--quiet", &candidate_ref])
+        if git_output_common_timed(repo, ["rev-parse", "--verify", "--quiet", &candidate_ref], timeout)
             .ok()
             .is_some_and(|output| output.status.success())
         {
@@ -2546,13 +2740,13 @@ fn origin_default_ref(repo: &RepoContext) -> Option<String> {
 /// branch when there is no `origin` at all. Returns a ref usable with
 /// `git merge-base --is-ancestor` — `refs/remotes/<remote>/<branch>` for the
 /// remote form, `refs/heads/<branch>` for the local fallback.
-fn default_branch_ref(repo: &RepoContext) -> Option<String> {
-    if let Some(remote) = origin_default_ref(repo) {
+fn default_branch_ref(repo: &RepoContext, timeout: Option<Duration>) -> Option<String> {
+    if let Some(remote) = origin_default_ref(repo, timeout) {
         return Some(format!("refs/remotes/{remote}"));
     }
     for candidate in ["main", "master"] {
         let candidate_ref = format!("refs/heads/{candidate}");
-        if git_output_common(repo, ["rev-parse", "--verify", "--quiet", &candidate_ref])
+        if git_output_common_timed(repo, ["rev-parse", "--verify", "--quiet", &candidate_ref], timeout)
             .ok()
             .is_some_and(|output| output.status.success())
         {
@@ -2564,14 +2758,16 @@ fn default_branch_ref(repo: &RepoContext) -> Option<String> {
 
 /// Whether `branch`'s tip is fully contained in the project's default
 /// branch ([`default_branch_ref`]) — "merged and forgotten". `None` when
-/// merge status can't be proven either way (no such branch, or no
-/// discoverable default branch), which callers should treat as "not merged"
-/// for any removal decision: an indeterminate branch is never assumed safe.
-fn is_branch_merged(repo: &RepoContext, branch: &str) -> Option<bool> {
-    let tip = branch_tip(repo, branch)?;
-    let default_ref = default_branch_ref(repo)?;
+/// merge status can't be proven either way (no such branch, no discoverable
+/// default branch, or — with a bounded `timeout` — a git call that timed
+/// out), which callers should treat as "not merged" for any removal
+/// decision: an indeterminate branch is never assumed safe.
+fn is_branch_merged(repo: &RepoContext, branch: &str, timeout: Option<Duration>) -> Option<bool> {
+    let tip = branch_tip(repo, branch, timeout)?;
+    let default_ref = default_branch_ref(repo, timeout)?;
     let output =
-        git_output_common(repo, ["merge-base", "--is-ancestor", &tip, &default_ref]).ok()?;
+        git_output_common_timed(repo, ["merge-base", "--is-ancestor", &tip, &default_ref], timeout)
+            .ok()?;
     Some(output.status.success())
 }
 
@@ -3197,8 +3393,12 @@ fn worktree_idle(worktree: &Path) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
-fn worktree_dirty(worktree: &Path) -> Result<bool> {
-    let output = git_output_at(worktree, ["status", "--porcelain"])?;
+/// `timeout`, when `Some`, bounds this call (see [`FACT_GIT_TIMEOUT`]).
+/// `remove` and `gc` need a definitive answer and pass `None`, unchanged
+/// from before the timeout existed; only `fleet`'s optional `dirty` fact
+/// passes a bound.
+fn worktree_dirty(worktree: &Path, timeout: Option<Duration>) -> Result<bool> {
+    let output = git_output_at_timed(worktree, ["status", "--porcelain"], timeout)?;
     if !output.status.success() {
         return Err(git_failure("git status --porcelain", &output));
     }
@@ -4076,6 +4276,87 @@ fn git_output_at<const N: usize>(path: &Path, args: [&str; N]) -> Result<Output>
         .args(args)
         .output()
         .context("run git")
+}
+
+/// The cap on a single fact-computing git call (`git status`, `git
+/// rev-parse`, `git merge-base`) issued by `fleet`'s optional `dirty` and
+/// `merged` facts — long enough that no healthy repository needs it, short
+/// enough that a repository whose index or refs are locked by a
+/// concurrently running agent cannot stall a `fleet --json` pass (Builders
+/// Stack's `pre-remove` hook calls it before every removal).
+const FACT_GIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bounded sibling of [`git_output_common`] — `timeout: None` behaves
+/// identically (an ordinary, unbounded `Command::output()`); `Some(d)`
+/// kills the process and returns an error if it hasn't finished within `d`.
+fn git_output_common_timed<const N: usize>(
+    repo: &RepoContext,
+    args: [&str; N],
+    timeout: Option<Duration>,
+) -> Result<Output> {
+    let mut command = Command::new("git");
+    command
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .args(args);
+    match timeout {
+        Some(timeout) => run_git_bounded(&mut command, timeout),
+        None => command.output().context("run git"),
+    }
+}
+
+/// Bounded sibling of [`git_output_at`]; see [`git_output_common_timed`].
+fn git_output_at_timed<const N: usize>(
+    path: &Path,
+    args: [&str; N],
+    timeout: Option<Duration>,
+) -> Result<Output> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(path).args(args);
+    match timeout {
+        Some(timeout) => run_git_bounded(&mut command, timeout),
+        None => command.output().context("run git"),
+    }
+}
+
+/// Runs `command`, killing it and returning an error if it hasn't finished
+/// within `timeout` — used only by the two `_timed` helpers above, which in
+/// turn are used only by `fleet`'s optional per-worktree facts. Every other
+/// git invocation in this module keeps the plain, unbounded
+/// `Command::output()` (`git_output_common`/`git_output_at`/`run_command`),
+/// since those back core operations (`worktree add`, `remove`,
+/// `gc --apply`) that must run to completion rather than give up early.
+fn run_git_bounded(command: &mut Command, timeout: Duration) -> Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().context("spawn git")?;
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buffer);
+        buffer
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buffer);
+        buffer
+    });
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().context("wait for git")? {
+            break status;
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("git timed out after {}s", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Ok(Output {
+        status,
+        stdout: stdout_reader.join().unwrap_or_default(),
+        stderr: stderr_reader.join().unwrap_or_default(),
+    })
 }
 
 pub(super) fn run_command(command: &mut Command, description: &str) -> Result<()> {

@@ -35,13 +35,35 @@ lines from a real run, right after `wt0 create agent/add-tests` and
 /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-fix-checkout-9b8dc285  87194d1 [agent/fix-checkout]
 ```
 
+`wt0 list --json` adds `runtime_id`, `owner`, and `managed` per worktree —
+read straight from the ownership marker (a stat, and for a managed worktree
+one small file read; no subprocess). This is the cheapest way to check
+whether wt0 owns a given path before removing it — the recommended check
+for a `pre-remove` hook or similar:
+
+```bash
+wt0 list --json | jq --arg dir "$WT0_WORKTREE" --arg id "$WT0_RUNTIME_ID" \
+  '.worktrees[] | select(.worktree == $dir and .runtime_id == $id)'
+```
+
 `wt0 fleet` is the control view: every Worktree Zero runtime — and every
-worktree it doesn't own — with owner, slot, port window, idle time, whether
-its branch is merged into the default branch, whether it's dirty, whether a
-process is live in it, mode, and path (`wt0 fleet --json` for the
-machine-readable form, with the same facts additively). Same two runtimes,
-after `add-tests`' branch was merged and `fix-checkout`'s work is still in
-progress:
+worktree it doesn't own — with owner, slot, port window, and idle time, all
+cheap (the ownership marker and lease; no subprocess). Whether a branch is
+merged, whether it's dirty, whether a process is live in it, and its
+generated-state/`node_modules` size are each expensive to compute (`git`,
+`lsof`, or a tree walk) and so are opt-in: `--merged`/`--unmerged` compute
+`merged`; `--dirty`/`--clean` compute `dirty`; `--live` computes `live` (and
+filters to it); `--size` (or `--sort size`) computes `size`; `--facts`
+computes all four regardless of which filters were passed. Only worktrees
+that already survived the cheap filters below pay for a fact. A plain
+`wt0 fleet` — what Builders Stack's `pre-remove` hook runs before every
+removal — spawns no `git`, runs no `lsof`, and walks no tree.
+
+Facts nothing asked for show as `?` in the human table and `null` in JSON,
+which also reports which facts were computed, additively, as a top-level
+`facts` list (`wt0 fleet --json` for the machine-readable form). Same two
+runtimes as above, this time with `wt0 fleet --facts`, after `add-tests`'
+branch was merged and `fix-checkout`'s work is still in progress:
 
 ```text
 Worktree Zero fleet: 3 worktree(s)
@@ -60,14 +82,19 @@ checkout's git index mtime rather than a heartbeat, since walking every
 tracked file for its newest mtime isn't worth the cost.
 
 Filter with `--idle <duration>` (idle at least this long), `--merged` /
-`--unmerged`, `--dirty` / `--clean`, `--owner <id>`, `--prefix <branch
-prefix>`, `--unmanaged` / `--managed` — combinable, all AND'd together.
-`wt0 fleet --idle 7d` finds worktrees nobody has touched in a week;
+`--unmerged`, `--dirty` / `--clean`, `--live`, `--owner <id>`, `--prefix
+<branch prefix>`, `--unmanaged` / `--managed` — combinable, all AND'd
+together. `--idle`, `--owner`, `--prefix`, `--unmanaged`/`--managed` are
+cheap and narrow the candidate set before any expensive fact is computed
+for it. `wt0 fleet --idle 7d` finds worktrees nobody has touched in a week;
 `wt0 fleet --merged --dirty` finds merged branches someone left dirty work
 in (so `gc --merged` alone won't touch them). `--sort idle|branch|size`
-orders the table; `size` (and `--sort size`) additionally computes each
-worktree's generated-state plus logical `node_modules` size, which is not
-free — it walks the tree — so it's opt-in.
+orders the table.
+
+`git status` and `git merge-base` calls made for the `dirty`/`merged` facts
+are killed and reported `null` (with a `warnings` entry in JSON) if they
+don't finish within 10 seconds, so a repository locked by a concurrently
+running agent can't stall a `fleet` pass.
 
 Both worktrees above were created without `--path`: by default a worktree
 lives under `<repo>/.git/wt0/worktrees/<slug>/`, inside the repository's own
