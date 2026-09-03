@@ -556,3 +556,84 @@ row) also completed without refusal; removal of the 236,332-file hoisted
 trees took roughly a minute each (many individual `unlink` calls, unlike
 the single `clonefile` call `create` uses), consistent with the "removing
 it took 65 s" receipt already recorded in gap #7 above.
+
+### Verification — hoisted node_modules per-worktree cost (2026-09-03)
+
+The 2×2 section above flagged its 89.1 MiB figure "provisional pending an
+independent re-run" because it revises gap #7's published 471 MiB for the
+same 236k-file hoisted tree. Independent re-run, separate session, fresh
+24 GiB APFS sparse image, FLAM's real `origin/main` (`20f6601a`, fetched
+directly from GitHub — the maintainer's local mirror was 363 commits
+stale), `bunfig.toml` overridden to `linker = "hoisted"` and committed,
+Bun 1.3.14, `BUN_INSTALL` on the bench volume. Base install: 1,920
+packages, 236,342 files / 479 symlinks / 28,930 dirs under `node_modules`.
+Six worktrees, two methods interleaved (A B A B A B) so volume state and
+ordering cannot explain a difference, physical `df -k` deltas with `sync`
+before every read:
+
+| Worktree | Method | Create/seed | Reconcile/prepare | Total | Final files |
+| --- | --- | ---: | ---: | ---: | ---: |
+| A1 | `wt0 create --require-cow` (`.wt0-seed`) | +91.3 MiB (seeded) | +1.40 MiB (`bun install`) | **92.7 MiB** | 236,343 |
+| B1 | `--no-seed` + `wt0 prepare --apply` | +1.65 MiB (checkout only) | +176.9 MiB (first seal) | **178.6 MiB** | 236,343 |
+| A2 | seed | +89.0 MiB | +1.37 MiB | **90.4 MiB** | 236,342 |
+| B2 | prepare (cache hit) | +1.68 MiB | +87.7 MiB (attach) | **89.4 MiB** | 236,343 |
+| A3 | seed | +89.0 MiB | +1.37 MiB | **90.4 MiB** | 236,342 |
+| B3 | prepare (cache hit) | +1.66 MiB | +88.0 MiB (attach) | **89.7 MiB** | 236,343 |
+
+**89.1 MiB stands; 460–471 MiB does not reflect what wt0 does today.**
+Steady-state cost (A2, A3, B2, B3 — B1 is the one-time sealing cost the
+whole environment family pays once, not a per-worktree cost) averages
+90.0 MiB, ≈403 bytes/file, matching the 2×2 section's 89.1 MiB
+(≈395 bytes/file) within 1%. B1's 178.6 MiB — a genuinely one-time cost,
+since `wt0 prepare` seeds *and* publishes to `.git/wt0/environments/`
+(two whole-tree clones) only when no cached environment exists yet —
+matches the 2×2 section's already-published "Worktree #1: 179.4 MiB"
+within 0.5%. `wt0 create`'s own seed path (`.wt0-seed`, method A) has no
+such amortization: every worktree clones straight from the base checkout,
+so its cost is flat at ~90 MiB regardless of how many worktrees came
+before it, while `wt0 prepare --apply` (method B) pays 178.6 MiB once per
+environment key and ~89 MiB for every worktree after.
+
+**Why gap #7 said 471 MiB.** `git log` on this repository settles it:
+`.wt0-seed` (the feature gap #7's "seed clone" column claims to measure)
+landed in `fc2d89f` at 19:55 on 2026-09-02 — twelve minutes *after*
+`25f13867`, the docs commit that published gap #7's 471 MiB figure, at
+19:43 the same day. Gap #7's number cannot have come from wt0's own seed
+code; it predates that code's existence. It also cannot have come from
+today's whole-tree `clonefile` (`clone_tree_atomically` in `cow.rs`,
+which this session's `wt0 create` receipts confirm is still what runs):
+that optimization landed earlier the same day, in `dc773dc2` at 18:56, so
+gap #7's separately-scripted "direct `clonefile(2)`" measurement had it
+available and, per its own prose, used "one directory `clonefile`" too —
+yet still landed 5x higher than every whole-tree-`clonefile` measurement
+since. The most likely account, unproven but consistent with every timing
+fact above: gap #7's script cloned file-by-file (`cp -c -R` recurses into
+one `clonefile(2)` call per entry, not one call for the whole tree) rather
+than through the atomic whole-directory syscall `cow.rs` uses, and the
+~2 KB/file constant this session's `CLONED_FILE_METADATA_BYTES` inherited
+from it (`worktree.rs:2484`, added in the same `fc2d89f` commit that
+introduced `.wt0-seed`, twelve minutes after gap #7's docs commit) was
+calibrated against that script rather than against the seed path it now
+describes — it still drives `wt0 doctor`'s user-facing metadata warning
+today and overstates the real cost by roughly 5x.
+
+Two hypothesis checks, both negative — neither explains the gap:
+
+- **Sealed tree shape vs. the base.** `.git/wt0/environments/bun/*/node_modules`
+  (the tree B1 published) has 236,343 files / 479 symlinks / 28,930 dirs —
+  the same shape as the base's 236,342 files / 479 symlinks / 28,930 dirs
+  (the +1 is the reconcile's own write). No hidden symlink layer explains
+  the smaller number; it is a real tree of real files, clonefiled twice.
+- **Clone of a clone.** A direct `clonefile(2)` (Python `ctypes`) of A3's
+  `node_modules` (one generation from the base) cost 87.7 MiB; the same
+  call on B2's `node_modules` (seeded from base into B1, published to the
+  store, attached into B2 — three clone generations removed) cost
+  87.9 MiB. APFS does not charge more for cloning a clone; the per-file
+  metadata floor is set once, at clone time, regardless of lineage.
+
+A delayed `df -k` re-read 10 s after `sync` moved by 4 KiB — noise, not
+delayed accounting.
+
+Six `wt0 create`/`prepare` receipts, `wt0 remove --force` teardown of all
+six worktrees, and the two `ctypes.clonefile` probe deltas back every
+number above.

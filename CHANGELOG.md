@@ -97,6 +97,19 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   an earlier "no reduction" finding — flagged provisional pending an
   independent re-run — and superseded three FLAM rows in the README's
   "What a worktree costs you today" table.
+- **The 2×2's 89 MiB hoisted-`node_modules` figure is settled, not
+  provisional.** A separate six-worktree re-run (interleaved `.wt0-seed`
+  clones and `wt0 prepare --apply` attaches, fresh APFS sparse image,
+  `docs/design-partners/flam-migration.md`'s new "Verification — hoisted
+  node_modules per-worktree cost") reproduces the 2×2's marginal cost
+  (89.96 MiB measured vs. 89.1 MiB published) and its first-worktree cost
+  (178.6 MiB vs. 179.4 MiB) within 1%, and traces why gap #7's 471 MiB
+  figure — and the `CLONED_FILE_METADATA_BYTES` constant `wt0 doctor`
+  still quotes, both from `worktree.rs` — predate the `.wt0-seed` feature
+  they claimed to measure and this session's whole-tree `clonefile`
+  optimization (`cow.rs`'s `clone_tree_atomically`), which cuts the
+  metadata cost per cloned file roughly 5x. The README's fourth row and
+  caveat now state 89 MiB (marginal) / 179 MiB (first worktree) plainly.
 
 ## 0.1.16 — 2026-09-02
 
