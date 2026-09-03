@@ -344,6 +344,61 @@ Worktree Zero is not stable until a new agent integration can:
 - [Compatibility contract](docs/compatibility.md) and
   [FLAM design-partner brief](docs/design-partners/flam.md).
 
+## FAQ
+
+- **`npx wt0` says 404.** The npm package is `worktree-zero` — the registry
+  refuses the bare name `wt0` as too similar to existing short packages —
+  but the installed command is still `wt0`. Use `npx worktree-zero …` or
+  `npm i -g worktree-zero`.
+- **Where does a worktree live?** Under `<repo>/.git/wt0/worktrees/<slug>/`
+  by default, so nothing is added beside your checkout; pass `--path` to put
+  it anywhere. Editors that skip dot-directories in their file tree need to
+  be pointed at it explicitly.
+- **What does a worktree cost?** The checkout is a copy-on-write clone — a
+  few MiB regardless of checkout size (see the table above). Dependencies
+  cost what the manager's layout costs: a link tree (pnpm, Bun
+  `globalStore`) ~3–7 MiB; a seeded hoisted tree about 2 KB of filesystem
+  metadata per file. The first worktree of a base commit costs about the
+  same as the second
+  ([D13](docs/design-partners/flam-migration.md#after---d13---the-first-worktree-2026-09-02)).
+- **Why is Bun's global store (or pnpm) still recommended if wt0 shares
+  files?** Copy-on-write shares blocks, not inodes: a 236k-file hoisted
+  `node_modules` still needs 236k inodes per worktree. A link tree makes it
+  ~12k symlinks instead. wt0 detects the mode, and `doctor` prints the one
+  config line that closes the gap.
+- **Will an agent's `npm install` inside a worktree break the sharing?** No —
+  measured: adding a package writes the package (~5 MiB for lodash), never
+  the tree; a seeded `.next/cache` survives an edit and rebuild 4× faster
+  and 85% smaller than a cold one
+  ([drift.md](docs/design-partners/drift.md)).
+- **Will it delete my work?** `gc` and `remove` refuse dirty trees, unmerged
+  branches, unowned worktrees, detached commits, and unknown ignored state,
+  and a live process blocks removal outright; `--force` is explicit, and a
+  `pre-remove` hook can veto even that. Removal never touches `.immorterm`
+  or user data.
+- **What are slots, port windows, `WT0_SLUG`?** A slot is a small index per
+  live worktree; a port window is 100 ports (20000+) claimed machine-wide
+  with a bind probe; the slug is a URL-safe branch label. Hooks and
+  `wt0 run` see them as `WT0_SLOT`, `WT0_PORT_BASE`, `WT0_SLUG` — use them
+  for dev-server ports and portless hostnames (FLAM and Builders Stack
+  derive their Tilt port and hostnames from them; see the
+  [Tilt integration](integrations/tilt/README.md)).
+- **What happens when an agent crashes?** The lease stops refreshing;
+  `wt0 gc --older-than` reaps the worktree, frees its slot and ports, and
+  retires its generated state; an `rm -rf` is recovered by `wt0 prune` as an
+  orphan with its runtime id
+  ([orphans](docs/lifecycle.md#orphans-a-checkout-that-vanished-outside-wt0)).
+- **Windows?** ReFS/Dev Drive gives copy-on-write, and the storage numbers
+  hold (9.8 MiB per worktree in CI). `wt0 create` is slower there today
+  (per-file cloning; the CI receipt shows the current number). NTFS falls
+  back to a plain checkout and says so.
+- **Is `doctor` "not ready" a blocker?** No — `create` works regardless;
+  "ready" means dependencies are shared and generated state has a retention
+  policy. `create` now prints the next step when it isn't.
+- **What is simgit?** The copy-on-write engine wt0 started from, included
+  under its MIT license with history; wt0 adds everything around it (see
+  [Origins](#origins) below).
+
 ## Origins
 
 The source engine began in [simgit](https://github.com/abendrothj/simgit) by

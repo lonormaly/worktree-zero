@@ -23,6 +23,31 @@ wt0 migrate --all --source-only
 wt0 migrate --all --source-only --apply --adopt
 ```
 
+### Inspecting the fleet
+
+`wt0 list` prints every worktree Git's own registry knows about, owned by
+Worktree Zero or not — path, commit, and branch, one line per worktree. Two
+lines from a real run, right after `wt0 create agent/add-tests` and
+`wt0 create agent/fix-checkout`:
+
+```text
+/Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-add-tests-99c97ab6     87194d1 [agent/add-tests]
+/Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-fix-checkout-9b8dc285  87194d1 [agent/fix-checkout]
+```
+
+`wt0 fleet` is the control view: every Worktree Zero runtime with its slot,
+port window, lease age, mode, and path — the one call an orchestrator needs
+(`wt0 fleet --json` for the machine-readable form). Same two runtimes:
+
+```text
+  agent/add-tests  slot 4  ports 22500+  lease 0s  cow-clone  /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-add-tests-99c97ab6
+  agent/fix-checkout  slot 1  ports 22300+  lease 1s  cow-clone  /Users/shaisnir/Development/worktree-zero/.git/wt0/worktrees/agent-fix-checkout-9b8dc285
+```
+
+Both worktrees above were created without `--path`: by default a worktree
+lives under `<repo>/.git/wt0/worktrees/<slug>/`, inside the repository's own
+`.git` directory, so nothing is added beside your checkout.
+
 ### Orphans: a checkout that vanished outside wt0
 
 An `rm -rf`, a wiped temp volume, or a crashed machine removes a checkout

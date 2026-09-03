@@ -314,6 +314,7 @@ fn add(args: WorktreeAdd, json: bool) -> Result<()> {
             "slug": branch_slug(&args.branch),
             "reused": created.reused,
             "seeded": created.seeded,
+            "dependencies": created.dependencies,
         }));
     } else {
         eprintln!("mode: {}", created.mode);
@@ -334,6 +335,16 @@ fn add(args: WorktreeAdd, json: bool) -> Result<()> {
         eprintln!("runtime: {}", created.lease.runtime_id);
         println!("{}", created.target.display());
     }
+    // A JavaScript manager was detected but the new worktree has no usable
+    // dependency tree yet — never blocks the create, just says what to do
+    // next. Printed on stderr regardless of --json so an agent piping stdout
+    // still sees it.
+    if created.dependencies == Some("not-prepared") {
+        eprintln!(
+            "next: run `wt0 prepare --apply` in {} (wt0 run does this automatically)",
+            created.target.display()
+        );
+    }
     Ok(())
 }
 
@@ -345,6 +356,9 @@ struct CreatedWorktree {
     lease: RuntimeLease,
     reused: bool,
     seeded: Vec<serde_json::Value>,
+    /// "prepared" | "native" | "not-prepared", or `None` when no JavaScript
+    /// package manager was detected. See `runtime::dependency_classification`.
+    dependencies: Option<&'static str>,
 }
 
 fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
@@ -417,7 +431,8 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
             Err(error) => {
                 ports::release(&target);
                 let _ = force_teardown(&repo, &target);
-                let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
+                let _ =
+                    delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true, None);
                 return Err(error).context("record worktree ownership lease");
             }
         }
@@ -425,7 +440,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
     if args.ephemeral {
         if let Err(error) = mark_ephemeral(&target) {
             let _ = force_teardown(&repo, &target);
-            let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
+            let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true, None);
             return Err(error).context("mark worktree ephemeral");
         }
     }
@@ -437,7 +452,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         Ok(generated) => generated,
         Err(error) => {
             let _ = force_teardown(&repo, &target);
-            let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
+            let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true, None);
             return Err(error).context("prepare owned generated runtime");
         }
     };
@@ -461,10 +476,15 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         crate::hooks::run_hook(&target, crate::hooks::HookEvent::PostCreate, &hook_env)
     {
         let _ = force_teardown(&repo, &target);
-        let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
+        let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true, None);
         return Err(error).context("post-create hook failed; worktree rolled back");
     }
 
+    // Reuses the same classification `wt0 doctor` reports, computed after
+    // populate + seeding so a seeded or already-native tree is credited.
+    let dependencies = crate::runtime::dependency_classification(&target)
+        .ok()
+        .flatten();
     crate::events::record(
         &repo.common_git_dir,
         "created",
@@ -487,6 +507,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         lease,
         reused: false,
         seeded,
+        dependencies,
     })
 }
 
@@ -558,6 +579,9 @@ fn reuse_existing_runtime(
             "runtime_id": lease.runtime_id,
         }),
     );
+    let dependencies = crate::runtime::dependency_classification(&existing)
+        .ok()
+        .flatten();
     // same_path proved `existing` and `target` name one location; report the
     // request's resolved spelling so a retried create's receipt is
     // byte-identical to the original on every platform.
@@ -581,6 +605,7 @@ fn reuse_existing_runtime(
         },
         reused: true,
         seeded: Vec::new(),
+        dependencies,
     })
 }
 
@@ -1059,7 +1084,7 @@ fn add_overlay_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &
         let _ = fs::remove_dir_all(target);
         let _ = fs::remove_dir_all(&overlay_dir);
         let _ = run_git_common(repo, [OsStr::new("worktree"), OsStr::new("prune")]);
-        let _ = delete_local_branch(repo, branch, true);
+        let _ = delete_local_branch(repo, branch, true, None);
         return Err(error);
     }
     Ok(())
@@ -1113,6 +1138,10 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     let overlay = overlay::state(&repo, &target);
 
     let removed_runtime_id = runtime_identity(&target).ok();
+    // Captured before the worktree (and its ownership marker) is gone: a
+    // later --delete-branch refusal needs the base commit to tell "no
+    // commits of its own" from a branch that genuinely diverged.
+    let branch_base = stored_lease(&target).ok().and_then(|lease| lease.base);
     let mut hook_env = vec![
         ("WT0_WORKTREE", target.display().to_string()),
         ("WT0_REPO_ROOT", repo.main_worktree.display().to_string()),
@@ -1163,7 +1192,8 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
             command.arg("--force");
         }
         command.arg(&target);
-        run_command(&mut command, "git worktree remove")?;
+        run_command(&mut command, "git worktree remove")
+            .map_err(|error| refine_remove_refusal(&target, error))?;
     }
 
     ports::release(&target);
@@ -1183,7 +1213,7 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     let mut branch_deleted = false;
     if args.delete_branch {
         let branch = branch.context("cannot delete branch for a detached worktree")?;
-        delete_local_branch(&repo, &branch, args.force)?;
+        delete_local_branch(&repo, &branch, args.force, branch_base.as_deref())?;
         branch_deleted = true;
     }
     if json {
@@ -1197,6 +1227,25 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         println!("{}", target.display());
     }
     Ok(())
+}
+
+/// Git's own "contains modified or untracked files" refusal names the
+/// worktree but not what to do about it. Reframe it as wt0's own refusal
+/// with the three ways out, keeping git's original text as the `caused by`
+/// cause rather than discarding it.
+fn refine_remove_refusal(target: &Path, error: anyhow::Error) -> anyhow::Error {
+    if error
+        .to_string()
+        .contains("contains modified or untracked files")
+    {
+        error.context(format!(
+            "refusing to remove {}: it has modified or untracked files — commit them, pass \
+             --commit to keep them on the branch, or --force to discard",
+            target.display()
+        ))
+    } else {
+        error
+    }
 }
 
 /// Resolve a user-supplied worktree reference — an explicit path, a branch
@@ -1681,7 +1730,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
                 );
                 if args.delete_branches {
                     if let Some(branch) = &entry.branch {
-                        if delete_local_branch(repo, branch, false).is_err() {
+                        if delete_local_branch(repo, branch, false, None).is_err() {
                             retained_branches.push(short.to_owned());
                         } else {
                             deleted_branches.push(short.to_owned());
@@ -1705,7 +1754,17 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
     })
 }
 
-fn delete_local_branch(repo: &RepoContext, branch_ref: &str, force: bool) -> Result<()> {
+/// `base` is the commit the removed worktree was created from (its lease's
+/// `base`, read before removal deleted the marker) — used only to recognize
+/// "this branch never moved past its base" when `-d` refuses. Callers that
+/// already pass `force: true` (rollback paths) never reach that logic, so
+/// they may pass `None`.
+fn delete_local_branch(
+    repo: &RepoContext,
+    branch_ref: &str,
+    force: bool,
+    base: Option<&str>,
+) -> Result<()> {
     let branch = branch_ref.strip_prefix("refs/heads/").unwrap_or(branch_ref);
     if branch == "main" || branch == "master" {
         bail!("refusing to delete primary branch '{branch}'");
@@ -1714,11 +1773,122 @@ fn delete_local_branch(repo: &RepoContext, branch_ref: &str, force: bool) -> Res
     // not checked out anywhere, so it needs the same serialization as the
     // registry mutations it races against.
     let _registry = StateLock::registry(&repo.common_git_dir);
+    if force {
+        return run_branch_delete(repo, branch, true);
+    }
+    match run_branch_delete(repo, branch, false) {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains("is not fully merged") => {
+            handle_unmerged_branch(repo, branch, base)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn run_branch_delete(repo: &RepoContext, branch: &str, force: bool) -> Result<()> {
     let mut command = Command::new("git");
     command
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))
         .args(["branch", if force { "-D" } else { "-d" }, branch]);
     run_command(&mut command, "delete worktree branch")
+}
+
+/// `git branch -d` refuses on "not fully merged" — Git's language for
+/// "not reachable from wherever HEAD is in the checkout you ran this from",
+/// which for an agent removing a worktree from elsewhere is rarely obvious.
+/// Reframe it against the main checkout's actual current branch. When
+/// nothing is actually lost — the branch never moved past its own base, or
+/// the remote's default branch already carries its commits — delete it
+/// instead of refusing.
+fn handle_unmerged_branch(repo: &RepoContext, branch: &str, base: Option<&str>) -> Result<()> {
+    let current = main_checkout_branch(repo);
+    let tip = branch_tip(repo, branch);
+    let origin_ref = origin_default_ref(repo);
+
+    let reason = if tip
+        .as_deref()
+        .zip(base)
+        .is_some_and(|(tip, base)| tip == base)
+    {
+        Some("it has no commits of its own".to_owned())
+    } else {
+        tip.as_deref()
+            .zip(origin_ref.as_deref())
+            .and_then(|(tip, origin_ref)| {
+                let contained =
+                    git_output_common(repo, ["merge-base", "--is-ancestor", tip, origin_ref])
+                        .ok()
+                        .is_some_and(|output| output.status.success());
+                contained.then(|| format!("{origin_ref} already contains it"))
+            })
+    };
+
+    if let Some(reason) = reason {
+        eprintln!("branch {branch} is not merged into {current}; {reason} — deleting it");
+        return run_branch_delete(repo, branch, true);
+    }
+
+    bail!(
+        "branch {branch} is not merged into {current}; it is kept — delete it with \
+         git branch -D if intended"
+    );
+}
+
+/// The branch currently checked out in the repository's main worktree — the
+/// branch git actually measured "not fully merged" against, whichever
+/// checkout the remove was invoked from.
+fn main_checkout_branch(repo: &RepoContext) -> String {
+    git_path_output(
+        &repo.main_worktree,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .ok()
+    .filter(|name| !name.is_empty())
+    .unwrap_or_else(|| "a detached HEAD".to_owned())
+}
+
+fn branch_tip(repo: &RepoContext, branch: &str) -> Option<String> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let output = git_output_common(repo, ["rev-parse", "--verify", "--quiet", &branch_ref]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|text| text.trim().to_owned())
+}
+
+/// The remote's default branch as a remote-tracking ref (`origin/main`), if
+/// discoverable without touching the network: the symref a clone (or
+/// `git remote set-head`) records at `refs/remotes/origin/HEAD`, falling
+/// back to whichever of `origin/main`/`origin/master` actually exists.
+fn origin_default_ref(repo: &RepoContext) -> Option<String> {
+    if let Ok(output) = git_output_common(
+        repo,
+        ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    ) {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                let short = text
+                    .trim()
+                    .strip_prefix("refs/remotes/")
+                    .unwrap_or(text.trim());
+                if !short.is_empty() {
+                    return Some(short.to_owned());
+                }
+            }
+        }
+    }
+    for candidate in ["origin/main", "origin/master"] {
+        let candidate_ref = format!("refs/remotes/{candidate}");
+        if git_output_common(repo, ["rev-parse", "--verify", "--quiet", &candidate_ref])
+            .ok()
+            .is_some_and(|output| output.status.success())
+        {
+            return Some(candidate.to_owned());
+        }
+    }
+    None
 }
 
 /// A linked worktree as reported by `git worktree list --porcelain`.
@@ -3140,7 +3310,7 @@ fn ensure_clean(worktree: &Path) -> Result<()> {
 
 fn rollback_created_worktree(repo: &RepoContext, target: &Path, branch: &str) {
     let _ = remove_worktree_force(repo, target);
-    let _ = delete_local_branch(repo, branch, true);
+    let _ = delete_local_branch(repo, branch, true, None);
 }
 
 fn remove_worktree_force(repo: &RepoContext, target: &Path) -> Result<()> {

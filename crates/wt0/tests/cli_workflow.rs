@@ -1441,6 +1441,120 @@ fn npm_recommendation_states_it_has_no_machine_wide_store() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn create_prints_a_prepare_hint_and_reports_not_prepared_dependencies() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-create-hint-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    let worktree = root.join("worktree");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+    fs::write(repo.join("package-lock.json"), "{\"lockfileVersion\": 3}\n")
+        .expect("write lockfile");
+    fs::write(repo.join("package.json"), "{\"name\":\"fixture\"}\n").expect("write manifest");
+    git(
+        &repo,
+        &[
+            "add",
+            "-f",
+            ".gitignore",
+            "package-lock.json",
+            "package.json",
+        ],
+    );
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "create", "agent/hint", "--path"])
+        .arg(&worktree)
+        .output()
+        .expect("create worktree");
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&created.stdout).expect("create JSON");
+    // No node_modules exists yet in the new worktree, and npm has no native
+    // link-tree store, so nothing here is ready to use.
+    assert_eq!(receipt["dependencies"], "not-prepared", "{receipt}");
+
+    let stderr = String::from_utf8_lossy(&created.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "next: run `wt0 prepare --apply` in {} (wt0 run does this automatically)",
+            worktree.display()
+        )),
+        "stderr: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn doctor_verdict_flags_generated_state_over_budget_even_when_otherwise_ready() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-doctor-budget-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("README.md"), "root\n").expect("write fixture");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    // No JavaScript manager, so dependency_ready holds trivially, and a
+    // reviewed .wt0-generated policy so the "no policy reviewed" shortfall
+    // does not fire either — the only thing left wrong is the budget itself.
+    fs::write(repo.join(".wt0-generated"), "# reviewed\n.next\n").expect("write policy");
+    fs::create_dir_all(repo.join(".next")).expect("create .next");
+    let big = fs::File::create(repo.join(".next/huge")).expect("create sparse fixture");
+    big.set_len(600 * 1024 * 1024)
+        .expect("extend sparse fixture past the default budget");
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let doctor = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["--json", "doctor"])
+        .output()
+        .expect("doctor");
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)
+        .unwrap_or_else(|_| panic!("doctor JSON: {}", String::from_utf8_lossy(&doctor.stderr)));
+
+    assert_eq!(doctor["ready"], false, "{doctor}");
+    assert_eq!(doctor["dependency_ready"], true, "{doctor}");
+    assert_ne!(doctor["promise"]["verdict"], "holds", "{doctor}");
+    assert!(
+        doctor["promise"]["shortfalls"]
+            .as_array()
+            .expect("shortfalls")
+            .iter()
+            .filter_map(|item| item.as_str())
+            .any(|item| item.contains("generated state exceeds the default budget")),
+        "{doctor}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 /// A cloned worktree starts from the baseline's stat-populated index and a
 /// per-worktree `core.checkStat=minimal`, so the first `git status` inside it
 /// is clean without hashing every file — and the main checkout's own

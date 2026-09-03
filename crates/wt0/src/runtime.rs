@@ -168,37 +168,43 @@ fn native_store_recommendation(root: &Path, store: &NativeStore) -> Option<Strin
     }
 }
 
-pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
-    let requested = args.path.unwrap_or(std::env::current_dir()?);
-    let root = git_root(&requested)?;
-    let dependencies = dependency_storage(&root)?;
-    let generated = generated_storage(&root)?;
-    let bun = bun_report(&root);
-    let javascript_manager = javascript_package_manager(&root)?;
-    let store = javascript_manager
+/// The dependency facts `wt0 doctor` and `wt0 create` both need: which
+/// JavaScript package manager (if any) governs this tree, what native
+/// link-tree store it resolves to, and whether its dependencies are already
+/// usable. Doctor renders these into its promise line, recommendations, and
+/// verdict; `create` renders them into a one-line "run prepare" hint and its
+/// receipt's `dependencies` field (see `dependency_classification`).
+pub(crate) struct DependencyFacts {
+    pub(crate) manager: Option<String>,
+    pub(crate) manager_version: Option<String>,
+    pub(crate) store: Option<NativeStore>,
+    /// True when the dependency tree this manager would use is already
+    /// usable here — a ready native link-tree store, or an attached prepared
+    /// environment. False means `wt0 prepare --apply` (or `wt0 run`, which
+    /// does this automatically) has work to do.
+    pub(crate) manager_ready: bool,
+    pub(crate) prepared_key: Option<String>,
+    pub(crate) prepared_attached: bool,
+    pub(crate) bun_links_ready: bool,
+}
+
+fn dependency_facts(root: &Path) -> Result<DependencyFacts> {
+    let bun = bun_report(root);
+    let manager = javascript_package_manager(root)?;
+    let store = manager
         .as_deref()
-        .map(|manager| native_store(&root, manager, bun.as_ref()));
-    // A materialized tree is only "stale" when Bun's global store should have
-    // linked it; under the prepared-environment fallback it is the layout.
-    let stale = if matches!(store, Some(NativeStore::BunGlobalStore)) {
-        dependencies.bun_backups + dependencies.materialized_root_entries
-    } else {
-        0
-    };
-    let manager_version = javascript_manager
+        .map(|manager| native_store(root, manager, bun.as_ref()));
+    let manager_version = manager
         .as_deref()
         .and_then(|manager| package_manager_version(manager).ok());
-    let prepared_key = javascript_manager
+    let prepared_key = manager
         .as_deref()
         .zip(manager_version.as_deref())
-        .and_then(|(manager, version)| package_environment_key(&root, manager, version).ok());
+        .and_then(|(manager, version)| package_environment_key(root, manager, version).ok());
     let prepared_attached = prepared_key
         .as_deref()
-        .is_some_and(|key| prepared_marker_key(&root).ok().flatten().as_deref() == Some(key));
-    let bun_links_ready = has_global_links(&root).unwrap_or(false);
-    let dependency_adapter_shipped = javascript_manager
-        .as_deref()
-        .is_none_or(|manager| matches!(manager, "bun" | "npm" | "pnpm" | "yarn"));
+        .is_some_and(|key| prepared_marker_key(root).ok().flatten().as_deref() == Some(key));
+    let bun_links_ready = has_global_links(root).unwrap_or(false);
     // pnpm and Yarn's pnpm linker need no prepared environment either: their
     // native store already resolves whatever `node_modules` links to, the
     // same way Bun's global store does once its links are ready.
@@ -211,6 +217,81 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
         }
         Some(NativeStore::None { .. }) => root.join("node_modules").is_dir() && prepared_attached,
     };
+    Ok(DependencyFacts {
+        manager,
+        manager_version,
+        store,
+        manager_ready,
+        prepared_key,
+        prepared_attached,
+        bun_links_ready,
+    })
+}
+
+/// Whether `store` is a manager's own native link-tree store (pnpm, Yarn's
+/// pnpm linker or PnP, Bun's global store) — one that resolves `node_modules`
+/// on its own, with nothing for `wt0 prepare` to seal. Shared by `doctor`'s
+/// "seal" action gate and `create`'s dependency classification so the two
+/// never disagree about what counts as native.
+fn is_native_store(store: &Option<NativeStore>) -> bool {
+    matches!(
+        store,
+        Some(
+            NativeStore::Pnpm
+                | NativeStore::YarnPnpmLinker
+                | NativeStore::YarnPnp
+                | NativeStore::BunGlobalStore
+        )
+    )
+}
+
+/// The three-state summary `wt0 create`'s receipt reports for its new
+/// worktree: whether the dependency tree its manager would use is already
+/// usable, and how. `None` when no JavaScript package manager is detected —
+/// there is nothing to classify, and `create` prints no hint.
+pub(crate) fn dependency_classification(root: &Path) -> Result<Option<&'static str>> {
+    let facts = dependency_facts(root)?;
+    if facts.store.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(
+        match (facts.manager_ready, is_native_store(&facts.store)) {
+            (false, _) => "not-prepared",
+            (true, true) => "native",
+            (true, false) => "prepared",
+        },
+    ))
+}
+
+pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
+    let requested = args.path.unwrap_or(std::env::current_dir()?);
+    let root = git_root(&requested)?;
+    let dependencies = dependency_storage(&root)?;
+    let generated = generated_storage(&root)?;
+    let bun = bun_report(&root);
+    let DependencyFacts {
+        manager: javascript_manager,
+        manager_version,
+        store,
+        manager_ready,
+        prepared_key,
+        prepared_attached,
+        bun_links_ready,
+    } = dependency_facts(&root)?;
+    // A materialized tree is only "stale" when Bun's global store should have
+    // linked it; under the prepared-environment fallback it is the layout.
+    let stale = if matches!(store, Some(NativeStore::BunGlobalStore)) {
+        dependencies.bun_backups + dependencies.materialized_root_entries
+    } else {
+        0
+    };
+    let dependency_adapter_shipped = javascript_manager
+        .as_deref()
+        .is_none_or(|manager| matches!(manager, "bun" | "npm" | "pnpm" | "yarn"));
+    // A manager's own native link-tree store resolves node_modules on its
+    // own; there is nothing for `wt0 prepare` to seal, so the seal action
+    // below must not fire alongside a "dependencies: native store (...)" line.
+    let native_store_active = is_native_store(&store);
     let mut recommendations: Vec<String> = store
         .as_ref()
         .and_then(|store| native_store_recommendation(&root, store))
@@ -272,16 +353,29 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     } else {
         "report-only (no .wt0-generated policy; gc will refuse unknown ignored state)".to_owned()
     };
-    let mut shortfalls: Vec<&str> = Vec::new();
+    let mut shortfalls: Vec<String> = Vec::new();
     if !cow_available {
-        shortfalls.push("tracked files are full copies here: no copy-on-write on this volume");
+        shortfalls
+            .push("tracked files are full copies here: no copy-on-write on this volume".to_owned());
     }
     if dependency_sharing.starts_with("not yet prepared") {
-        shortfalls.push("dependencies are not shared until `wt0 prepare --apply` seals them");
+        shortfalls
+            .push("dependencies are not shared until `wt0 prepare --apply` seals them".to_owned());
     }
     if policy_paths == 0 {
-        shortfalls
-            .push("generated state cannot be reclaimed until a .wt0-generated policy is reviewed");
+        shortfalls.push(
+            "generated state cannot be reclaimed until a .wt0-generated policy is reviewed"
+                .to_owned(),
+        );
+    }
+    // `ready` can be false purely because generated state is over budget even
+    // when every other promise line above is clean — without this, the
+    // verdict would misreport "holds" while `ready: no`.
+    if !generated_ready {
+        shortfalls.push(format!(
+            "generated state exceeds the default budget ({})",
+            human_bytes(DEFAULT_GENERATED_BUDGET_BYTES)
+        ));
     }
     let verdict = match shortfalls.len() {
         0 => "holds",
@@ -384,7 +478,8 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
                 javascript_manager.as_deref().unwrap_or("package-manager")
             );
         }
-        if dependencies.materialized_store_entries > 0 && !prepared_attached {
+        if dependencies.materialized_store_entries > 0 && !prepared_attached && !native_store_active
+        {
             println!(
                 "  action: seal the worktree-local post-install files with `wt0 prepare --apply`"
             );
@@ -867,12 +962,18 @@ fn prepare_node_environment(
     assert_node_modules_ignored(root)?;
     let version = package_manager_version(manager)?;
     let key = package_environment_key(root, manager, &version)?;
+    // Captured once, before anything runs: on the first seal of an empty
+    // tree (no node_modules yet) this is 0, and it must stay 0 in the
+    // receipt even though `prepare_portable_node_environment` below fills
+    // node_modules in — the field reports what is being replaced, not what
+    // the attach left behind.
+    let bytes_to_replace = logical_bytes(&root.join("node_modules"))?;
     if !apply {
         emit_prepare(
             json_output,
             root,
             false,
-            logical_bytes(&root.join("node_modules"))?,
+            bytes_to_replace,
             Some(&key),
             None,
             "dry run; repeat with --apply after reviewing the exact target",
@@ -897,7 +998,7 @@ fn prepare_node_environment(
         json_output,
         root,
         true,
-        logical_bytes(&root.join("node_modules"))?,
+        bytes_to_replace,
         Some(&prepared.key),
         Some(i128::from(physical_after) - i128::from(physical_before)),
         &prepared.action,
@@ -1173,7 +1274,13 @@ fn manager_lockfile(root: &Path, manager: &str) -> Result<PathBuf> {
         .iter()
         .map(|name| root.join(name))
         .find(|path| path.is_file())
-        .with_context(|| format!("{manager} lockfile was not found"))
+        .with_context(|| {
+            format!(
+                "no {manager} lockfile found; the four managers' lockfiles are \
+                 package-lock.json/npm-shrinkwrap.json (npm), pnpm-lock.yaml (pnpm), \
+                 yarn.lock (yarn), and bun.lock/bun.lockb (bun) — {manager}'s must be committed"
+            )
+        })
 }
 
 fn repair_dependency_layout(root: &Path, before: &DependencyStorage) -> Result<()> {
@@ -1219,7 +1326,7 @@ fn emit_prepare(
         );
     } else {
         println!("Worktree Zero prepare: {}", root.display());
-        println!("  stale dependency layout: {}", human_bytes(bytes));
+        println!("  dependency tree to replace: {}", human_bytes(bytes));
         if let Some(key) = environment_key {
             println!("  prepared environment: {key}");
         }
@@ -1972,7 +2079,11 @@ fn replace_dependency_tree(root: &Path) -> Result<()> {
 
 fn assert_node_modules_ignored(root: &Path) -> Result<()> {
     if !node_modules_ignored(root)? {
-        bail!("node_modules is not ignored in {}", root.display());
+        bail!(
+            "node_modules is not ignored in {}: add \"node_modules/\" to a committed .gitignore \
+             (an uncommitted .gitignore does not reach a worktree)",
+            root.display()
+        );
     }
     Ok(())
 }
@@ -2418,6 +2529,87 @@ fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn is_native_store_covers_every_link_tree_store() {
+        assert!(is_native_store(&Some(NativeStore::Pnpm)));
+        assert!(is_native_store(&Some(NativeStore::YarnPnpmLinker)));
+        assert!(is_native_store(&Some(NativeStore::YarnPnp)));
+        assert!(is_native_store(&Some(NativeStore::BunGlobalStore)));
+        assert!(!is_native_store(&Some(NativeStore::None {
+            manager: "npm".to_owned()
+        })));
+        assert!(!is_native_store(&None));
+    }
+
+    fn init_test_repo(root: &Path) {
+        fs::create_dir_all(root).expect("create fixture root");
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .expect("init fixture repository")
+            .success());
+    }
+
+    #[test]
+    fn node_modules_not_ignored_names_the_fix() {
+        let root = std::env::temp_dir().join(format!(
+            "wt0-not-ignored-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        init_test_repo(&root);
+
+        let error = assert_node_modules_ignored(&root)
+            .expect_err("a repository with no ignore rule for node_modules must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("node_modules is not ignored in"),
+            "{message}"
+        );
+        assert!(
+            message.contains("add \"node_modules/\" to a committed .gitignore"),
+            "{message}"
+        );
+        assert!(
+            message.contains("an uncommitted .gitignore does not reach a worktree"),
+            "{message}"
+        );
+
+        fs::remove_dir_all(root).expect("remove test fixture");
+    }
+
+    #[test]
+    fn manager_lockfile_names_all_four_lockfiles_when_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "wt0-no-lockfile-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        init_test_repo(&root);
+
+        let error = manager_lockfile(&root, "pnpm")
+            .expect_err("a repository with no pnpm-lock.yaml must be refused");
+        let message = error.to_string();
+        assert!(message.contains("no pnpm lockfile found"), "{message}");
+        assert!(
+            message.contains("package-lock.json/npm-shrinkwrap.json (npm)"),
+            "{message}"
+        );
+        assert!(message.contains("pnpm-lock.yaml (pnpm)"), "{message}");
+        assert!(message.contains("yarn.lock (yarn)"), "{message}");
+        assert!(message.contains("bun.lock/bun.lockb (bun)"), "{message}");
+        assert!(message.contains("pnpm's must be committed"), "{message}");
+
+        fs::remove_dir_all(root).expect("remove test fixture");
+    }
 
     #[test]
     fn finds_bun_migration_backups_and_generated_state_without_following_links() {
