@@ -59,7 +59,11 @@ CI job. `WT0_POPULATE=reflink|overlay|checkout` forces a populate mode.
 
 ## Releasing
 
-Published as `worktree-zero` on crates.io (binary `wt0`).
+Published as `worktree-zero` on crates.io (binary `wt0`). See
+`docs/release.md` for how the GitHub Actions pipeline actually cuts a
+release end to end (tagging, the six-target build, macOS signing/
+notarization, npm) and the secrets it needs — the steps below are what's
+still done by hand.
 
 1. Bump `version` in the workspace `Cargo.toml`, `cargo build` to refresh the lockfile, commit.
 2. Tag and push: `git tag -a vX.Y.Z -m "…" && git push origin main vX.Y.Z`.
