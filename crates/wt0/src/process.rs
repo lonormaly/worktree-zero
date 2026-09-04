@@ -48,7 +48,7 @@ pub(crate) fn live_open_path(root: &Path) -> Result<Option<String>> {
 }
 
 /// Whether `pid` is currently running, when this platform can tell.
-/// `Some(true)`/`Some(false)` on Unix, from a `ps` probe. `None` on
+/// `Some(true)`/`Some(false)` on Unix, from the kernel's signal-0 probe. `None` on
 /// Windows, where no portable liveness check exists without opening a
 /// process handle — a caller deciding whether to steal an abandoned lock
 /// should treat `None` as "can't tell" and fall back to another signal
@@ -192,7 +192,19 @@ mod imp {
     }
 
     pub(super) fn is_alive_hint(pid: u32) -> Option<bool> {
-        Some(is_alive(pid))
+        let pid = libc::pid_t::try_from(pid).ok()?;
+        // SAFETY: signal 0 does not deliver a signal. It asks the kernel to
+        // validate the process identity and our permission to address it.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return Some(true);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Some(false),
+            // A process we cannot signal still exists.
+            Some(libc::EPERM) => Some(true),
+            // Resource/probe failures are unknown, never proof of death.
+            _ => None,
+        }
     }
 
     /// `pid` and every ancestor up to init.

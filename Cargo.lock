@@ -563,6 +563,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dunce",
+ "libc",
  "reflink-copy",
  "serde_json",
  "uuid",
