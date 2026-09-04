@@ -92,6 +92,17 @@ jobs:
           WT0_BIN="$PWD/target/debug/wt0" bash tests/prepared_node_integration.sh npm
           WT0_BIN="$PWD/target/debug/wt0" bash tests/prepared_node_integration.sh pnpm
           WT0_BIN="$PWD/target/debug/wt0" bash tests/prepared_node_integration.sh yarn
+      - name: Install Yarn Berry through Corepack
+        if: runner.os == 'macOS'
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: 0
+        run: |
+          npm install --global corepack@0.34.0 --force
+          corepack enable
+          corepack prepare yarn@4.9.2 --activate
+      - name: Yarn Berry pnpm-linker native-store integration
+        if: runner.os == 'macOS'
+        run: WT0_BIN="$PWD/target/debug/wt0" bash tests/prepared_node_integration.sh yarn-pnpm
 
   overlay-linux:
     # Validates the fuse-overlayfs populate mode, which cannot run on macOS.

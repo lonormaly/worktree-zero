@@ -5,16 +5,20 @@
 # takes a different path (`prepare_native_store` in runtime.rs) — `migrate`
 # treats its dependencies as already migrated, and `prepare` runs pnpm's own
 # frozen install directly against the shared store instead of sealing
-# anything. Yarn Berry's `nodeLinker: pnpm` shares that code path but is not
-# exercised here (no Yarn Berry in this CI image); see docs/research/dependency-link-trees.md.
+# anything. Yarn Berry's `nodeLinker: pnpm` shares that code path; the
+# `yarn-pnpm` fixture exercises its real Corepack/Yarn Berry shell-out.
 set -euo pipefail
 
 manager="${1:-npm}"
 case "$manager" in
-  npm|pnpm|yarn) ;;
-  *) echo "usage: $0 npm|pnpm|yarn" >&2; exit 2 ;;
+  npm|pnpm|yarn|yarn-pnpm) ;;
+  *) echo "usage: $0 npm|pnpm|yarn|yarn-pnpm" >&2; exit 2 ;;
 esac
-command -v "$manager" >/dev/null
+manager_command="$manager"
+if [[ "$manager" == yarn-pnpm ]]; then
+  manager_command=yarn
+fi
+command -v "$manager_command" >/dev/null
 
 repo="$(mktemp -d "${TMPDIR:-/tmp}/wt0-${manager}.XXXXXX")"
 trap 'rm -rf "$repo"' EXIT
@@ -22,7 +26,13 @@ git -C "$repo" init -q
 git -C "$repo" config user.email wt0@example.invalid
 git -C "$repo" config user.name "Worktree Zero Test"
 printf 'node_modules/\n' > "$repo/.gitignore"
-printf '{"name":"wt0-node-test","private":true,"dependencies":{"is-even":"1.0.0"}}\n' > "$repo/package.json"
+if [[ "$manager" == yarn-pnpm ]]; then
+  printf '{"name":"wt0-node-test","private":true,"packageManager":"yarn@4.9.2","dependencies":{"is-even":"1.0.0"}}\n' > "$repo/package.json"
+  printf 'nodeLinker: pnpm\n' > "$repo/.yarnrc.yml"
+  printf '.yarn/install-state.gz\n' >> "$repo/.gitignore"
+else
+  printf '{"name":"wt0-node-test","private":true,"dependencies":{"is-even":"1.0.0"}}\n' > "$repo/package.json"
+fi
 
 case "$manager" in
   npm) (cd "$repo" && npm install --package-lock-only --no-audit --no-fund >/dev/null) ;;
@@ -34,6 +44,7 @@ case "$manager" in
       (cd "$repo" && yarn install --mode=skip-build >/dev/null)
     fi
     ;;
+  yarn-pnpm) (cd "$repo" && YARN_ENABLE_HARDENED_MODE=0 yarn install --no-immutable --mode=skip-build) ;;
 esac
 
 git -C "$repo" add package.json
@@ -42,8 +53,10 @@ case "$manager" in
   npm) git -C "$repo" add -f package-lock.json ;;
   pnpm) git -C "$repo" add -f pnpm-lock.yaml ;;
   yarn) git -C "$repo" add -f yarn.lock ;;
+  yarn-pnpm) git -C "$repo" add -f yarn.lock .yarnrc.yml ;;
 esac
 git -C "$repo" commit -qm fixture
+[[ -z "$(git -C "$repo" status --porcelain)" ]]
 
 binary="${WT0_BIN:-$(git rev-parse --show-toplevel)/target/debug/wt0}"
 "$binary" prepare "$repo" --apply --json >/dev/null
@@ -58,7 +71,7 @@ node -e "if (!require('$repo/node_modules/is-even')(4)) process.exit(1)"
 second="$repo-second"
 git -C "$repo" worktree add -qb second "$second"
 "$binary" migrate "$second" --baseline HEAD --apply --json > "$repo/receipt.json"
-if [[ "$manager" == pnpm ]]; then
+if [[ "$manager" == pnpm || "$manager" == yarn-pnpm ]]; then
   # A raw `git worktree add` carries no node_modules (it is untracked), and
   # migrate no longer populates one for a native store — that is `prepare`'s
   # job now, run directly against the shared store, not a sealed attach.
@@ -67,7 +80,11 @@ if [[ "$manager" == pnpm ]]; then
     exit 1
   fi
   "$binary" prepare "$second" --apply --json > "$repo/second-prepare-receipt.json"
-  grep -q 'native store (pnpm): installed from the shared store; nothing to seal' \
+  receipt_manager="$manager"
+  if [[ "$manager" == yarn-pnpm ]]; then
+    receipt_manager=yarn
+  fi
+  grep -q "native store ($receipt_manager): installed from the shared store; nothing to seal" \
     "$repo/second-prepare-receipt.json"
   "$binary" doctor "$second" --json >/dev/null
   node -e "if (!require('$second/node_modules/is-even')(4)) process.exit(1)"
@@ -95,12 +112,14 @@ case "$manager" in
   npm) (cd "$drift" && npm install --package-lock-only --save-exact --no-audit --no-fund is-odd@3.0.1 >/dev/null) ;;
   pnpm) (cd "$drift" && pnpm add --lockfile-only --save-exact is-odd@3.0.1 >/dev/null) ;;
   yarn) (cd "$drift" && yarn add --ignore-scripts --exact is-odd@3.0.1 >/dev/null 2>&1) ;;
+  yarn-pnpm) (cd "$drift" && YARN_ENABLE_HARDENED_MODE=0 yarn add --mode=skip-build --exact is-odd@3.0.1 >/dev/null) ;;
 esac
 git -C "$drift" add package.json
 case "$manager" in
   npm) git -C "$drift" add -f package-lock.json ;;
   pnpm) git -C "$drift" add -f pnpm-lock.yaml ;;
   yarn) git -C "$drift" add -f yarn.lock ;;
+  yarn-pnpm) git -C "$drift" add -f yarn.lock ;;
 esac
 git -C "$drift" commit -qm "change one dependency"
 if [[ -d "$drift/node_modules" ]]; then
@@ -109,8 +128,12 @@ fi
 "$binary" prepare "$drift" --apply --json > "$repo/drift-receipt.json"
 "$binary" doctor "$drift" --json >/dev/null
 node -e "if (!require('$drift/node_modules/is-odd')(3)) process.exit(1)"
-if [[ "$manager" == pnpm ]]; then
-  grep -q 'native store (pnpm): installed from the shared store; nothing to seal' "$repo/drift-receipt.json"
+if [[ "$manager" == pnpm || "$manager" == yarn-pnpm ]]; then
+  receipt_manager="$manager"
+  if [[ "$manager" == yarn-pnpm ]]; then
+    receipt_manager=yarn
+  fi
+  grep -q "native store ($receipt_manager): installed from the shared store; nothing to seal" "$repo/drift-receipt.json"
 else
   grep -q 'derived and sealed a prepared environment from the nearest compatible snapshot' "$repo/drift-receipt.json"
 fi
