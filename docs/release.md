@@ -34,11 +34,23 @@ Two more places do **not** run in CI and are still done by hand, in this
 order, once the assets above exist:
 
 5. **crates.io**: `cargo publish -p worktree-zero` (CONTRIBUTING.md).
-6. **Homebrew**: update `url`/`sha256` in
-   `packaging/homebrew/worktree-zero.rb`. As of this writing the formula is
-   still `head`-only (see the comment at the top of that file) — there is
-   no automated tap-bump step, so this is a manual edit + commit each time,
-   not a script.
+6. **Homebrew**: update a clean checkout of the public tap from the released
+   archives, then review and publish its one-formula diff:
+
+   ```sh
+   git clone https://github.com/lonormaly/homebrew-wt0.git ../homebrew-wt0
+   scripts/bump-homebrew-tap.sh X.Y.Z ../homebrew-wt0
+   git -C ../homebrew-wt0 diff --check
+   brew audit --strict --formula ../homebrew-wt0/Formula/wt0.rb
+   brew style ../homebrew-wt0/Formula/wt0.rb
+   git -C ../homebrew-wt0 diff -- Formula/wt0.rb
+   ```
+
+   The script downloads all four macOS/Linux archives and checksum sidecars,
+   recomputes every SHA-256, refuses a dirty tap or an unexpected formula
+   shape, and updates only `version` plus the four matching `sha256` lines. It
+   deliberately does not commit or push; the maintainer publishes the reviewed
+   tap diff after the GitHub/npm/crates.io release steps succeed.
 
 ## macOS signing and notarization
 
