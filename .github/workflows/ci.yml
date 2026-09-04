@@ -56,6 +56,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --locked
 
+  package:
+    # The CLI embeds repository-owned docs and Tilt templates. Build the exact
+    # archive crates.io receives so moving those files outside the package can
+    # never produce a release that passes ordinary workspace builds but fails
+    # after upload.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --dry-run --locked -p worktree-zero
+
   check:
     strategy:
       fail-fast: false

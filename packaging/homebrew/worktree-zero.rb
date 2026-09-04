@@ -10,7 +10,7 @@ class WorktreeZero < Formula
   depends_on "rust" => :build
 
   def install
-    system "cargo", "install", "--locked", "--path", "crates/wt0", "--root", prefix
+    system "cargo", "install", "--locked", "--path", ".", "--root", prefix
   end
 
   test do
