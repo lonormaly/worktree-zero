@@ -1435,6 +1435,27 @@ fn state_lock_liveness_overrides_a_zero_stale_after() -> Result<()> {
     Ok(())
 }
 
+/// A liveness probe that cannot represent or inspect the recorded pid is
+/// unknown, not proof that the owner died. Treating probe failure as death
+/// lets a waiter unlink a live lock under process pressure and allocate a
+/// duplicate slot.
+#[cfg(unix)]
+#[test]
+fn state_lock_unknown_owner_liveness_falls_back_to_age() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("wt0-statelock-test-{}", Uuid::new_v4()));
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("test.lock");
+    fs::write(&path, u32::MAX.to_string())?;
+
+    assert!(
+        !StateLock::owner_is_dead(&path, Duration::from_secs(3600)),
+        "an unrepresentable pid in a fresh lock is unknown, not dead"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
 /// A lock left behind by a process that has actually exited is stolen —
 /// not because it's old (`stale_after` here is an hour, far longer than
 /// this test runs), but because its recorded owner is confirmed dead.
