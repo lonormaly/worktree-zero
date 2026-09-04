@@ -1,8 +1,5 @@
 [workspace]
 resolver = "2"
-members = [
-    "crates/wt0",
-]
 
 [workspace.package]
 version      = "0.1.18"
@@ -34,3 +31,63 @@ dunce        = "1"
 
 # Error handling
 anyhow       = "1"
+
+[package]
+name        = "worktree-zero"
+description = "One complete, thin development runtime for coding agents"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage    = "https://github.com/lonormaly/worktree-zero"
+readme      = "README.md"
+keywords    = ["git", "worktree", "copy-on-write", "agents", "cli"]
+categories  = ["command-line-utilities", "development-tools"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.md",
+    "/crates/wt0/src/**/*.rs",
+    "/crates/wt0/tests/**/*.rs",
+    "/docs/faq.md",
+    "/integrations/tilt/examples/*",
+]
+
+[[bin]]
+name = "wt0"
+path = "crates/wt0/src/main.rs"
+
+[[test]]
+name = "cli_workflow"
+path = "crates/wt0/tests/cli_workflow.rs"
+
+[[test]]
+name = "concurrency_stress"
+path = "crates/wt0/tests/concurrency_stress.rs"
+
+[[test]]
+name = "mcp_server"
+path = "crates/wt0/tests/mcp_server.rs"
+
+[dependencies]
+clap.workspace         = true
+serde_json.workspace   = true
+anyhow.workspace       = true
+uuid.workspace         = true
+reflink-copy.workspace = true
+dunce.workspace        = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+# cargo-binstall: fetch a prebuilt `wt0` from GitHub Releases instead of
+# compiling. Expects release assets named wt0-<target>.tar.gz once published.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/wt0-{ target }{ archive-suffix }"
+bin-dir = "wt0-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"

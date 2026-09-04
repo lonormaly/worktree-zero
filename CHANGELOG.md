@@ -104,6 +104,14 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Fixed
 
+- **The crates.io archive builds from the files it contains.** The CLI package
+  now lives at the repository/workspace root with a strict publish allowlist,
+  so its canonical FAQ and Tilt templates are included beside the Rust source
+  instead of disappearing outside the old nested `crates/wt0` package root.
+  CI runs `cargo publish --dry-run --locked` against the exact archive before
+  any release can claim crates.io readiness. Homebrew's source-build formula
+  follows the package to the repository root; the binary source remains under
+  `crates/wt0/src`.
 - **`StateLock` (the registry/slot/port cross-process mutex) never
   proceeds unlocked.** Under heavy concurrent load — 24 simultaneous `wt0
   create` against one repository, CI's own stress job — a waiter that
