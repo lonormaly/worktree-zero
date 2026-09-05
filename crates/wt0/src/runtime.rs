@@ -7,10 +7,11 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 const DEFAULT_GENERATED_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+const TOOL_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// wt0's own whole-tree checkout clone: measured 4,040 tracked files → 1.8 MiB
 /// (~450 B/file) on FLAM, and the first worktree of a base commit now costs
@@ -232,6 +233,7 @@ fn known_issues(next_detected: bool, javascript_manager: Option<&str>) -> Vec<Va
 pub(crate) struct DependencyFacts {
     pub(crate) manager: Option<String>,
     pub(crate) manager_version: Option<String>,
+    pub(crate) manager_probe_error: Option<String>,
     pub(crate) store: Option<NativeStore>,
     /// True when the dependency tree this manager would use is already
     /// usable here — a ready native link-tree store, or an attached prepared
@@ -244,14 +246,18 @@ pub(crate) struct DependencyFacts {
 }
 
 pub(crate) fn dependency_facts(root: &Path) -> Result<DependencyFacts> {
-    let bun = bun_report(root);
     let manager = javascript_package_manager(root)?;
+    let (manager_version, manager_probe_error) = match manager.as_deref() {
+        Some(manager) => match package_manager_version(root, manager) {
+            Ok(version) => (Some(version), None),
+            Err(error) => (None, Some(format!("{error:#}"))),
+        },
+        None => (None, None),
+    };
+    let bun = bun_report_with_version(root, manager_version.clone());
     let store = manager
         .as_deref()
         .map(|manager| native_store(root, manager, bun.as_ref()));
-    let manager_version = manager
-        .as_deref()
-        .and_then(|manager| package_manager_version(manager).ok());
     let prepared_key = manager
         .as_deref()
         .zip(manager_version.as_deref())
@@ -275,12 +281,25 @@ pub(crate) fn dependency_facts(root: &Path) -> Result<DependencyFacts> {
     Ok(DependencyFacts {
         manager,
         manager_version,
+        manager_probe_error,
         store,
         manager_ready,
         prepared_key,
         prepared_attached,
         bun_links_ready,
     })
+}
+
+pub(crate) fn dependency_probe_warning(facts: &DependencyFacts) -> Option<String> {
+    let error = facts.manager_probe_error.as_deref()?;
+    let manager = facts.manager.as_deref().unwrap_or("package manager");
+    let reason = error
+        .split_once("timed out after ")
+        .map(|(_, duration)| format!("check timed out after {duration}"))
+        .unwrap_or_else(|| "tool could not be started".to_owned());
+    Some(format!(
+        "{manager} version unresolved; continuing without it ({reason})."
+    ))
 }
 
 /// Whether `store` is a manager's own native link-tree store (pnpm, Yarn's
@@ -344,20 +363,24 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let root = git_root(&requested)?;
     let dependencies = dependency_storage(&root)?;
     let generated = generated_storage(&root)?;
-    let bun = bun_report(&root);
     let tracked = tracked_stats(&root)?;
     let tooling_report = tooling::detect(&root);
     let tilt = tooling::detect_tilt(&root);
     let dev_tools = tooling::detect_dev_environment(&root);
+    let dependency_facts = dependency_facts(&root)?;
+    let manager_probe_warning = dependency_probe_warning(&dependency_facts);
+    let steps = doctor_steps_with_facts(&root, &dependency_facts)?;
     let DependencyFacts {
         manager: javascript_manager,
         manager_version,
+        manager_probe_error,
         store,
         manager_ready,
         prepared_key,
         prepared_attached,
         bun_links_ready,
-    } = dependency_facts(&root)?;
+    } = dependency_facts;
+    let bun = bun_report_with_version(&root, manager_version.clone());
     // A materialized tree is only "stale" when Bun's global store should have
     // linked it; under the prepared-environment fallback it is the layout.
     let stale = if matches!(store, Some(NativeStore::BunGlobalStore)) {
@@ -484,7 +507,6 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
         node_modules_files_total,
         logical_bytes(&modules)?,
     );
-    let steps = doctor_steps(&root)?;
     let tooling_names = tooling_report.names();
     let known_issues = known_issues(tooling_report.next, javascript_manager.as_deref());
 
@@ -510,6 +532,7 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
         "dependencies": {
             "javascript_package_manager": javascript_manager,
             "package_manager_version": manager_version,
+            "package_manager_probe_error": manager_probe_error,
             "adapter_shipped": dependency_adapter_shipped,
             "bun": bun.map(|report| json!({
                 "configured": report.configured,
@@ -579,6 +602,7 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
             root: &root,
             tracked: &tracked,
             javascript_manager: javascript_manager.as_deref(),
+            manager_probe_warning: manager_probe_warning.as_deref(),
             store: &store,
             node_modules_files: node_modules_files_total,
             tooling_names: &tooling_names,
@@ -624,6 +648,7 @@ struct DoctorPrintArgs<'a> {
     root: &'a Path,
     tracked: &'a TrackedStats,
     javascript_manager: Option<&'a str>,
+    manager_probe_warning: Option<&'a str>,
     store: &'a Option<NativeStore>,
     node_modules_files: u64,
     tooling_names: &'a [&'static str],
@@ -658,6 +683,7 @@ fn print_doctor_report(args: DoctorPrintArgs) {
         root,
         tracked,
         javascript_manager,
+        manager_probe_warning,
         store,
         node_modules_files,
         tooling_names,
@@ -692,6 +718,9 @@ fn print_doctor_report(args: DoctorPrintArgs) {
         human_bytes(tracked.bytes),
         format_count(tracked.files)
     );
+    if let Some(warning) = manager_probe_warning {
+        println!("   ⚠ {warning}");
+    }
     if !tooling_names.is_empty() {
         println!("   {}", tooling_names.join(" · "));
     }
@@ -1440,12 +1469,14 @@ fn native_store_step(manager: &str) -> (&'static str, String) {
 /// `wt0 init` target, a one-line package-manager config change, or
 /// `wt0 prepare --apply` — never a bare diagnosis with nothing to run.
 pub(crate) fn doctor_steps(root: &Path) -> Result<Vec<Value>> {
-    let DependencyFacts {
-        manager,
-        store,
-        manager_ready,
-        ..
-    } = dependency_facts(root)?;
+    let facts = dependency_facts(root)?;
+    doctor_steps_with_facts(root, &facts)
+}
+
+fn doctor_steps_with_facts(root: &Path, facts: &DependencyFacts) -> Result<Vec<Value>> {
+    let manager = &facts.manager;
+    let store = &facts.store;
+    let manager_ready = facts.manager_ready;
     let generated = generated_storage(root)?;
     let policy_paths = worktree::project_generated_policy(root)
         .map(|paths| paths.len())
@@ -1461,7 +1492,7 @@ pub(crate) fn doctor_steps(root: &Path) -> Result<Vec<Value>> {
 
     let mut steps = Vec::new();
     if let Some(manager) = manager.as_deref() {
-        if !is_native_store(&store) {
+        if !is_native_store(store) {
             let (title, command) = native_store_step(manager);
             let before = node_modules_files * worktree::CLONED_FILE_METADATA_BYTES;
             let checkout_marginal = tracked.files * TRACKED_FILE_CLONE_METADATA_BYTES;
@@ -1689,7 +1720,7 @@ fn migrate_one(
     };
     let manager_version = manager
         .as_deref()
-        .and_then(|manager| package_manager_version(manager).ok());
+        .and_then(|manager| package_manager_version(root, manager).ok());
     let prepared_key = manager
         .as_deref()
         .zip(manager_version.as_deref())
@@ -2025,7 +2056,7 @@ fn prepare_node_environment(
     json_output: bool,
 ) -> Result<()> {
     assert_node_modules_ignored(root)?;
-    let version = package_manager_version(manager)?;
+    let version = package_manager_version(root, manager)?;
     let key = package_environment_key(root, manager, &version)?;
     // Captured once, before anything runs: on the first seal of an empty
     // tree (no node_modules yet) this is 0, and it must stay 0 in the
@@ -2136,7 +2167,7 @@ fn prepare_native_store(root: &Path, manager: &str, apply: bool, json_output: bo
             bail!("refusing dependency preparation while a process uses {path}");
         }
     }
-    let version = package_manager_version(manager)?;
+    let version = package_manager_version(root, manager)?;
     let physical_before = filesystem_free_bytes(root)?;
     run_package_manager_install(root, manager, &version)?;
     write_native_store_marker(root, manager, &lockfile_hash)?;
@@ -2770,11 +2801,26 @@ fn package_environment_key(root: &Path, manager: &str, version: &str) -> Result<
     Ok(key)
 }
 
-fn package_manager_version(manager: &str) -> Result<String> {
-    let output = Command::new(manager)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("{manager} executable was not found"))?;
+fn package_manager_version(root: &Path, manager: &str) -> Result<String> {
+    package_manager_version_with_timeout(
+        root,
+        Path::new(manager),
+        manager,
+        TOOL_VERSION_PROBE_TIMEOUT,
+    )
+}
+
+fn package_manager_version_with_timeout(
+    root: &Path,
+    program: &Path,
+    manager: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let mut command = Command::new(program);
+    command.arg("--version").current_dir(root);
+    let output =
+        crate::process::output_with_timeout(command, timeout, format!("{manager} --version"))
+            .with_context(|| format!("{manager} executable could not be resolved"))?;
     if !output.status.success() {
         bail!("{manager} --version failed");
     }
@@ -3322,19 +3368,17 @@ pub(crate) fn native_link_tree_store(root: &Path, manager: &str) -> Option<&'sta
 }
 
 fn bun_report(root: &Path) -> Option<BunReport> {
+    let version = package_manager_version(root, "bun").ok();
+    bun_report_with_version(root, version)
+}
+
+fn bun_report_with_version(root: &Path, version: Option<String>) -> Option<BunReport> {
     let lock = root.join("bun.lock");
     let manifest = root.join("bunfig.toml");
     if !lock.exists() && !manifest.exists() {
         return None;
     }
     let configured = bun_isolated_global_store(root);
-    let version = Command::new("bun")
-        .arg("--version")
-        .current_dir(root)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
     Some(BunReport {
         configured,
         version,

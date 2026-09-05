@@ -752,6 +752,99 @@ fn wt0_init_targets_propose_apply_and_refuse_overwrite() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// A version-manager shim may resolve or download a tool on first use, and a
+/// sick macOS Gatekeeper can leave that child at `_dyld_start` indefinitely.
+/// `init seed` needs the lockfile/layout, not a version string: bound the
+/// informational probe, report it as unresolved, and still write the policy.
+#[cfg(unix)]
+#[test]
+fn init_seed_continues_when_a_package_manager_probe_times_out() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-init-seed-probe-timeout-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    let fake_bin = root.join("bin");
+    fs::create_dir_all(repo.join("node_modules/pkg")).expect("create dependency fixture");
+    fs::create_dir_all(&fake_bin).expect("create fake bin");
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join("bun.lock"), "{}\n").expect("write Bun lockfile");
+    fs::write(repo.join("package.json"), "{\"name\":\"fixture\"}\n")
+        .expect("write package manifest");
+
+    let bun = fake_bin.join("bun");
+    // The background child keeps stdout/stderr open after the shim is killed;
+    // the command returns promptly only if wt0 kills the whole process group.
+    fs::write(&bun, "#!/bin/sh\nsleep 12 &\nwait\n").expect("write stalled Bun shim");
+    fs::set_permissions(&bun, fs::Permissions::from_mode(0o755)).expect("chmod Bun shim");
+    let inherited_path = std::env::var_os("PATH").expect("test PATH");
+    let probe_path = std::env::join_paths(
+        std::iter::once(fake_bin.clone()).chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("compose test PATH");
+
+    let started = Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_wt0"))
+        .current_dir(&repo)
+        .env("PATH", probe_path)
+        .args(["init", "seed", "--apply"])
+        .output()
+        .expect("init seed with stalled package-manager shim");
+    let elapsed = started.elapsed();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "version probe was not bounded: {elapsed:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("bun version unresolved"), "{stderr}");
+    assert!(stderr.contains("check timed out after 3 s"), "{stderr}");
+    assert!(stderr.contains("continuing without it"), "{stderr}");
+    let policy = fs::read_to_string(repo.join(".wt0-seed")).expect("read seed policy");
+    assert!(policy.contains("node_modules"), "{policy}");
+
+    let doctor_started = Instant::now();
+    let doctor = Command::new(env!("CARGO_BIN_EXE_wt0"))
+        .current_dir(&repo)
+        .env(
+            "PATH",
+            std::env::join_paths(
+                std::iter::once(fake_bin).chain(std::env::split_paths(&inherited_path)),
+            )
+            .expect("compose doctor PATH"),
+        )
+        .args(["--json", "doctor"])
+        .output()
+        .expect("doctor with stalled package-manager shim");
+    assert!(
+        doctor_started.elapsed() < Duration::from_secs(8),
+        "doctor repeated or failed to bound its version probe: {:?}",
+        doctor_started.elapsed()
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("doctor JSON report");
+    let probe_error = report["dependencies"]["package_manager_probe_error"]
+        .as_str()
+        .expect("probe error in doctor report");
+    assert!(
+        probe_error.contains("bun --version timed out after 3 s"),
+        "{probe_error}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 fn git_stdout(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
