@@ -104,6 +104,15 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Fixed
 
+- **Package-manager version checks stop after three seconds instead of hanging
+  wt0.** Laor's live design-partner rollout found `wt0 init seed --apply`
+  waiting forever when a proto-shimmed `bun --version` child stalled at
+  `_dyld_start` behind a wedged macOS Gatekeeper. Informational dependency
+  probes now run in their own process group, kill the shim and its descendants
+  at the bound, report the version as unresolved, and let `init seed`/`doctor`
+  continue with the lockfile and on-disk layout they actually need. A sleeping
+  shim regression test covers both the timeout and descendant-pipe leak. Laor's
+  own Tilt port window and slugged Portless route integration are live.
 - **The crates.io archive builds from the files it contains.** The CLI package
   now lives at the repository/workspace root with a strict publish allowlist,
   so its canonical FAQ and Tilt templates are included beside the Rust source

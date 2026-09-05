@@ -335,6 +335,9 @@ fn propose_seed(root: &Path) -> Result<Vec<(PathBuf, &'static str)>> {
     // rule `wt0 create`'s own seed gate applies
     // (docs/lifecycle.md, "Seeding: the base checkout as the store").
     let facts = crate::runtime::dependency_facts(root)?;
+    if let Some(warning) = crate::runtime::dependency_probe_warning(&facts) {
+        eprintln!("wt0: {warning}");
+    }
     if facts.manager.is_some()
         && root.join("node_modules").is_dir()
         && !crate::runtime::is_native_store(&facts.store)

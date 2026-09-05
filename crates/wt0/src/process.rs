@@ -12,8 +12,132 @@
 //! or deleted. The Windows implementation therefore probes with a rename
 //! round-trip and relies on mandatory locking to refuse the rest at act time.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+#[derive(Debug)]
+struct CommandTimedOut {
+    label: String,
+    timeout: Duration,
+}
+
+impl std::fmt::Display for CommandTimedOut {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.timeout.subsec_millis() == 0 {
+            write!(
+                formatter,
+                "{} timed out after {} s",
+                self.label,
+                self.timeout.as_secs()
+            )
+        } else {
+            write!(
+                formatter,
+                "{} timed out after {} ms",
+                self.label,
+                self.timeout.as_millis()
+            )
+        }
+    }
+}
+
+impl std::error::Error for CommandTimedOut {}
+
+fn command_timed_out(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<CommandTimedOut>().is_some()
+}
+
+/// Capture a short-lived subprocess without allowing a shim or one of its
+/// descendants to hold wt0 forever. The child receives its own process group;
+/// a timeout kills that whole group before joining the stdout/stderr readers.
+/// Informational callers may degrade the returned error to "unresolved";
+/// lifecycle guards must keep treating it as unknown/refuse.
+pub(crate) fn output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+    label: impl Into<String>,
+) -> Result<Output> {
+    let label = label.into();
+    configure_process_group(&mut command);
+    let mut child: Child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("start {label}"))?;
+    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("wait for {label}"))?
+        {
+            let stdout = stdout_reader.join().unwrap_or_default();
+            let stderr = stderr_reader.join().unwrap_or_default();
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        if Instant::now() >= deadline {
+            terminate_process_group(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(CommandTimedOut { label, timeout }.into());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(unix)]
+fn terminate_process_group(child: &mut Child) {
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: the child was placed in a new process group whose id is its
+        // pid. A negative pid targets that group, not wt0's own group.
+        let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(windows)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(windows)]
+fn terminate_process_group(child: &mut Child) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
 /// Working directories of live processes. Windows cannot enumerate other
 /// processes' working directories portably; it returns an empty list and the
@@ -59,10 +183,10 @@ pub(crate) fn is_alive_hint(pid: u32) -> Option<bool> {
 
 #[cfg(unix)]
 mod imp {
-    use anyhow::{bail, Context, Result};
+    use anyhow::{bail, Result};
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::process::Command;
+    use std::time::Duration;
 
     /// Bound on how long a single `lsof` sweep may run before wt0 gives up
     /// and refuses rather than blocking indefinitely — on a loaded laptop a
@@ -91,66 +215,20 @@ mod imp {
         if let Some(path) = path_arg {
             command.arg(path);
         }
-        output_with_timeout(command, lsof_timeout())
+        run_lsof_command(command, lsof_timeout())
     }
 
-    /// Run `command` to completion, killing it and returning a distinct
-    /// timeout error rather than blocking forever if it hasn't exited by
-    /// `timeout`. Callers must treat a timeout as "unknown" and refuse,
-    /// never as "no process found".
-    ///
-    /// stdout/stderr are drained on background threads while the main
-    /// thread polls `try_wait` — `Command::output()` can't be used here
-    /// since it blocks until exit with no way to bound the wait, and
-    /// reading the pipes only after that wait (instead of concurrently)
-    /// would deadlock if lsof's sweep fills the pipe buffer before exiting.
-    fn output_with_timeout(
-        mut command: Command,
-        timeout: Duration,
-    ) -> Result<std::process::Output> {
-        use std::io::Read;
-
-        let mut child: Child = command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("lsof is required for safe cleanup and migration")?;
-        let mut stdout_pipe = child.stdout.take().expect("stdout piped");
-        let mut stderr_pipe = child.stderr.take().expect("stderr piped");
-        let stdout_reader = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout_pipe.read_to_end(&mut buf);
-            buf
-        });
-        let stderr_reader = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr_pipe.read_to_end(&mut buf);
-            buf
-        });
-
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = child.try_wait().context("waiting for lsof")? {
-                let stdout = stdout_reader.join().unwrap_or_default();
-                let stderr = stderr_reader.join().unwrap_or_default();
-                return Ok(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+    fn run_lsof_command(command: Command, timeout: Duration) -> Result<std::process::Output> {
+        match super::output_with_timeout(command, timeout, "lsof") {
+            Ok(output) => Ok(output),
+            Err(error) if super::command_timed_out(&error) => {
                 bail!(
                     "could not prove no live process within {} s (lsof); retry, raise \
                      WT0_LSOF_TIMEOUT, or pass --force",
                     timeout.as_secs()
-                );
+                )
             }
-            std::thread::sleep(Duration::from_millis(25));
+            Err(error) => Err(error.context("lsof is required for safe cleanup and migration")),
         }
     }
 
@@ -277,11 +355,14 @@ mod imp {
         let dir = std::env::temp_dir().join(format!("wt0-fake-lsof-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create fixture dir");
         let script = dir.join("lsof");
-        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").expect("write fake lsof");
+        // The background child keeps the capture pipes open after its shell
+        // dies. Returning promptly therefore proves the whole process group
+        // was stopped, not merely the direct shim process.
+        std::fs::write(&script, "#!/bin/sh\nsleep 30 &\nwait\n").expect("write fake lsof");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake lsof");
 
-        let error = output_with_timeout(Command::new(&script), Duration::from_millis(200))
+        let error = run_lsof_command(Command::new(&script), Duration::from_millis(200))
             .expect_err("a command that outlives the timeout must be refused, not awaited");
         let message = error.to_string();
         assert!(
