@@ -393,6 +393,45 @@ fn gc_include_unmanaged_considers_but_still_checks_a_plain_worktree() -> Result<
     Ok(())
 }
 
+/// Another tool can use Git's own worktree lock as an ownership/liveness
+/// claim. Even the explicit unmanaged-adoption path must preserve that claim:
+/// `--include-unmanaged` broadens selection, never the removal safety policy.
+#[test]
+fn gc_include_unmanaged_still_refuses_a_git_locked_worktree() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+    let foreign = fixture.root.join("foreign-locked");
+    add_git_worktree(&repo, "foreign/locked", &foreign, &base)?;
+    run_git_common(
+        &repo,
+        [
+            OsStr::new("worktree"),
+            OsStr::new("lock"),
+            OsStr::new("--reason"),
+            OsStr::new("foreign agent"),
+            foreign.as_os_str(),
+        ],
+    )?;
+
+    let outcome = run_gc(
+        &repo,
+        &WorktreeGc {
+            older_than: "0s".to_owned(),
+            include_unmanaged: true,
+            ..Default::default()
+        },
+    )?;
+    assert!(outcome.reaped.is_empty());
+    assert!(outcome.adopted_for_removal.is_empty());
+    assert_eq!(
+        outcome.skipped,
+        vec![(foreign.clone(), "git-locked".to_owned())]
+    );
+    assert!(foreign.exists());
+    Ok(())
+}
+
 #[test]
 fn delete_local_branch_keeps_an_unmerged_branch_and_names_the_current_checkout() -> Result<()> {
     let fixture = Fixture::new()?;

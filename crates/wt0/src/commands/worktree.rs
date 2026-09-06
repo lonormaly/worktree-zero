@@ -2389,6 +2389,7 @@ fn print_gc_dry_run(outcome: &GcOutcome) {
     // (an unrecognized check, a hook or removal failure) still gets a group
     // rather than being dropped, appended in first-seen order.
     let fixed_order = [
+        "kept: locked by another tool",
         "kept: dirty",
         "kept: unmerged",
         "kept: live",
@@ -2497,6 +2498,14 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
 
     for entry in list_worktrees(repo)? {
         if entry.is_main {
+            continue;
+        }
+        // Git's native worktree lock is an ownership/liveness claim used by
+        // other worktree managers (including coding agents). It is a hard
+        // veto even when the operator explicitly asks wt0 to consider
+        // unmanaged worktrees: selection can broaden, safety cannot.
+        if entry.locked {
+            skipped.push((entry.path, "git-locked".to_owned()));
             continue;
         }
         let unmanaged = !is_managed(&entry.path);
@@ -2647,6 +2656,7 @@ fn skip_group_heading(reason: &str) -> String {
         "dirty" => "kept: dirty".to_owned(),
         "unmerged" => "kept: unmerged".to_owned(),
         "active-cwd" | "active-open-path" => "kept: live".to_owned(),
+        "git-locked" => "kept: locked by another tool".to_owned(),
         "unowned-local-state" => "kept: unknown ignored state".to_owned(),
         "unowned" => "skipped: unmanaged (pass --include-unmanaged to consider)".to_owned(),
         other => format!("kept: {}", other.replace('-', " ")),
@@ -2857,6 +2867,7 @@ struct WorktreeEntry {
     path: PathBuf,
     branch: Option<String>,
     is_main: bool,
+    locked: bool,
 }
 
 fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
@@ -2871,6 +2882,7 @@ fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
     let mut entries = Vec::new();
     let mut path: Option<PathBuf> = None;
     let mut branch: Option<String> = None;
+    let mut locked = false;
     for line in text.lines() {
         if line.is_empty() {
             if let Some(path) = path.take() {
@@ -2879,13 +2891,17 @@ fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
                     path,
                     branch: branch.take(),
                     is_main,
+                    locked,
                 });
             }
             branch = None;
+            locked = false;
         } else if let Some(rest) = line.strip_prefix("worktree ") {
             path = Some(PathBuf::from(rest));
         } else if let Some(rest) = line.strip_prefix("branch ") {
             branch = Some(rest.to_owned());
+        } else if line == "locked" || line.starts_with("locked ") {
+            locked = true;
         }
     }
     if let Some(path) = path.take() {
@@ -2894,6 +2910,7 @@ fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
             path,
             branch,
             is_main,
+            locked,
         });
     }
     Ok(entries)

@@ -78,6 +78,15 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Changed
 
+- **`wt0 gc` always preserves Git-locked worktrees, including foreign-tool
+  checkouts considered through `--include-unmanaged`.** The default path
+  already skipped every unowned worktree, but the explicit adoption path
+  ignored `git worktree lock` metadata and could propose a clean, idle
+  checkout another coding tool had locked. The porcelain parser now carries
+  Git's lock bit into the lifecycle guard before ownership, dirty, or
+  liveness checks; dry runs report `git-locked` / “kept: locked by another
+  tool,” and `--apply` cannot adopt or remove it. A real four-worktree
+  design-partner receipt reproduced the gap with three locked checkouts.
 - **A new worktree's default location moved out of `.git`, and out of the
   repository's tree entirely.** `create`/`run` with no `--path` now use
   `<parent>/<repo-name>-worktrees/<slug>` — a sibling directory next to the
