@@ -196,8 +196,11 @@ post_attach(worktree) -> private fixups only
 
 Initial adapters:
 
-- Bun: prefer and verify the isolated global virtual store. Patched, trusted,
-  workspace, file, and link closures stay project-local as Bun requires.
+- Bun: prefer and verify the isolated global virtual store unless Next.js with
+  Turbopack is detected; there, keep `globalStore` disabled and seal a prepared
+  environment so package realpaths remain inside the workspace. Patched,
+  trusted, workspace, file, and link closures stay project-local as Bun
+  requires.
 - npm: prepare a verified `node_modules` environment through npm itself, then
   provide private CoW views because npm's download cache does not share the
   installed tree.

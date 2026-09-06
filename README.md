@@ -79,7 +79,10 @@ pays that whole-tree cost once per environment (179 MiB) and the cheaper
 marginal cost (89 MiB) for every worktree after. Bun's `isolated` linker
 with `globalStore = true` — one `bunfig.toml` line, the fifth row — still
 turns 236k files into 12k links and gives wt0 its largest margin, and
-remains the recommendation regardless. Fixtures, instrument, and every
+remains the recommendation when the framework can resolve out-of-workspace
+package realpaths. Next.js with Turbopack cannot reliably do that, so wt0
+keeps Bun's `globalStore` off there and uses a prepared environment instead.
+Fixtures, instrument, and every
 raw number:
 [flam-migration.md](docs/design-partners/flam-migration.md) (see "The 2×2"
 and "Verification — hoisted node_modules per-worktree cost"),
@@ -158,8 +161,10 @@ prepared environments are keyed by lockfile, manifests, manager version, OS,
 and ABI — changing one dependency starts from the nearest compatible snapshot
 instead of a full copy. No virtual store is *required*: without one, wt0
 seals the manager's own install once and clones it per worktree. The
-manager's store is still recommended — it is the smallest footprint, and it
-shares across repositories, which a per-repository seal cannot. A checked-in
+manager's store is still recommended when the framework supports it — it is
+the smallest footprint, and it shares across repositories, which a
+per-repository seal cannot. Next.js with Turbopack is the known exception for
+Bun's global store; wt0 recommends `wt0 prepare --apply` there. A checked-in
 `.wt0-seed` additionally clones the base checkout's build caches
 (`.nx/cache`, `.next/cache`) — and its `node_modules`, when the lockfile is
 identical and no cheaper native store (pnpm, Bun's global store, Yarn's
@@ -231,9 +236,10 @@ Three things wt0 deliberately does not do:
   and can warm caches from the base checkout — it never shares a writable
   build directory between two live agents.
 - **It does not require a virtual store.** Without one, wt0 seals the
-  manager's own install once and clones it per worktree. The manager's
-  store is recommended because it is smaller and shares across
-  repositories.
+  manager's own install once and clones it per worktree. A compatible
+  manager store is recommended because it is smaller and shares across
+  repositories; Next.js with Turbopack is incompatible with Bun's global
+  store, so wt0 uses the prepared-environment fallback there.
 
 ## Built for agents
 

@@ -162,14 +162,15 @@ fn native_store(root: &Path, manager: &str, bun: Option<&BunReport>) -> NativeSt
 
 /// One precise, actionable recommendation per manager that has no native
 /// store active, citing the measured number so the reader can weigh it
-/// against `docs/research/dependency-link-trees.md`. `None` when a native
-/// store is already in use (pnpm, Bun's global store, Yarn's pnpm linker or
-/// PnP) — there is nothing to recommend.
+/// against `docs/research/dependency-link-trees.md`. Next+Bun deliberately
+/// takes wt0's prepared-environment path: Turbopack refuses package realpaths
+/// that Bun's global virtual store places outside the workspace.
 fn native_store_recommendation(root: &Path, store: &NativeStore) -> Option<String> {
     let NativeStore::None { manager } = store else {
         return None;
     };
     match manager.as_str() {
+        "bun" if tooling::detect(root).next => Some(NEXT_BUN_PREPARE_ADVICE.to_owned()),
         "bun" => Some(BUN_GLOBAL_STORE_ADVICE.to_owned()),
         "yarn" if root.join(".yarnrc.yml").is_file() => Some(
             "Yarn Berry is not using a link-tree store here: set `.yarnrc.yml: nodeLinker: pnpm` \
@@ -200,23 +201,23 @@ fn native_store_recommendation(root: &Path, store: &NativeStore) -> Option<Strin
 /// distinct from `recommendations`/`steps`, which are about wt0's own
 /// promise; these are additive, informational, and never move `ready`.
 ///
-/// Next.js building with Turbopack (the `next build` default since Next 15)
-/// fails against Bun's global virtual store with "Symlink … points out of
-/// the filesystem root" (vercel/next.js#94432, reproduced on this project's
-/// own CI) — and Bun's global store is the only shared-store shape wt0 ever
-/// recommends for Bun, so any repository where Bun is the manager either
-/// already has the store on or is about to be told to turn it on.
+/// Next.js with Turbopack can fail against Bun's global virtual store because
+/// package realpaths escape the workspace root (vercel/next.js#94432). wt0
+/// therefore never recommends enabling that store when it detects Next, but
+/// still warns when the repository already carries the setting.
 fn known_issues(next_detected: bool, javascript_manager: Option<&str>) -> Vec<Value> {
     let mut issues = Vec::new();
     if next_detected && javascript_manager == Some("bun") {
         issues.push(json!({
             "id": "next-turbopack-bun-global-store",
-            "summary": "Next.js building with Turbopack can fail against Bun's global virtual \
-                store: \"Symlink … points out of the filesystem root\" (vercel/next.js#94432).",
+            "summary": "Next.js with Turbopack can fail against Bun's global virtual store \
+                because package realpaths resolve outside the workspace root \
+                (vercel/next.js#94432).",
             "workarounds": [
-                "run `next build --webpack` (verified fix)",
-                "set `turbopack.root` to a directory that contains the store — did not fix it \
-                 in testing, so prefer --webpack",
+                "remove `globalStore = true`, keep `linker = \"isolated\"`, and run \
+                 `wt0 prepare --apply` (verified for Next dev with Turbopack)",
+                "if the global store is required, run Next with Webpack instead \
+                 (`next build --webpack` verified)",
             ],
             "upstream": "https://github.com/vercel/next.js/issues/94432",
         }));
@@ -391,6 +392,7 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let dependency_adapter_shipped = javascript_manager
         .as_deref()
         .is_none_or(|manager| matches!(manager, "bun" | "npm" | "pnpm" | "yarn"));
+    let next_with_bun = tooling_report.next && javascript_manager.as_deref() == Some("bun");
     let mut recommendations: Vec<String> = store
         .as_ref()
         .and_then(|store| native_store_recommendation(&root, store))
@@ -416,8 +418,13 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let wt0_metadata = modules_files * worktree::CLONED_FILE_METADATA_BYTES;
     let native_metadata = modules_files * worktree::NATIVE_INSTALL_FILE_METADATA_BYTES;
     if wt0_metadata > DEPENDENCY_METADATA_ADVICE_BYTES {
+        let compatible_store = if next_with_bun {
+            "pnpm's content-addressable store can keep a tree this size under 20 MiB; with Bun, keep globalStore disabled for Turbopack and use `wt0 prepare --apply`"
+        } else {
+            "a link-tree layout (Bun's global store, pnpm) keeps a tree this size under 20 MiB"
+        };
         recommendations.push(format!(
-            "node_modules holds {modules_files} files; a native install pays about {} of filesystem metadata per worktree (~2 KB/file measured), a wt0 seed or attach about {} (~400 B/file) — a link-tree layout (Bun's global store, pnpm) keeps a tree this size under 20 MiB",
+            "node_modules holds {modules_files} files; a native install pays about {} of filesystem metadata per worktree (~2 KB/file measured), a wt0 seed or attach about {} (~400 B/file) — {compatible_store}",
             format_mib(native_metadata),
             format_mib(wt0_metadata)
         ));
@@ -500,13 +507,18 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     } else {
         0
     };
-    let estimate = estimate_cost(
+    let mut estimate = estimate_cost(
         &tracked,
         javascript_manager.as_deref(),
         &store,
         node_modules_files_total,
         logical_bytes(&modules)?,
     );
+    if next_with_bun {
+        // Do not print the otherwise-useful "with Bun's global store" cost
+        // row as an implicit recommendation to a Turbopack repository.
+        estimate.with_native_store_each_bytes = None;
+    }
     let tooling_names = tooling_report.names();
     let known_issues = known_issues(tooling_report.next, javascript_manager.as_deref());
 
@@ -1488,11 +1500,21 @@ fn doctor_steps_with_facts(root: &Path, facts: &DependencyFacts) -> Result<Vec<V
     } else {
         0
     };
+    let tooling_report = tooling::detect(root);
     let tilt = tooling::detect_tilt(root);
 
     let mut steps = Vec::new();
     if let Some(manager) = manager.as_deref() {
-        if !is_native_store(store) {
+        if !is_native_store(store) && tooling_report.next && manager == "bun" {
+            if !manager_ready {
+                steps.push(json!({
+                    "order": steps.len() + 1,
+                    "title": "dependencies",
+                    "command_or_config": "wt0 prepare --apply",
+                    "payoff": "seals a private copy-on-write dependency environment without Bun globalStore, whose out-of-workspace realpaths Turbopack rejects",
+                }));
+            }
+        } else if !is_native_store(store) {
             let (title, command) = native_store_step(manager);
             let before = node_modules_files * worktree::CLONED_FILE_METADATA_BYTES;
             let checkout_marginal = tracked.files * TRACKED_FILE_CLONE_METADATA_BYTES;
@@ -1960,6 +1982,7 @@ fn format_mib(bytes: u64) -> String {
 }
 
 pub(crate) const BUN_GLOBAL_STORE_ADVICE: &str = "enable Bun's global virtual store for the smallest footprint: bunfig.toml [install] linker = \"isolated\" and globalStore = true, with Bun 1.3.14 or newer";
+const NEXT_BUN_PREPARE_ADVICE: &str = "Next.js with Turbopack can reject Bun globalStore package realpaths outside the workspace; keep globalStore disabled and run `wt0 prepare --apply` to seal a private copy-on-write dependency environment";
 
 fn bun_global_store_ready(bun: &BunReport, root: &Path) -> bool {
     bun.configured
@@ -1971,7 +1994,11 @@ fn prepare_bun(root: &Path, apply: bool, json_output: bool) -> Result<()> {
     assert_node_modules_ignored(root)?;
     let bun = bun_report(root).context("Bun project configuration was not found")?;
     if !bun_global_store_ready(&bun, root) {
-        eprintln!("wt0: Bun's global store is not enabled here; sealing a prepared environment instead ({BUN_GLOBAL_STORE_ADVICE})");
+        if tooling::detect(root).next {
+            eprintln!("wt0: Bun's global store remains disabled for Next.js/Turbopack compatibility; sealing a prepared environment instead");
+        } else {
+            eprintln!("wt0: Bun's global store is not enabled here; sealing a prepared environment instead ({BUN_GLOBAL_STORE_ADVICE})");
+        }
         return prepare_node_environment(root, "bun", apply, json_output);
     }
 
@@ -3711,11 +3738,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn known_issues_flags_next_on_bun_whether_the_store_is_on_or_about_to_be_recommended() {
-        // Bun as the manager resolves to exactly two states — the global
-        // store already on, or not yet (about to be recommended) — and both
-        // carry the same Turbopack incompatibility, so checking the manager
-        // alone covers it.
+    fn known_issues_flags_next_on_bun_and_leads_with_the_compatible_fix() {
         let issues = known_issues(true, Some("bun"));
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0]["id"], "next-turbopack-bun-global-store");
@@ -3727,6 +3750,13 @@ mod tests {
             issues[0]["upstream"],
             "https://github.com/vercel/next.js/issues/94432"
         );
+        let rendered = serde_json::to_string(&issues).expect("serialize issues");
+        assert!(
+            rendered.contains("remove `globalStore = true`"),
+            "{issues:?}"
+        );
+        assert!(rendered.contains("wt0 prepare --apply"), "{issues:?}");
+        assert!(!rendered.contains("turbopack.root"), "{issues:?}");
     }
 
     #[test]
@@ -4168,6 +4198,85 @@ mod tests {
         assert!(
             !steps.iter().any(|step| step["title"] == "tilt"),
             "no Tiltfile in the fixture: {steps:?}"
+        );
+
+        fs::remove_dir_all(root).expect("remove test fixture");
+    }
+
+    #[test]
+    fn doctor_steps_never_recommends_bun_global_store_to_next() {
+        let root = std::env::temp_dir().join(format!(
+            "wt0-next-bun-steps-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        init_test_repo(&root);
+        fs::write(
+            root.join("package.json"),
+            r#"{"dependencies":{"next":"16.0.0"}}"#,
+        )
+        .expect("write Next manifest");
+        fs::write(root.join("bun.lock"), "{}").expect("write Bun lockfile");
+        for args in [
+            &["config", "user.email", "test@example.com"][..],
+            &["config", "user.name", "Test User"][..],
+            &["add", "package.json", "bun.lock"][..],
+            &["commit", "-q", "-m", "fixture"][..],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .expect("prepare Next+Bun fixture")
+                .success());
+        }
+        let facts = DependencyFacts {
+            manager: Some("bun".to_owned()),
+            manager_version: Some("1.4.2".to_owned()),
+            manager_probe_error: None,
+            store: Some(NativeStore::None {
+                manager: "bun".to_owned(),
+            }),
+            manager_ready: false,
+            prepared_key: None,
+            prepared_attached: false,
+            bun_links_ready: false,
+        };
+
+        let steps = doctor_steps_with_facts(&root, &facts).expect("doctor steps");
+        assert!(
+            !steps.iter().any(|step| {
+                step["command_or_config"]
+                    .as_str()
+                    .is_some_and(|command| command.contains("globalStore = true"))
+            }),
+            "{steps:?}"
+        );
+        assert!(steps.iter().any(|step| {
+            step["title"] == "dependencies" && step["command_or_config"] == "wt0 prepare --apply"
+        }));
+        let advice = native_store_recommendation(
+            &root,
+            facts.store.as_ref().expect("Bun store classification"),
+        )
+        .expect("Next+Bun recommendation");
+        assert!(advice.contains("wt0 prepare --apply"), "{advice}");
+        assert!(!advice.contains("globalStore = true"), "{advice}");
+
+        let ready_facts = DependencyFacts {
+            manager_ready: true,
+            prepared_attached: true,
+            ..facts
+        };
+        let ready_steps = doctor_steps_with_facts(&root, &ready_facts).expect("ready doctor steps");
+        assert!(
+            !ready_steps.iter().any(|step| {
+                matches!(step["title"].as_str(), Some("bunfig.toml" | "dependencies"))
+            }),
+            "{ready_steps:?}"
         );
 
         fs::remove_dir_all(root).expect("remove test fixture");

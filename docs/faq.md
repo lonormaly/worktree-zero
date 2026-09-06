@@ -76,17 +76,19 @@ installed package into each project's own `node_modules` folder — a
 each package once on your machine and gives every worktree a set of links
 into it — usually a fraction of a plain install's size, and it's what makes
 `wt0 doctor`'s "with wt0" column so small. wt0 detects which mode your
-project is in and prints the one config line that turns a store on.
+project is in and prints the config line that turns a compatible store on.
+Next.js with Turbopack is the exception: wt0 does not recommend Bun's global
+store there and points to `wt0 prepare --apply` instead.
 
-**Known issue:** Next.js building with Turbopack (the `next build` default
-since Next 15) can fail against Bun's global virtual store — "Symlink …
-points out of the filesystem root"
+**Known issue:** Next.js with Turbopack can fail against Bun's global virtual
+store because package realpaths resolve outside the workspace root
 ([vercel/next.js#94432](https://github.com/vercel/next.js/issues/94432)),
-reproduced on this project's own CI. `wt0 doctor` flags this whenever a
-repository uses Next.js and Bun together. Two workarounds: run
-`next build --webpack` (verified fix), or set `turbopack.root` to a
-directory that contains the store — in testing that did not fix it, so
-prefer `--webpack` until the upstream issue is resolved.
+reproduced in CI and in a live Next+Bun dev stack. `wt0 doctor` flags this
+whenever a repository uses Next.js and Bun together. The verified default is
+to remove `globalStore = true`, keep `linker = "isolated"`, and run `wt0
+prepare --apply`; this keeps package realpaths inside the workspace. If the
+global store is required, run Next with Webpack (`next build --webpack` was
+verified). Pointing `turbopack.root` above the store did not fix the failure.
 
 ## What is a build cache, and what does `wt0 init seed` do?
 

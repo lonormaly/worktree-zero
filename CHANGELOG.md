@@ -63,17 +63,18 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   itself) with a distinct error — "could not prove no live process within
   Ns (lsof); retry, raise WT0_LSOF_TIMEOUT, or pass --force" — that every
   caller already propagates as a refusal, never as "no process found".
-- **`wt0 doctor` flags Next.js + Turbopack on Bun's global store.** Building
-  with Turbopack (the `next build` default since Next 15) can fail against
-  Bun's global virtual store — "Symlink … points out of the filesystem
-  root" (vercel/next.js#94432), reproduced on this project's own CI — and
-  Bun's global store is the only shared-store shape wt0 ever recommends
-  for Bun. `doctor` now surfaces a `known_issues` entry (JSON, additive)
-  and a one-line note in the plain report whenever a repository uses both,
-  naming both workarounds: `next build --webpack` (verified) or
-  `turbopack.root` pointed at a directory containing the store (did not
-  fix it in testing). See `docs/faq.md`, "What does \"shared package
-  store\" mean…".
+- **`wt0 doctor` no longer recommends Bun's global store to Next.js +
+  Turbopack repositories.** A live Next+Bun A/B proof showed that
+  `globalStore = true` moves package realpaths under
+  `~/.bun/install/cache/links`, where Turbopack rejected even React as
+  outside the workspace; removing that one setting made the same dev stack
+  green while Bun's isolated linker remained enabled. The numbered step,
+  JSON recommendation, cost comparison, and `prepare` message now choose
+  `wt0 prepare --apply` instead. The existing `known_issues` entry leads with
+  that verified fix and no longer presents the failed `turbopack.root`
+  experiment as a workaround; Webpack remains the alternative when a project
+  intentionally retains the global store. See `docs/faq.md`, "What does
+  \"shared package store\" mean…".
 
 ### Changed
 
