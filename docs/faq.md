@@ -205,8 +205,9 @@ skips them since each spawns `git` or `lsof`). `wt0 gc --idle 7d` (or any
 duration; `--older-than` still
 works as the older name) is a dry run that shows what it would remove; add
 `--apply` to actually remove it — it already refuses anything dirty,
-unmerged, live, or in an unrecognized ignored state, so there's no way to
-lose changes this way.
+unmerged, live, Git-locked by another tool, or in an unrecognized ignored
+state. Foreign worktrees are skipped by default; even
+`--include-unmanaged` cannot override a Git worktree lock.
 
 Add `--merged` for "merged and forgotten": `wt0 gc --merged --idle 0s`
 reaps every worktree whose branch already landed on the default branch,

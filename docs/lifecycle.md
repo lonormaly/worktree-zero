@@ -237,6 +237,7 @@ is a dry run by default; `wt0 gc --apply` removes a worktree only when all
 of these are true:
 
 - Worktree Zero owns it;
+- Git does not mark it locked for another tool;
 - it is attached to a preserved branch, not a detached commit;
 - its lease is old enough;
 - Git reports no modified or untracked work;
@@ -245,8 +246,10 @@ of these are true:
   `.next`, `.nx`, `dist`, coverage, or Wrangler output.
 
 An ignored `.env.local`, an unknown tool directory, a dirty file, a running
-agent, an unowned checkout, or a detached commit is preserved and reported.
-`wt0 gc --force` is disabled.
+agent, a Git-locked worktree, an unowned checkout, or a detached commit is
+preserved and reported. `--include-unmanaged` can opt a clean foreign
+worktree into consideration, but it cannot override Git's lock. `wt0 gc
+--force` is disabled.
 
 ### Fleet management: selecting which worktrees to consider
 
