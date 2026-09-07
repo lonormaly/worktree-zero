@@ -25,7 +25,7 @@ v1alpha1.extension(name='wt0', repo_name='worktree-zero', repo_path='integration
 load('ext://wt0', 'wt0_port', 'wt0_namespace', 'wt0_short_id')
 load('ext://namespace', 'namespace_create', 'namespace_inject')
 
-ns = wt0_namespace()                       # e.g. wt0-0198f3a2
+ns = wt0_namespace()                       # e.g. wt0-1234567890ab
 namespace_create(ns)
 k8s_yaml(namespace_inject(read_file('k8s/app.yaml'), ns))
 k8s_resource('web', port_forwards='%d:3000' % wt0_port(0))
@@ -108,7 +108,7 @@ load('ext://wt0', 'wt0_shared_namespace', 'wt0_resource_name', 'wt0_port')
 k8s_yaml(namespace_inject(read_file('k8s/services.yaml'), wt0_shared_namespace()))
 
 # App tier: private per worktree, tenant-named inside the shared services.
-db_name = wt0_resource_name('appdb')       # e.g. appdb_0198f3a2
+db_name = wt0_resource_name('appdb')       # e.g. appdb_1234567890ab
 k8s_resource('web', port_forwards='%d:3000' % wt0_port(0))
 ```
 
