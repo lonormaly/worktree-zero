@@ -48,8 +48,9 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
   runtime`) and notarize with `xcrun notarytool submit --wait`
   (`scripts/sign-and-notarize-macos.sh`) before packaging, so the
   `.tar.gz.sha256` covers the signed bytes; verification uses `codesign
-  --verify --deep --strict` and `spctl -a -t exec`, since `xcrun stapler`
-  doesn't apply to a bare binary. The step is a no-op — release still
+  --verify --deep --strict --check-notarization`, since `xcrun stapler`
+  doesn't apply to a bare binary and `spctl` rejects valid bare CLIs as “does
+  not seem to be an app.” The step is a no-op — release still
   ships, with a clear job-summary notice — when the six `APPLE_*` secrets
   aren't set, so a fork (or this repository before they're added) keeps
   releasing. See `docs/release.md` for the required secrets and the

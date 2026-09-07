@@ -64,9 +64,11 @@ before packaging, via `scripts/sign-and-notarize-macos.sh`.
 
 `xcrun stapler` does not apply here — it only accepts app bundles,
 installer packages, and disk images, and a bare Mach-O binary has none of
-those. Verification instead uses `codesign --verify --deep --strict` and
-`spctl -a -t exec -vv`, and the notarization submission ID is recorded in
-the job's summary.
+those. `spctl -a -t exec` also rejects a valid bare CLI as “code is valid but
+does not seem to be an app.” Verification instead uses `codesign --verify
+--deep --strict --check-notarization`, which validates the signature and
+forces Apple's online notarization-ticket lookup; the submission ID is
+recorded in the job's summary.
 
 **The observable symptom, and why it's worse on a busy Mac:** `syspolicyd`
 (Gatekeeper's policy daemon) evaluates a binary the first time it runs; if

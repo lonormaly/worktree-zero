@@ -111,12 +111,12 @@ if [ "$status" != "Accepted" ]; then
 fi
 
 echo "==> Verifying"
-codesign --verify --deep --strict --verbose=2 "$bin"
 # `xcrun stapler` only accepts app bundles, installer packages, and disk
-# images -- a bare Mach-O binary has none of those to staple, so Gatekeeper's
-# online check on first launch is the real gate; spctl -a -t exec proves the
-# notarized signature would pass it.
-spctl -a -t exec -vv "$bin"
+# images -- a bare Mach-O binary has none of those to staple. `spctl` likewise
+# assesses app/package shapes and rejects a valid CLI with "does not seem to
+# be an app". `codesign --check-notarization` forces the online ticket lookup
+# while performing the same strict signature verification.
+codesign --verify --deep --strict --verbose=2 --check-notarization "$bin"
 
 {
   echo "### macOS notarization ($label)"
