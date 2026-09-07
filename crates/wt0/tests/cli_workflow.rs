@@ -144,7 +144,7 @@ fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
             "--",
             "sh",
             "-c",
-            "printf 'agent output\\n' > result.txt && git add . && git commit -qm agent-result",
+            "printf 'agent output\\n' > result.txt && printf '%s\\n%s\\n' \"$WT0_RUNTIME_ID\" \"$COMPOSE_PROJECT_NAME\" > runtime-env.txt && git add . && git commit -qm agent-result",
         ])
         .output()
         .expect("run wt0 run");
@@ -157,6 +157,13 @@ fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
         fs::read_to_string(worktree.join("result.txt")).expect("agent result"),
         "agent output\n"
     );
+    let runtime_environment =
+        fs::read_to_string(worktree.join("runtime-env.txt")).expect("runtime environment");
+    let mut runtime_environment = runtime_environment.lines();
+    let runtime_id = runtime_environment.next().expect("runtime id");
+    let compose_project = runtime_environment.next().expect("compose project");
+    let random_tail = runtime_id.rsplit('-').next().expect("UUIDv7 random tail");
+    assert_eq!(compose_project, format!("wt0-{random_tail}"));
     git(&repo, &["merge", "--ff-only", "agent/test"]);
 
     let gc = Command::new(wt0)

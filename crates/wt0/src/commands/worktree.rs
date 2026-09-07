@@ -809,8 +809,10 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
         command.env("WT0_OWNER", owner);
     }
     if std::env::var_os("COMPOSE_PROJECT_NAME").is_none() {
-        let short_id: String = created.lease.runtime_id.chars().take(8).collect();
-        command.env("COMPOSE_PROJECT_NAME", format!("wt0-{short_id}"));
+        command.env(
+            "COMPOSE_PROJECT_NAME",
+            format!("wt0-{}", runtime_identity_suffix(&created.lease.runtime_id)),
+        );
     }
     let mut child = command
         .spawn()
@@ -2997,6 +2999,13 @@ fn generated_root_for(repo: &RepoContext, runtime_id: &str) -> PathBuf {
     state_dir(&repo.common_git_dir)
         .join("generated")
         .join(runtime_id)
+}
+
+/// The random tail of wt0's UUIDv7 runtime identity. UUIDv7 prefixes encode
+/// time, so concurrent runtimes commonly share them; the final group is the
+/// stable label-safe portion to use for external resource identities.
+fn runtime_identity_suffix(runtime_id: &str) -> &str {
+    runtime_id.rsplit('-').next().unwrap_or(runtime_id)
 }
 
 /// A URL- and label-safe form of a branch name: lowercase, runs of anything

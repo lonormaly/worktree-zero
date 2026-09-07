@@ -115,6 +115,14 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Fixed
 
+- **Concurrent runtimes no longer share Docker Compose or Tilt identities.**
+  UUIDv7 runtime ids start with a timestamp, so two runtimes created together
+  routinely shared the first eight characters that `COMPOSE_PROJECT_NAME` and
+  the Tilt helper used as their supposedly unique suffix. Runtime-derived
+  external names now use the UUID's 12-character random tail; caller-supplied
+  Compose names still win. A real two-runtime `wt0 run` + `ext://wt0` + Tilt
+  0.37.7 proof caught the collision and reached two disposable HTTP servers
+  on distinct port windows after the fix.
 - **Package-manager version checks stop after three seconds instead of hanging
   wt0.** Laor's live design-partner rollout found `wt0 init seed --apply`
   waiting forever when a proto-shimmed `bun --version` child stalled at
