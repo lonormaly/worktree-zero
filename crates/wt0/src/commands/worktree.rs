@@ -1425,9 +1425,22 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
             }
         })
         .filter(|path| path.exists())
-        .unwrap_or(cwd);
+        .unwrap_or_else(|| cwd.clone());
     let repo = discover_repo(&repo_hint)?;
     let target = resolve_worktree_target(&repo, args.target.as_deref())?;
+    let canonical_cwd = dunce::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+    let canonical_target = dunce::canonicalize(&target).unwrap_or_else(|_| target.clone());
+    if target != repo.main_worktree && canonical_cwd.starts_with(&canonical_target) {
+        // Release the target as this process's cwd before an overlay unmount or
+        // directory removal. Hooks and worktree-local Git commands set their
+        // own cwd explicitly, so they still execute against the target.
+        std::env::set_current_dir(&repo.main_worktree).with_context(|| {
+            format!(
+                "move out of worktree before removal: {}",
+                repo.main_worktree.display()
+            )
+        })?;
+    }
     // Resolved before removal, alongside the container below: a port claim
     // is stored under `allocate`'s canonical form, and `target` no longer
     // exists to canonicalize (or to reread a `.wt0/config` override from)
@@ -1491,10 +1504,8 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         run_git_common(&repo, [OsStr::new("worktree"), OsStr::new("prune")])?;
     } else {
         let _registry = StateLock::registry(&repo.common_git_dir)?;
-        let mut command = Command::new("git");
-        command
-            .arg(format!("--git-dir={}", repo.common_git_dir.display()))
-            .args(["worktree", "remove"]);
+        let mut command = common_git_command(&repo);
+        command.args(["worktree", "remove"]);
         if args.force {
             command.arg("--force");
         }
@@ -1625,7 +1636,14 @@ fn resolve_worktree_target(repo: &RepoContext, target: Option<&str>) -> Result<P
     let Some(spec) = target else {
         return Ok(repo.top_level.clone());
     };
-    let as_path = absolute_path(PathBuf::from(spec))?;
+    // `cwd.join(".")` is absolute but still carries a trailing CurDir
+    // component. Some Git versions unregister that spelling while leaving
+    // the directory behind, so remove only no-op `.` components here. Path
+    // components deliberately retain symlinks and `..` segments.
+    let as_path = absolute_path(PathBuf::from(spec))?
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .collect::<PathBuf>();
     if as_path.exists() {
         return Ok(as_path);
     }
@@ -2697,10 +2715,8 @@ fn delete_local_branch(
 }
 
 fn run_branch_delete(repo: &RepoContext, branch: &str, force: bool) -> Result<()> {
-    let mut command = Command::new("git");
-    command
-        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
-        .args(["branch", if force { "-D" } else { "-d" }, branch]);
+    let mut command = common_git_command(repo);
+    command.args(["branch", if force { "-D" } else { "-d" }, branch]);
     run_command(&mut command, "delete worktree branch")
 }
 
@@ -4480,11 +4496,8 @@ fn rollback_created_worktree(repo: &RepoContext, target: &Path, branch: &str) {
 
 fn remove_worktree_force(repo: &RepoContext, target: &Path) -> Result<()> {
     let _registry = StateLock::registry(&repo.common_git_dir)?;
-    let mut command = Command::new("git");
-    command
-        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
-        .args(["worktree", "remove", "--force"])
-        .arg(target);
+    let mut command = common_git_command(repo);
+    command.args(["worktree", "remove", "--force"]).arg(target);
     run_command(&mut command, "git worktree remove --force")
 }
 
@@ -4497,11 +4510,21 @@ where
     S: AsRef<OsStr>,
 {
     let _registry = StateLock::registry(&repo.common_git_dir)?;
+    let mut command = common_git_command(repo);
+    command.args(args);
+    run_command(&mut command, "git")
+}
+
+/// Repository-scoped Git commands must not inherit the caller's working
+/// directory: `remove` can delete that directory before its final ref and
+/// registry operations run. The main checkout is the stable surviving cwd
+/// and also makes branch-merge checks measure the documented primary HEAD.
+fn common_git_command(repo: &RepoContext) -> Command {
     let mut command = Command::new("git");
     command
-        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
-        .args(args);
-    run_command(&mut command, "git")
+        .current_dir(&repo.main_worktree)
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()));
+    command
 }
 
 fn run_git_at<const N: usize>(path: &Path, args: [&str; N]) -> Result<()> {
@@ -4511,8 +4534,7 @@ fn run_git_at<const N: usize>(path: &Path, args: [&str; N]) -> Result<()> {
 }
 
 fn git_output_common<const N: usize>(repo: &RepoContext, args: [&str; N]) -> Result<Output> {
-    Command::new("git")
-        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+    common_git_command(repo)
         .args(args)
         .output()
         .context("run git")
@@ -4543,10 +4565,8 @@ fn git_output_common_timed<const N: usize>(
     args: [&str; N],
     timeout: Option<Duration>,
 ) -> Result<Output> {
-    let mut command = Command::new("git");
-    command
-        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
-        .args(args);
+    let mut command = common_git_command(repo);
+    command.args(args);
     match timeout {
         Some(timeout) => run_git_bounded(&mut command, timeout),
         None => command.output().context("run git"),

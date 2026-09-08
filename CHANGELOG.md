@@ -115,6 +115,13 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Fixed
 
+- **`wt0 remove --delete-branch` works when invoked from inside the worktree
+  being removed.** The checkout deletion succeeded, but the following Git
+  branch command inherited a current directory that no longer existed and
+  failed with “Unable to read current working directory.” Repository-scoped
+  Git subprocesses now share one command constructor rooted in the surviving
+  main checkout. A CLI regression removes `.` from inside a managed worktree
+  and proves both the checkout and branch are gone.
 - **Concurrent runtimes no longer share Docker Compose or Tilt identities.**
   UUIDv7 runtime ids start with a timestamp, so two runtimes created together
   routinely shared the first eight characters that `COMPOSE_PROJECT_NAME` and

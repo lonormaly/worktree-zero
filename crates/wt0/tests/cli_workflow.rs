@@ -112,6 +112,67 @@ fn remove_accepts_an_absolute_worktree_path_from_outside_the_repository() {
     fs::remove_dir_all(root).expect("remove fixture");
 }
 
+#[cfg(unix)]
+#[test]
+fn remove_from_inside_the_target_can_delete_its_branch_after_the_checkout() {
+    let root = std::env::temp_dir().join(format!(
+        "worktree-zero-inside-remove-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    let worktree = root.join("worktree");
+    fs::create_dir_all(&repo).expect("create repository");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("README.md"), "base\n").expect("write fixture");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let wt0 = env!("CARGO_BIN_EXE_wt0");
+    let created = Command::new(wt0)
+        .current_dir(&repo)
+        .args(["create", "inside/remove", "--path"])
+        .arg(&worktree)
+        .output()
+        .expect("create worktree");
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let removed = Command::new(wt0)
+        .current_dir(&worktree)
+        .args(["remove", ".", "--delete-branch"])
+        .output()
+        .expect("remove from inside target");
+    assert!(
+        removed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!worktree.exists());
+
+    let branch = Command::new("git")
+        .current_dir(&repo)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/inside/remove",
+        ])
+        .status()
+        .expect("inspect removed branch");
+    assert!(!branch.success(), "worktree branch survived remove");
+
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
 // Drives the agent command through `sh`; the equivalent Windows coverage is
 // the MCP end-to-end test plus the unit suite on the ReFS CI volume.
 #[cfg(unix)]
