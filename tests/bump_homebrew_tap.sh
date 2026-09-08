@@ -59,8 +59,12 @@ make_assets "$assets"
 make_tap "$tap"
 
 WORKTREE_ZERO_RELEASE_ASSETS_DIR="$assets" /bin/bash "$script" 0.1.19 "$tap" >/dev/null
-grep -q 'version "0.1.19"' "$tap/Formula/wt0.rb"
+if grep -q '^ *version ' "$tap/Formula/wt0.rb"; then
+  echo 'formula must infer its version from literal release URLs' >&2
+  exit 1
+fi
 for target in "${targets[@]}"; do
+  grep -q "https://example.invalid/v0.1.19/wt0-$target.tar.gz" "$tap/Formula/wt0.rb"
   expected="$(sha256_of "$assets/wt0-$target.tar.gz")"
   awk -v target="$target" -v expected="$expected" '
     index($0, "wt0-" target ".tar.gz") { found_url = 1; next }

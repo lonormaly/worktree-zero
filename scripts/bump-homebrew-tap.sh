@@ -116,18 +116,20 @@ checksums = pairs.each_slice(2).to_h
 expected = checksums.keys.sort
 seen = Hash.new(0)
 version_lines = 0
+url_lines = 0
 sha_lines = 0
 current_target = nil
 
-lines = File.readlines(source)
-lines.map! do |line|
+lines = File.readlines(source).filter_map do |line|
   if line.match?(/^\s*version\s+"/)
     version_lines += 1
-    line = line.sub(/^(\s*version\s+")[^"]+(".*)$/) { "#{$1}#{version}#{$2}" }
+    next
   end
 
   if (match = line.match(%r{wt0-([A-Za-z0-9_-]+)\.tar\.gz}))
     current_target = match[1]
+    url_lines += 1
+    line = line.sub(%r{/v(?:#\{version\}|[0-9]+\.[0-9]+\.[0-9]+)/(?=wt0-)}, "/v#{version}/")
   elsif line.match?(/^\s*sha256\s+"/)
     sha_lines += 1
     raise "sha256 line has no preceding wt0 archive URL" unless current_target
@@ -142,7 +144,8 @@ lines.map! do |line|
   line
 end
 
-raise "expected exactly one version line, found #{version_lines}" unless version_lines == 1
+raise "expected at most one legacy version line, found #{version_lines}" unless version_lines <= 1
+raise "expected #{expected.length} wt0 archive URLs, found #{url_lines}" unless url_lines == expected.length
 raise "expected #{expected.length} sha256 lines, found #{sha_lines}" unless sha_lines == expected.length
 raise "target mismatch: expected #{expected.inspect}, saw #{seen.keys.sort.inspect}" unless seen.keys.sort == expected
 raise "a target was updated more than once: #{seen.inspect}" unless seen.values.all? { |count| count == 1 }

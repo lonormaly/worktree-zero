@@ -68,9 +68,9 @@ still done by hand.
 1. Bump the workspace and agent-plugin manifest versions together, refresh
    `Cargo.lock`, and merge the fully verified release commit.
 2. Cut the GitHub release through `.github/workflows/release.yml`; it creates
-   the tag once, builds/signs all six targets, and dispatches npm publishing.
-3. `cargo publish --locked -p worktree-zero` from the exact tagged commit.
-4. Run `scripts/bump-homebrew-tap.sh` against a clean tap checkout and publish
+   the tag once, builds/signs all six targets, and publishes npm plus crates.io
+   through their Trusted Publishing flows.
+3. Run `scripts/bump-homebrew-tap.sh` against a clean tap checkout and publish
    the reviewed formula diff only after the registries and release assets pass.
 
 ## Communication
