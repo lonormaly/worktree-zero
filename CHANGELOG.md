@@ -3,6 +3,25 @@
 All notable changes to Worktree Zero. Versions follow semantic versioning;
 pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
+## Unreleased
+
+### Changed
+
+- **Future crates.io releases use Trusted Publishing instead of a long-lived
+  token.** The release workflow checks whether the tagged version already
+  exists, obtains a short-lived crates.io credential through GitHub OIDC only
+  when needed, and runs the same locked publish CI already dry-runs. The
+  manually scoped token used once to reserve `worktree-zero` for 0.1.19 can be
+  revoked; re-running a completed release skips the existing crate version.
+- **Homebrew tap bumps keep strict audit green.** The tap formula now carries
+  literal tagged release URLs and lets Homebrew infer the version instead of
+  declaring a redundant `version` field. The repository-owned bump script
+  migrates the old interpolated shape, updates all four URLs plus their
+  verified checksums, and tests that no explicit version line survives. The
+  install instructions include Homebrew 6's formula-level trust command, while
+  the release checklist audits through a temporary local tap and removes that
+  trust afterward.
+
 ## 0.1.19 — 2026-09-08
 
 ### Added

@@ -10,8 +10,10 @@ second, sharing files with your main checkout instead of copying them.
 ### Install
 
 ```bash
+brew trust --formula lonormaly/wt0/wt0  # Homebrew 6+: trust this formula, not the whole tap
 brew tap lonormaly/wt0
 brew install wt0                   # macOS and Linux, prebuilt + checksummed
+cargo install --locked worktree-zero  # builds the `wt0` command from crates.io
 npm i -g worktree-zero             # installs the `wt0` command; or: npx worktree-zero doctor
 ```
 

@@ -29,12 +29,16 @@ set for the parts that need them. See `.github/workflows/release.yml` and
    release's own `.tar.gz`/`.sha256` assets (`npm/build.sh`,
    `npm/publish.sh`) and publishes via npm Trusted Publishing (GitHub OIDC)
    — no token to rotate, re-runs skip whatever's already on the registry.
+5. **`crates`** waits for all six builds, checks the public sparse index for
+   the exact tagged version, and publishes `worktree-zero` with `cargo publish
+   --locked`. Authentication comes from crates.io Trusted Publishing through
+   GitHub OIDC (`rust-lang/crates-io-auth-action`), so the workflow receives a
+   short-lived token and stores no registry secret; a re-run skips a version
+   already present on crates.io.
 
-Two more places do **not** run in CI and are still done by hand, in this
-order, once the assets above exist:
+One place does **not** run in CI and is still done by hand once the assets and
+registries above succeed:
 
-5. **crates.io**: `cargo publish --locked -p worktree-zero`
-   (CONTRIBUTING.md).
 6. **Homebrew**: update a clean checkout of the public tap from the released
    archives, then review and publish its one-formula diff:
 
@@ -42,16 +46,40 @@ order, once the assets above exist:
    git clone https://github.com/lonormaly/homebrew-wt0.git ../homebrew-wt0
    scripts/bump-homebrew-tap.sh X.Y.Z ../homebrew-wt0
    git -C ../homebrew-wt0 diff --check
-   brew audit --strict --formula ../homebrew-wt0/Formula/wt0.rb
-   brew style ../homebrew-wt0/Formula/wt0.rb
+   brew trust --formula lonormaly/wt0/wt0
+   brew tap lonormaly/wt0 "file://$(cd ../homebrew-wt0 && pwd -P)"
+   brew audit --strict --formula lonormaly/wt0/wt0
+   brew style lonormaly/wt0/wt0
+   brew untap lonormaly/wt0
+   brew untrust --formula lonormaly/wt0/wt0
    git -C ../homebrew-wt0 diff -- Formula/wt0.rb
    ```
 
    The script downloads all four macOS/Linux archives and checksum sidecars,
    recomputes every SHA-256, refuses a dirty tap or an unexpected formula
-   shape, and updates only `version` plus the four matching `sha256` lines. It
-   deliberately does not commit or push; the maintainer publishes the reviewed
-   tap diff after the GitHub/npm/crates.io release steps succeed.
+   shape, and updates only the four literal tagged URLs plus their matching
+   `sha256` lines. Homebrew 6 requires explicit trust before it will load a
+   third-party formula; formula-level trust is narrower than trusting the whole
+   tap, and the audit sequence removes it afterward. The script deliberately
+   does not commit or push; the maintainer publishes the reviewed tap diff
+   after the GitHub/npm/crates.io release steps succeed.
+
+## crates.io Trusted Publishing
+
+The initial `worktree-zero` crate was reserved by manually publishing 0.1.19
+with a seven-day `publish-new` token kept in macOS Keychain. Future versions
+use the `crates` job above. Its one-time crates.io configuration is:
+
+| Field | Value |
+| --- | --- |
+| Repository owner | `lonormaly` |
+| Repository name | `worktree-zero` |
+| Workflow filename | `release.yml` |
+| Environment | _(empty)_ |
+
+After saving that Trusted Publisher, revoke the bootstrap API token. The
+workflow grants only `contents: read` and `id-token: write` to the crates job;
+the auth action revokes its short-lived token when the job finishes.
 
 ## macOS signing and notarization
 
@@ -116,3 +144,6 @@ this repository before the secrets exist, releasing normally.
 | --- | --- | --- |
 | `NPM_TOKEN` | `npm.yml` | Fallback only — npm Trusted Publishing (OIDC) is the primary path and needs no secret; see the comment at the top of `npm.yml` |
 | `GITHUB_TOKEN` | both workflows | Provided automatically by Actions, not a repository secret |
+
+crates.io likewise uses Trusted Publishing and has no long-lived GitHub
+secret.

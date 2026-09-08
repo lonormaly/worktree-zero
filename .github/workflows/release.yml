@@ -133,6 +133,44 @@ jobs:
             "wt0-${{ matrix.target }}.tar.gz.sha256" \
             --clobber
 
+  crates:
+    # The initial crate-name reservation was published manually for v0.1.19.
+    # Every later version uses a short-lived crates.io token minted for this
+    # repository + workflow through GitHub OIDC; no registry secret persists.
+    needs: [tag, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check whether this crate version already exists
+        id: crate
+        shell: bash
+        run: |
+          version="${{ needs.tag.outputs.tag }}"
+          version="${version#v}"
+          index=$(curl --fail --silent --show-error https://index.crates.io/wo/rk/worktree-zero)
+          if printf '%s\n' "$index" | jq -e --arg version "$version" \
+            'select(.vers == $version)' >/dev/null; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "worktree-zero $version is already on crates.io; skipping"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Authenticate with crates.io
+        if: steps.crate.outputs.publish == 'true'
+        id: crates_auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish to crates.io
+        if: steps.crate.outputs.publish == 'true'
+        run: cargo publish --locked -p worktree-zero
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth.outputs.token }}
+
   # A release created with the workflow's own token does not fire the
   # `release: published` event for other workflows, and npm's Trusted
   # Publishing is bound to one workflow file per package (npm.yml). So the
