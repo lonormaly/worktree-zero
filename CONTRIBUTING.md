@@ -65,12 +65,13 @@ release end to end (tagging, the six-target build, macOS signing/
 notarization, npm) and the secrets it needs — the steps below are what's
 still done by hand.
 
-1. Bump `version` in the workspace `Cargo.toml`, `cargo build` to refresh the lockfile, commit.
-2. Tag and push: `git tag -a vX.Y.Z -m "…" && git push origin main vX.Y.Z`.
-3. `cargo publish -p worktree-zero`.
-4. GitHub release: `gh release create vX.Y.Z --title vX.Y.Z --notes "…"`.
-5. Homebrew: update `url`/`sha256` in
-   `packaging/homebrew/worktree-zero.rb` after the first stable release.
+1. Bump the workspace and agent-plugin manifest versions together, refresh
+   `Cargo.lock`, and merge the fully verified release commit.
+2. Cut the GitHub release through `.github/workflows/release.yml`; it creates
+   the tag once, builds/signs all six targets, and dispatches npm publishing.
+3. `cargo publish --locked -p worktree-zero` from the exact tagged commit.
+4. Run `scripts/bump-homebrew-tap.sh` against a clean tap checkout and publish
+   the reviewed formula diff only after the registries and release assets pass.
 
 ## Communication
 

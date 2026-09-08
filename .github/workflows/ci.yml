@@ -19,11 +19,11 @@ jobs:
         run: shellcheck tests/*.sh integrations/tilt/examples/*.sh npm/*.sh scripts/*.sh
       - name: Homebrew tap bump safety integration
         run: BUMP_HOMEBREW_TAP="$PWD/scripts/bump-homebrew-tap.sh" bash tests/bump_homebrew_tap.sh
-      - name: Plugin manifest versions match the workspace version
+      - name: Agent plugin manifest versions match the workspace version
         run: |
           version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
           test -n "$version"
-          for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json; do
+          for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json gemini-extension.json; do
             jq -e --arg v "$version" '.version == $v' "$manifest" >/dev/null \
               || { echo "$manifest version does not match workspace $version"; exit 1; }
           done
