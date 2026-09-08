@@ -33,7 +33,8 @@ set for the parts that need them. See `.github/workflows/release.yml` and
 Two more places do **not** run in CI and are still done by hand, in this
 order, once the assets above exist:
 
-5. **crates.io**: `cargo publish -p worktree-zero` (CONTRIBUTING.md).
+5. **crates.io**: `cargo publish --locked -p worktree-zero`
+   (CONTRIBUTING.md).
 6. **Homebrew**: update a clean checkout of the public tap from the released
    archives, then review and publish its one-formula diff:
 
