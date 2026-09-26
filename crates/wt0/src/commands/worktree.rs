@@ -218,6 +218,11 @@ pub struct WorktreeGc {
 #[derive(Args)]
 #[command(trailing_var_arg = true)]
 pub struct WorktreeRun {
+    /// Refuse to start unless doctor confirms the complete thin-runtime promise.
+    /// Preparation runs first; an unready checkout is retained for inspection.
+    #[arg(long)]
+    pub require_ready: bool,
+
     /// Branch to create for the command.
     pub branch: String,
 
@@ -791,6 +796,11 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
     );
     crate::runtime::prepare_for_agent_run(&created.target)
         .context("prepare package-manager environment for agent command")?;
+    if args.require_ready {
+        crate::runtime::require_ready(&created.target).with_context(|| {
+            format!("command not started; checkout retained at {}. Run `wt0 doctor` there and follow its steps before retrying", created.target.display())
+        })?;
+    }
     let generated = prepare_generated_runtime(&created.target)?;
     let program = args.command.first().context("command is required")?;
     let mut command_args = args.command.iter().skip(1).cloned().collect::<Vec<_>>();
@@ -852,10 +862,11 @@ fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
     };
     if !status.success() {
         bail!(
-            "command exited with {status}; worktree retained at {}",
+            "command exited with {status}; worktree retained at {}. Inspect with `wt0 doctor` before resuming",
             created.target.display()
         );
     }
+    eprintln!("worktree retained at {}; assess cleanup with `wt0 gc --branch {} --json` (dry run). Ephemeral does not mean automatically deleted; directory sizes are not reclaimable physical bytes.", created.target.display(), args.branch);
     Ok(())
 }
 
@@ -2886,6 +2897,25 @@ struct WorktreeEntry {
     branch: Option<String>,
     is_main: bool,
     locked: bool,
+}
+
+/// Count existing secondary checkouts, excluding stale Git registrations.
+pub(crate) fn adoption_counts(root: &Path) -> Result<(usize, usize, usize)> {
+    let repo = discover_repo(root)?;
+    let (mut managed, mut unmanaged, mut missing) = (0, 0, 0);
+    for entry in list_worktrees(&repo)? {
+        if entry.is_main {
+            continue;
+        }
+        if !entry.path.is_dir() {
+            missing += 1;
+        } else if is_managed(&entry.path) {
+            managed += 1;
+        } else {
+            unmanaged += 1;
+        }
+    }
+    Ok((managed, unmanaged, missing))
 }
 
 fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {

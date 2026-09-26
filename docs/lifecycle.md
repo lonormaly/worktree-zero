@@ -1,5 +1,34 @@
 # Runtime lifecycle: leases, garbage collection, and hooks
 
+## Enforce readiness in agent workflows
+
+Use `wt0 run <branch> --require-cow --require-ready --require-free 10G -- <agent-command>`
+to prepare dependencies and refuse to launch until doctor confirms the complete
+thin-runtime promise. Choose a free-space floor appropriate to the machine.
+`--require-ready` requires both doctor's `ready` and `promise.verdict: "holds"`;
+the additive `automation_ready` JSON field reports that same decision. This
+includes a reviewed generated-file policy and available copy-on-write support.
+Existing `create` and `run` behavior remains available without this opt-in flag.
+
+On refusal, the checkout remains. Run `wt0 doctor <path> --json`, then address
+its numbered steps inside that checkout: `wt0 prepare --apply` for dependencies,
+and `wt0 init generated` to preview a generated-file policy. Review it before
+applying with `wt0 init generated --apply`. Do not broadly classify ignored
+files as disposable. Bun's global store and `.wt0-seed` are optional; Next.js
+with Turbopack can use prepared CoW dependencies with globalStore disabled.
+
+Doctor's `adoption` counts cover existing secondary managed/unmanaged checkouts
+and missing Git registrations separately. Missing ownership cannot establish
+which tool created a checkout or whether deletion is safe. Inspect
+`wt0 fleet --unmanaged --json` and update agent creation paths that bypass WT0.
+
+Successful command completion retains the checkout. Preserve or merge its work,
+then assess `wt0 gc --branch <branch> --json` (dry run). Review refusals before
+using normal removal; dirty, live, locked, unowned and unknown ignored state
+remain protected. Ephemeral is a GC selection flag, not a scheduled cleanup job.
+Directory sizes are logical measurements, not exclusive allocation or guaranteed
+reclaimable bytes. Measure volume free-space deltas for physical storage claims.
+
 This is the full contract behind the README's lifecycle summary: how
 ownership is recorded, exactly when `wt0 gc` may remove a worktree, how a
 project reviews additional generated state, and the checked-in hook API.

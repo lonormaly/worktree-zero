@@ -146,6 +146,24 @@ fn mcp_serve_speaks_the_lifecycle_end_to_end() {
     );
 
     let worktree_path = root.join("agent-worktree");
+    // A non-ready doctor's JSON must survive the MCP error path: agents
+    // need the repair steps, not just the stderr summary.
+    fs::write(
+        repo.join("package.json"),
+        r#"{"name":"fixture","private":true}"#,
+    )
+    .unwrap();
+    fs::write(repo.join("package-lock.json"), "{}").unwrap();
+    let unready = client.call("doctor", serde_json::json!({}));
+    assert_eq!(unready["isError"], true);
+    assert_eq!(unready["structuredContent"]["automation_ready"], false);
+    assert!(unready["structuredContent"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| step["command_or_config"] == "wt0 prepare --apply"));
+    fs::remove_file(repo.join("package.json")).unwrap();
+    fs::remove_file(repo.join("package-lock.json")).unwrap();
     let created = client.call(
         "create_worktree",
         serde_json::json!({
