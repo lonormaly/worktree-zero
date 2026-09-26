@@ -24,6 +24,140 @@ fn cli_reports_the_pinned_release_version() {
 }
 
 #[test]
+fn strict_run_retains_unready_checkout_without_starting_command() {
+    let root = std::env::temp_dir().join(format!(
+        "wt0-strict-ready-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let repo = root.join("repo");
+    let target = root.join("agent");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    fs::write(repo.join("README.md"), "fixture").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "fixture"]);
+    let result = Command::new(env!("CARGO_BIN_EXE_wt0"))
+        .current_dir(&repo)
+        .args(["run", "strict-test", "--require-ready", "--path"])
+        .arg(&target)
+        .args([
+            "--",
+            "git",
+            "config",
+            "--local",
+            "wt0.commandStarted",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("command not started"));
+    assert!(
+        target.join("README.md").exists(),
+        "retain source for remediation"
+    );
+    assert!(!Command::new("git")
+        .current_dir(&repo)
+        .args(["config", "--get", "wt0.commandStarted"])
+        .status()
+        .unwrap()
+        .success());
+    let doctor = Command::new(env!("CARGO_BIN_EXE_wt0"))
+        .current_dir(&target)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(report["adoption"]["managed_existing"], 1);
+    assert_eq!(report["adoption"]["unmanaged_existing"], 0);
+    assert_eq!(report["automation_ready"], false);
+    assert!(report["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["title"] == "agent lifecycle"));
+    let foreign = root.join("foreign");
+    let missing = root.join("missing");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            foreign.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            missing.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    fs::remove_dir_all(&missing).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_wt0"))
+        .current_dir(&repo)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["adoption"]["unmanaged_existing"], 1);
+    assert_eq!(report["adoption"]["missing_registered"], 1);
+    assert!(report["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["title"] == "unmanaged worktrees"));
+    assert!(foreign.join("README.md").exists());
+    // Once a reviewed policy closes the shortfall, strict mode must permit
+    // execution on a CoW-capable volume, not become an unconditional refusal.
+    if report["promise"]["copy_on_write"] == "available" {
+        fs::write(repo.join(".wt0-generated"), "dist/\n").unwrap();
+        git(&repo, &["add", ".wt0-generated"]);
+        git(&repo, &["commit", "-qm", "review generated policy"]);
+        let ready_target = root.join("ready-agent");
+        let result = Command::new(env!("CARGO_BIN_EXE_wt0"))
+            .current_dir(&repo)
+            .args(["run", "ready-test", "--require-ready", "--path"])
+            .arg(&ready_target)
+            .args([
+                "--",
+                "git",
+                "config",
+                "--local",
+                "wt0.commandStarted",
+                "true",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let started = Command::new("git")
+            .current_dir(&repo)
+            .args(["config", "--get", "wt0.commandStarted"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&started.stdout).trim(), "true");
+        assert!(ready_target.exists());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("assess cleanup"));
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn remove_accepts_an_absolute_worktree_path_from_outside_the_repository() {
     let root = std::env::temp_dir().join(format!(
         "worktree-zero-absolute-remove-{}-{}",

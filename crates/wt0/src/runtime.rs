@@ -360,6 +360,20 @@ pub fn doctor_or_intro(json_output: bool) -> Result<()> {
 }
 
 pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
+    doctor_impl(args, json_output, true)
+}
+
+pub(crate) fn require_ready(root: &Path) -> Result<()> {
+    doctor_impl(
+        Doctor {
+            path: Some(root.to_path_buf()),
+        },
+        true,
+        false,
+    )
+}
+
+fn doctor_impl(args: Doctor, json_output: bool, render: bool) -> Result<()> {
     let requested = args.path.unwrap_or(std::env::current_dir()?);
     let root = git_root(&requested)?;
     let dependencies = dependency_storage(&root)?;
@@ -370,7 +384,24 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     let dev_tools = tooling::detect_dev_environment(&root);
     let dependency_facts = dependency_facts(&root)?;
     let manager_probe_warning = dependency_probe_warning(&dependency_facts);
-    let steps = doctor_steps_with_facts(&root, &dependency_facts)?;
+    let mut steps = doctor_steps_with_facts(&root, &dependency_facts)?;
+    let (managed, unmanaged, missing) = worktree::adoption_counts(&root)?;
+    if unmanaged > 0 {
+        steps.push(json!({
+            "order": steps.len() + 1,
+            "title": "unmanaged worktrees",
+            "command_or_config": "wt0 fleet --unmanaged --json",
+            "payoff": format!("{unmanaged} existing secondary checkouts lack WT0 ownership. Inspect their creator and agent configuration; route future tasks through wt0 run --require-ready. Do not delete or adopt them based on missing markers alone."),
+        }));
+    }
+    if unmanaged > 0 || !steps.is_empty() {
+        steps.push(json!({
+        "order": steps.len() + 1,
+        "title": "agent lifecycle",
+        "command_or_config": "wt0 run <branch> --require-cow --require-ready --require-free 10G -- <agent-command>",
+        "payoff": "Prepares dependencies and refuses an incomplete thin runtime before launching the agent. Choose a free-space floor for your machine. At task completion, preserve changes and run wt0 gc --json for a safe assessment; ephemeral runtimes are not automatically deleted.",
+    }));
+    }
     let DependencyFacts {
         manager: javascript_manager,
         manager_version,
@@ -603,13 +634,15 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
             "derives_from_wt0": tool.derives_from_wt0,
             "fix": tool.fix.join(" "),
         })).collect::<Vec<_>>(),
+        "automation_ready": ready && verdict == "holds",
+        "adoption": { "managed_existing": managed, "unmanaged_existing": unmanaged, "missing_registered": missing, "excludes_main": true },
         "steps": steps,
         "known_issues": known_issues,
     });
 
-    if json_output {
+    if render && json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
+    } else if render {
         print_doctor_report(DoctorPrintArgs {
             root: &root,
             tracked: &tracked,
@@ -639,6 +672,12 @@ pub fn doctor(args: Doctor, json_output: bool) -> Result<()> {
     // below, so an agent piping stdout still sees it.
     if let Some(repo) = &repo_context {
         worktree::print_git_nested_notice(std::iter::once(root.as_path()), &repo.common_git_dir);
+    }
+    if !render && (!ready || verdict != "holds") {
+        bail!(
+            "runtime is not ready: {}. Run `wt0 doctor` in the retained checkout for remediation",
+            shortfalls.join("; ")
+        );
     }
     if ready {
         Ok(())
@@ -1083,6 +1122,20 @@ fn plain_steps(
                 "tilt" => tilt_fix_block(),
                 "docker-compose" => compose_fix_block(),
                 "dev environment" => dev_environment_fix_block(),
+                "agent lifecycle" => vec![
+                    "Gate automated startup on readiness".to_owned(),
+                    "      wt0 run <branch> --require-ready -- <agent-command>".to_owned(),
+                    "      Add --require-cow and --require-free 10G (choose your disk floor)."
+                        .to_owned(),
+                    "      At completion, preserve work and assess: wt0 gc --json (dry run)."
+                        .to_owned(),
+                    "      Ephemeral does not mean automatically deleted.".to_owned(),
+                ],
+                "unmanaged worktrees" => vec![
+                    "Inspect unmanaged checkouts: wt0 fleet --unmanaged --json".to_owned(),
+                    "      Route agent creation through wt0 run --require-ready.".to_owned(),
+                    "      Missing ownership does not make a checkout safe to delete.".to_owned(),
+                ],
                 _ => fallback_block(step),
             }
         })
@@ -1534,6 +1587,14 @@ fn doctor_steps_with_facts(root: &Path, facts: &DependencyFacts) -> Result<Vec<V
             }));
         }
     }
+    if manager.is_some() && !manager_ready && !steps.iter().any(|s| s["title"] == "dependencies") {
+        steps.push(json!({
+            "order": steps.len() + 1,
+            "title": "dependencies",
+            "command_or_config": "wt0 prepare --apply",
+            "payoff": "Prepare this checkout before starting another agent. A native global store is optional; WT0 can seal private copy-on-write dependencies instead.",
+        }));
+    }
     let generated_ready = generated.total() <= DEFAULT_GENERATED_BUDGET_BYTES;
     if policy_paths == 0 {
         steps.push(json!({
@@ -1541,7 +1602,7 @@ fn doctor_steps_with_facts(root: &Path, facts: &DependencyFacts) -> Result<Vec<V
             "title": "generated state",
             "command_or_config": "wt0 init generated   then review .wt0-generated",
             "payoff": if generated.total() > 0 {
-                format!("gc can reclaim {}", human_bytes(generated.total()))
+                format!("{} logical generated bytes need review; this is not guaranteed reclaimable physical space", human_bytes(generated.total()))
             } else {
                 "gc can review generated state safely".to_owned()
             },
