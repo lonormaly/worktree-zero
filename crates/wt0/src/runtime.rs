@@ -1246,7 +1246,7 @@ fn prepare_block() -> Vec<String> {
 fn generated_missing_policy_block(generated_total: u64) -> Vec<String> {
     let payoff = if generated_total > 0 {
         format!(
-            "      → `wt0 gc` can then reclaim {} from abandoned worktrees.",
+            "      → {} logical build output needs review; physical reclaimable space is unknown.",
             human_bytes_rounded(generated_total)
         )
     } else {
@@ -1255,8 +1255,8 @@ fn generated_missing_policy_block(generated_total: u64) -> Vec<String> {
     vec![
         "Tell wt0 which build folders are disposable (things like .nx, .next, dist — safe to delete"
             .to_owned(),
-        "      once a worktree is done). Run: wt0 init generated --apply, then review the".to_owned(),
-        "      .wt0-generated file it writes.".to_owned(),
+        "      once a worktree is done). Preview: wt0 init generated".to_owned(),
+        "      Review the proposal before wt0 init generated --apply; inspect .wt0-generated.".to_owned(),
         payoff,
     ]
 }
@@ -1268,7 +1268,7 @@ fn generated_over_budget_block(generated_total: u64) -> Vec<String> {
             human_bytes_rounded(generated_total),
             human_bytes_rounded(DEFAULT_GENERATED_BUDGET_BYTES)
         ),
-        "      Trim what's listed in .wt0-generated, or run `wt0 gc --apply` to reclaim some of it now."
+        "      Assess cleanup with wt0 gc --json (dry run); review every refusal before removal."
             .to_owned(),
     ]
 }
