@@ -2,7 +2,7 @@
 resolver = "2"
 
 [workspace.package]
-version      = "0.1.19"
+version      = "0.1.20"
 edition      = "2021"
 # Floor set by edition-2024 dependencies in Cargo.lock; the msrv CI job
 # enforces it, so bump both together.

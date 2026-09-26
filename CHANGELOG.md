@@ -5,6 +5,8 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ## Unreleased
 
+## 0.1.20 — 2026-09-26
+
 ### Changed
 
 - **MCP preserves diagnostic JSON on failure.** An unready doctor previously
