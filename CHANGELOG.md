@@ -7,6 +7,12 @@ pre-1.0, minor JSON-schema changes may occur and are called out explicitly.
 
 ### Changed
 
+- **MCP preserves diagnostic JSON on failure.** An unready doctor previously
+  lost its structured report at the transport boundary. Agents now receive
+  repair steps with `isError: true`; the shipped skill and server instructions
+  explicitly gate startup after preparation and require a scoped completion
+  assessment, retaining failed checkouts for repair instead of creating more.
+
 - **Gate agent startup with `wt0 run --require-ready`.** After dependency
   preparation, doctor must confirm readiness and the complete thin-runtime
   promise before the command starts. Failed checkouts remain for inspection.

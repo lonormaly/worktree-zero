@@ -126,7 +126,11 @@ fn initialize_result(params: &Value) -> Value {
             "version": env!("CARGO_PKG_VERSION"),
         },
         "instructions": "One guarded lifecycle for thin agent worktrees: discover \
-            capabilities first, create copy-on-write checkouts, refresh heartbeats \
+            capabilities first, create copy-on-write checkouts, then prepare with apply=true \
+            and call doctor on the returned path. Do not start work until automation_ready \
+            is true. A successful create is not readiness. Retain and inspect \
+            structuredContent even when isError=true: doctor supplies repair steps there. \
+            Refresh heartbeats \
             for long work, and clean up with dry-run-first gc. Refusals are safety \
             guards — surface their reason to a human instead of working around them. \
             Pass `repo` (an absolute path) to address a repository other than the \
@@ -161,14 +165,14 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "doctor",
             title: "Inspect runtime readiness",
-            description: "Inspect dependency sharing and generated runtime storage. Exits non-ready when stale layouts or over-budget generated state need attention.",
+            description: "Inspect readiness, adoption gaps and remediation steps. After prepare, require automation_ready=true before starting agent work. Non-ready results may have isError=true AND structuredContent: retain the report and follow its steps. Missing fields on older versions mean readiness is unknown.",
             properties: json!({ "repo": repo }),
             required: &[],
         },
         Tool {
             name: "create_worktree",
             title: "Create a thin worktree",
-            description: "Create a real Git linked worktree populated with copy-on-write clones where supported. The receipt carries the worktree path, populate mode, runtime id, slot, and a machine-globally unique port_base — use ports from that window so parallel runtimes never collide.",
+            description: "Create source checkout; success does not imply prepared dependencies or cleanup readiness. Persist the returned path/runtime id; call prepare(apply=true), then doctor and require automation_ready=true before work. Pass owner, idempotency_key and ephemeral for temporary agent tasks. Use the returned port_base window for services.",
             properties: json!({
                 "repo": repo,
                 "branch": { "type": "string", "description": "New branch name, e.g. agent/fix-checkout." },
@@ -527,6 +531,16 @@ fn execute(argv: Vec<OsString>, repo: Option<PathBuf>) -> Value {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if !output.status.success() {
         let reason = if stderr.is_empty() { &stdout } else { &stderr };
+        if let Ok(structured) = serde_json::from_str::<Value>(&stdout) {
+            return json!({
+                "content": [
+                    { "type": "text", "text": stdout },
+                    { "type": "text", "text": reason },
+                ],
+                "structuredContent": structured,
+                "isError": true,
+            });
+        }
         return tool_error(if reason.is_empty() {
             "wt0 failed without diagnostics"
         } else {

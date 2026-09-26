@@ -30,9 +30,26 @@ Before creating a checkout:
 With a project wrapper, follow its interface. Otherwise:
 
 ```bash
-wt0 create codex/my-task --base origin/main --require-cow --json
+wt0 create codex/my-task --base origin/main --require-cow --ephemeral --owner <agent-id> --idempotency-key <task-id> --json
 wt0 prepare /absolute/path/from-create --apply --json
+wt0 doctor /absolute/path/from-create --json
 ```
+
+Creation success only means source exists. Before starting the task, require
+doctor's `automation_ready: true`; retain its JSON even when the exit code is
+nonzero. If the installed version lacks that field, treat readiness as unknown:
+inspect `ready`, `promise.shortfalls`, and `steps` rather than assuming success.
+Resolve dependency preparation and review generated-file policy before moving on.
+`wt0 init generated` previews a proposal; review before `--apply`. Missing
+`bunfig.toml` alone is not a failure: prepared CoW dependencies work without a
+global store, and Next/Turbopack may require globalStore to stay disabled.
+
+If preparation or doctor fails, keep the exact checkout and report its blocker.
+Reuse it with the same idempotency key after repair; do not create replacement
+checkouts on every retry. For headless commands use
+`wt0 run <branch> --require-cow --require-ready -- <agent-command>` on versions
+that advertise `--require-ready` in help. Select an owner and free-space floor
+appropriate to the host. The run command streams output and does not support JSON.
 
 Use the returned absolute path for every later command. `prepare` supports Bun,
 npm, pnpm, and Yarn's `node_modules` linker. It preserves the manager's native
@@ -55,15 +72,24 @@ it for headless agents that do not need a project wrapper.
 ## Finish safely
 
 Commit or otherwise preserve source work before removal. Never pass `--force`.
+At task completion, assess cleanup even if the task failed. Ephemeral is a GC
+selection flag, not an automatic deletion schedule. Report retained path,
+runtime id, blocker and next action; do not claim completion includes cleanup
+unless removal was verified. Never broaden a branch-scoped assessment into
+fleet-wide apply just because the agent's own task ended.
 Use the project wrapper when it exists; otherwise use `wt0 remove <path>` only
 after checking status and live processes.
 
 Garbage collection is dry-run first:
 
 ```bash
-wt0 gc --json
-wt0 gc --apply --json
+wt0 gc --branch <task-branch> --json
 ```
+
+Review eligibility before applying the same selector or removing the exact
+owned path. Preserve dirty/unmerged work; stop owned processes through their
+project lifecycle; review unknown ignored files individually. Unmanaged or
+foreign-locked worktrees require investigation, not automatic adoption/deletion.
 
 GC preserves unowned, dirty, active, detached, unknown-state, or sensitive
 worktrees. Do not weaken a refusal. Surface its exact reason to the human.
@@ -86,5 +112,10 @@ Use `--json` for Codex, Claude Code, NanoClaw, OpenClaw, Hermes, Grok Bot,
 Slack agents, queue workers, and other autonomous hosts. Hosts with an MCP
 client can call the identical lifecycle through the `wt0 mcp serve` stdio
 server instead; both transports return the same versioned payloads. Do not
+discard `structuredContent` on MCP `isError: true`: an unready doctor report
+contains its machine-readable repair steps there. Use `repo` with the exact
+returned worktree path for prepare/doctor/heartbeat tool calls. MCP has no
+streaming run tool; the host gates its own command launch after doctor.
+Do not
 parse decorated terminal output or reimplement lifecycle behavior in a vendor
 plugin.

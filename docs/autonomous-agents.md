@@ -17,6 +17,27 @@ runtime identity, safety checks, or cleanup.
 
 ## Minimum integration
 
+### Executable readiness and completion workflow
+
+Create source with owner, idempotency key and `--ephemeral` for temporary tasks;
+persist the returned path and runtime id. Then `prepare --apply --json` and
+`doctor --json` in that exact checkout. Gate agent startup on
+`automation_ready: true`. Creation success alone is insufficient. Repair the
+retained checkout on failure; repeated creation is not a remediation strategy.
+For headless CLI hosts, `wt0 run --require-ready` enforces the same assessment.
+For MCP hosts, call `prepare` with `apply: true`, then `doctor`, setting `repo`
+to the returned checkout path; gate the host's command launch on its result.
+
+MCP failures retain valid JSON in `structuredContent` alongside `isError: true`.
+In particular, an unready doctor's steps and shortfalls remain accessible.
+Older versions without `automation_ready` need explicit assessment of `ready`
+and `promise`; absent fields must not be interpreted as a passing check.
+
+When the task ends, preserve changes and run a branch-scoped GC dry run.
+Report why the runtime remains, or verify its safe removal. Ephemeral does not
+schedule deletion, and a finished task does not authorize removing other agents'
+worktrees. Never treat logical directory totals as guaranteed reclaimed bytes.
+
 An autonomous platform needs only three abilities:
 
 1. run `wt0 ... --json` or call the equivalent MCP tool;
