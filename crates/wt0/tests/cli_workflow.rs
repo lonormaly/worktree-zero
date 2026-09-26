@@ -44,6 +44,7 @@ fn strict_run_retains_unready_checkout_without_starting_command() {
     git(&repo, &["commit", "-qm", "fixture"]);
     let result = Command::new(env!("CARGO_BIN_EXE_wt0"))
         .current_dir(&repo)
+        .env("WT0_POPULATE", "checkout")
         .args(["run", "strict-test", "--require-ready", "--path"])
         .arg(&target)
         .args([
@@ -128,6 +129,7 @@ fn strict_run_retains_unready_checkout_without_starting_command() {
         let ready_target = root.join("ready-agent");
         let result = Command::new(env!("CARGO_BIN_EXE_wt0"))
             .current_dir(&repo)
+            .env("WT0_POPULATE", "checkout")
             .args(["run", "ready-test", "--require-ready", "--path"])
             .arg(&ready_target)
             .args([
